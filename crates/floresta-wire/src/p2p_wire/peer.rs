@@ -10,9 +10,11 @@ use async_std::{
     channel::{unbounded, Receiver, Sender},
     io::BufReader,
     net::{TcpStream, ToSocketAddrs},
-    sync::RwLock,
+    // sync::RwLock,
     task::spawn,
 };
+use tokio::sync::RwLock;
+
 use bitcoin::{
     consensus::serialize,
     hashes::Hash,

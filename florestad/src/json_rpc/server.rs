@@ -2,7 +2,6 @@ use super::res::{
     BlockJson, Error, GetBlockchainInfoRes, RawTxJson, ScriptPubKeyJson, ScriptSigJson, TxInJson,
     TxOutJson,
 };
-use async_std::sync::RwLock;
 use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::{
@@ -24,6 +23,7 @@ use jsonrpc_derive::rpc;
 use jsonrpc_http_server::ServerBuilder;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[rpc]
 pub trait Rpc {

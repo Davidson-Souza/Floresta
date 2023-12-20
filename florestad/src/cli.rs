@@ -71,6 +71,9 @@ pub enum Commands {
         /// Assume blocks before this one as having valid signatures, same with bitcoin core
         #[arg(long)]
         assume_valid: Option<BlockHash>,
+        /// Electrum server url with port
+        #[arg(short, long, default_value = "0.0.0.0:50001")]
+        electrum_host: String,
     },
     #[cfg(feature = "experimental-p2p")]
     /// Starts your wallet and server
@@ -105,6 +108,9 @@ pub enum Commands {
         assume_valid: Option<BlockHash>,
         #[arg(long, short)]
         zmq_address: Option<String>,
+        /// Electrum server url with port
+        #[arg(short, long, default_value = "0.0.0.0:50001")]
+        electrum_host: String,
     },
 }
 

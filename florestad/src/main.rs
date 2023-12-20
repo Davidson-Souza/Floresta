@@ -27,10 +27,7 @@ mod wallet_input;
 #[cfg(feature = "zmq-server")]
 mod zmq;
 
-use async_std::{
-    sync::RwLock,
-    task::{self, block_on},
-};
+use async_std::task::{self, block_on};
 use bitcoin::{BlockHash, Network};
 use clap::Parser;
 use cli::{Cli, Commands, FilterType};
@@ -40,12 +37,13 @@ use floresta_chain::{
 };
 use floresta_common::constants::DIR_NAME;
 use floresta_compact_filters::{FilterBackendBuilder, KvFiltersStore};
-use floresta_electrum::electrum_protocol::{client_accept_loop, ElectrumServer};
+use floresta_electrum::electrum_protocol::ElectrumServer;
 use floresta_watch_only::{kv_database::KvDatabase, AddressCache, AddressCacheDatabase};
 use floresta_wire::{mempool::Mempool, node::UtreexoNode};
 use log::{debug, error, info};
 use pretty_env_logger::env_logger::{Env, TimestampPrecision};
 use std::{path::PathBuf, sync::Arc};
+use tokio::sync::RwLock;
 
 #[cfg(feature = "zmq-server")]
 use zmq::ZMQServer;
@@ -70,6 +68,7 @@ struct Ctx {
     cfilter_types: Vec<FilterType>,
     #[cfg(feature = "zmq-server")]
     zmq_address: Option<String>,
+    electrum_host: String,
 }
 fn main() {
     // Setup global logger
@@ -91,6 +90,7 @@ fn main() {
             zmq_address: _zmq_address,
             cfilters,
             cfilter_types,
+            electrum_host,
         }) => {
             let ctx = Ctx {
                 data_dir,
@@ -105,6 +105,7 @@ fn main() {
                 cfilter_types: cfilter_types.unwrap_or_default(),
                 #[cfg(feature = "zmq-server")]
                 zmq_address: _zmq_address,
+                electrum_host,
             };
             run_with_ctx(ctx);
         }
@@ -234,7 +235,7 @@ fn run_with_ctx(ctx: Ctx) {
     // Chain Provider (p2p)
     let chain_provider = UtreexoNode::new(
         blockchain_state.clone(),
-        Arc::new(async_std::sync::RwLock::new(Mempool::new())),
+        Arc::new(RwLock::new(Mempool::new())),
         get_net(&ctx.network).into(),
         data_dir,
         ctx.proxy.map(|x| x.parse().expect("Invalid proxy address")),
@@ -270,23 +271,19 @@ fn run_with_ctx(ctx: Ctx) {
     );
 
     // Electrum
-    let electrum_server = block_on(ElectrumServer::new(
-        "0.0.0.0:50001",
-        wallet,
-        blockchain_state,
-    ))
-    .expect("Could not create an Electrum Server");
+    let electrum_server = block_on(ElectrumServer::new(wallet, blockchain_state))
+        .expect("Could not create an Electrum Server");
 
     // Spawn all services
 
-    // Electrum accept loop
-    task::spawn(client_accept_loop(
-        electrum_server.tcp_listener.clone(),
-        electrum_server.message_transmitter.clone(),
-    ));
+    // Electrum loop to accept new TCP clients
+    // task::spawn(client_accept_loop(
+    //     electrum_server.tcp_listener.clone(),
+    //     electrum_server.message_transmitter.clone(),
+    // ));
     // Electrum main loop
-    task::spawn(electrum_server.main_loop());
-    info!("Server running on: 0.0.0.0:50001");
+    task::spawn(electrum_server.main_loop(ctx.electrum_host.clone()));
+    info!("Server running on: {}", ctx.electrum_host);
 
     let _kill_signal = kill_signal.clone();
     ctrlc::set_handler(move || {

@@ -15,7 +15,7 @@ use async_std::{
     channel::{self, bounded, Receiver, SendError, Sender},
     future::timeout,
     net::TcpStream,
-    sync::RwLock,
+    // sync::RwLock,
     task::spawn,
 };
 use bitcoin::{
@@ -46,6 +46,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::RwLock;
 
 /// Max number of simultaneous connections we initiates we are willing to hold
 const MAX_OUTGOING_PEERS: usize = 10;

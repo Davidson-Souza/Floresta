@@ -35,6 +35,7 @@ floresta-electrum = { path = "../floresta-electrum", optional = true, version = 
 rustreexo = "0.1.0"
 miniscript = "10.0.0"
 async-std = "1.12.0"
+tokio = { version = "1.35.0", features = ["full"] }
 bitcoin = { version = "0.29", features = [
     "serde",
     "no-std",
