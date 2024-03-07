@@ -6,6 +6,7 @@
 
 //! Bitcoin SLIP-132 standard implementation for parsing custom xpub/xpriv key
 //! formats
+#![allow(unused)]
 
 #[cfg(feature = "strict_encoding")]
 #[macro_use]
