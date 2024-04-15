@@ -35,6 +35,7 @@ use log::info;
 use log::trace;
 use serde_json::json;
 use serde_json::Value;
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 
 use crate::get_arg;
 use crate::json_rpc_res;
@@ -113,6 +114,8 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
     /// scan, since a wallet will often send multiple addresses, but
     /// in different requests.
     pub addresses_to_scan: Vec<sha256::Hash>,
+
+    pub ssl_acceptor: Arc<SslAcceptor>
 }
 
 impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
@@ -122,8 +125,15 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         chain: Arc<Blockchain>,
         block_filters: Option<Arc<BlockFilterBackend>>,
         node_interface: Arc<NodeInterface>,
+        cert_path: &str,
+        key_path: &str,
     ) -> Result<ElectrumServer<Blockchain>, Box<dyn std::error::Error>> {
+        let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        builder.set_private_key_file(key_path, SslFiletype::PEM).unwrap();
+        builder.set_certificate_chain_file(cert_path).unwrap();
+
         let listener = Arc::new(TcpListener::bind(address).await?);
+        let ssl_acceptor = Arc::new(builder.build());
         let (tx, rx) = unbounded();
         let unconfirmed = address_cache.read().await.find_unconfirmed().unwrap();
         for tx in unconfirmed {
@@ -140,9 +150,9 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             message_transmitter: tx,
             client_addresses: HashMap::new(),
             addresses_to_scan: Vec::new(),
+            ssl_acceptor
         })
     }
-
     /// Handle a request from a client. All methods are defined in the electrum
     /// protocol.
     pub async fn handle_client_request(

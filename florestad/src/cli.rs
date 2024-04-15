@@ -115,6 +115,10 @@ pub enum Commands {
         rpc_address: Option<String>,
         #[arg(long)]
         electrum_address: Option<String>,
+        #[clap(long)]
+        cert_path: Option<String>,
+        #[clap(long)]
+        key_path: Option<String>,
     },
 }
 

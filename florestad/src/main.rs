@@ -93,6 +93,8 @@ struct Ctx {
     #[cfg(feature = "json-rpc")]
     json_rpc_address: Option<String>,
     electrum_address: Option<String>,
+    cert_path: Option<String>,
+    key_path: Option<String>,
 }
 fn main() {
     // Setup global logger
@@ -117,6 +119,8 @@ fn main() {
             connect,
             rpc_address,
             electrum_address,
+            cert_path,
+            key_path,
         }) => {
             // By default, we build filters for WPKH and TR outputs, as they are the newest.
             // We also build the `inputs` filters to find spends
@@ -144,6 +148,8 @@ fn main() {
                 #[cfg(feature = "json-rpc")]
                 json_rpc_address: rpc_address,
                 electrum_address,
+                cert_path,
+                key_path,
             };
 
             run_with_ctx(ctx);
@@ -351,6 +357,8 @@ fn run_with_ctx(ctx: Ctx) {
     );
 
     // Electrum
+    let cert_path = ctx.cert_path.unwrap_or_else(|| "./ssl/certificate.pem".to_string());
+    let key_path = ctx.key_path.unwrap_or_else(|| "./ssl/key.pem".to_string());
     let electrum_address = ctx.electrum_address.unwrap_or("0.0.0.0:50001".into());
     let electrum_server = block_on(ElectrumServer::new(
         electrum_address,
@@ -358,6 +366,8 @@ fn run_with_ctx(ctx: Ctx) {
         blockchain_state,
         cfilters,
         chain_provider.get_handle(),
+        &cert_path,
+        &key_path,
     ))
     .expect("Could not create an Electrum Server");
 

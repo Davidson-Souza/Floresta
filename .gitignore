@@ -5,3 +5,4 @@ perf.*
 config.toml
 /builds
 data/
+ssl/
