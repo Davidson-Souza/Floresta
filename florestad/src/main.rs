@@ -19,7 +19,6 @@
 
 mod cli;
 mod config_file;
-mod error;
 mod florestad;
 #[cfg(feature = "json-rpc")]
 mod json_rpc;

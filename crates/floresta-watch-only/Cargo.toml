@@ -18,6 +18,7 @@ kv = "0.24.0"
 log = "0.4"
 thiserror = "1.0"
 floresta-common = { path = "../floresta-common" }
+floresta-errors = { path = "../floresta-errors" }
 hex = "0.4.3"
 
 [features]

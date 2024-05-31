@@ -2,6 +2,7 @@
 use core::cmp::Ordering;
 use core::fmt::Debug;
 
+
 use bitcoin::hashes::sha256;
 use bitcoin::ScriptBuf;
 use floresta_common::get_spk_hash;
@@ -24,38 +25,11 @@ use bitcoin::OutPoint;
 use bitcoin::Transaction;
 use bitcoin::TxOut;
 use floresta_common::prelude::*;
+use floresta_errors::watch_only::commom::DbError;
+use floresta_errors::watch_only::commom::WatchOnlyError;
 use merkle::MerkleProof;
 use serde::Deserialize;
 use serde::Serialize;
-
-#[derive(Debug)]
-pub enum WatchOnlyError<DatabaseError: fmt::Debug> {
-    WalletNotInitialized,
-    TransactionNotFound,
-    DatabaseError(DatabaseError),
-}
-impl<DatabaseError: fmt::Debug> Display for WatchOnlyError<DatabaseError> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WatchOnlyError::WalletNotInitialized => {
-                write!(f, "Wallet isn't initialized")
-            }
-            WatchOnlyError::TransactionNotFound => {
-                write!(f, "Transaction not found")
-            }
-            WatchOnlyError::DatabaseError(e) => {
-                write!(f, "Database error: {:?}", e)
-            }
-        }
-    }
-}
-impl<DatabaseError: fmt::Debug> From<DatabaseError> for WatchOnlyError<DatabaseError> {
-    fn from(e: DatabaseError) -> Self {
-        WatchOnlyError::DatabaseError(e)
-    }
-}
-impl<T: Debug> floresta_common::prelude::Error for WatchOnlyError<T> {}
-
 /// Every address contains zero or more associated transactions, this struct defines what
 /// data we store for those.
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
@@ -121,33 +95,32 @@ pub struct Stats {
 }
 /// Public trait defining a common interface for databases to be used with our cache
 pub trait AddressCacheDatabase {
-    type Error: fmt::Debug + Send + Sync + 'static;
     /// Saves a new address to the database. If the address already exists, `update` should
     /// be used instead
     fn save(&self, address: &CachedAddress);
     /// Loads all addresses we have cached so far
-    fn load(&self) -> Result<Vec<CachedAddress>, Self::Error>;
+    fn load(&self) -> Result<Vec<CachedAddress>, DbError>;
     /// Loads the data associated with our watch-only wallet.
-    fn get_stats(&self) -> Result<Stats, Self::Error>;
+    fn get_stats(&self) -> Result<Stats, DbError>;
     /// Saves the data associated with our watch-only wallet.
-    fn save_stats(&self, stats: &Stats) -> Result<(), Self::Error>;
+    fn save_stats(&self, stats: &Stats) -> Result<(), DbError>;
     /// Updates an address, probably because a new transaction arrived
     fn update(&self, address: &CachedAddress);
     /// TODO: Maybe turn this into another db
     /// Returns the height of the last block we filtered
-    fn get_cache_height(&self) -> Result<u32, Self::Error>;
+    fn get_cache_height(&self) -> Result<u32, DbError>;
     /// Saves the height of the last block we filtered
-    fn set_cache_height(&self, height: u32) -> Result<(), Self::Error>;
+    fn set_cache_height(&self, height: u32) -> Result<(), DbError>;
     /// Saves the descriptor of associated cache
-    fn desc_save(&self, descriptor: &str) -> Result<(), Self::Error>;
+    fn desc_save(&self, descriptor: &str) -> Result<(), DbError>;
     /// Get associated descriptors
-    fn descs_get(&self) -> Result<Vec<String>, Self::Error>;
+    fn descs_get(&self) -> Result<Vec<String>, DbError>;
     /// Get a transaction from the database
-    fn get_transaction(&self, txid: &Txid) -> Result<CachedTransaction, Self::Error>;
+    fn get_transaction(&self, txid: &Txid) -> Result<CachedTransaction, DbError>;
     /// Saves a transaction to the database
-    fn save_transaction(&self, tx: &CachedTransaction) -> Result<(), Self::Error>;
+    fn save_transaction(&self, tx: &CachedTransaction) -> Result<(), DbError>;
     /// Returns all transaction we have cached so far
-    fn list_transactions(&self) -> Result<Vec<Txid>, Self::Error>;
+    fn list_transactions(&self) -> Result<Vec<Txid>, DbError>;
 }
 /// Holds all addresses and associated transactions. We need a database with some basic
 /// methods, to store all data
@@ -361,21 +334,21 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
     }
     /// Setup is the first command that should be executed. In a new cache. It sets our wallet's
     /// state, like the height we should start scanning and the wallet's descriptor.
-    pub fn setup(&self) -> Result<(), WatchOnlyError<D::Error>> {
+    pub fn setup(&self) -> Result<(), WatchOnlyError>{
         if self.database.descs_get().is_err() {
             self.database.set_cache_height(0)?;
         }
         Ok(())
     }
     /// Tells whether or not a descriptor is already cached
-    pub fn is_cached(&self, desc: &String) -> Result<bool, WatchOnlyError<D::Error>> {
+    pub fn is_cached(&self, desc: &String) -> Result<bool, WatchOnlyError> {
         let known_descs = self.database.descs_get()?;
         Ok(known_descs.contains(desc))
     }
-    pub fn push_descriptor(&self, descriptor: &str) -> Result<(), WatchOnlyError<D::Error>> {
+    pub fn push_descriptor(&self, descriptor: &str) -> Result<(), WatchOnlyError> {
         Ok(self.database.desc_save(descriptor)?)
     }
-    fn derive_addresses(&mut self) -> Result<(), WatchOnlyError<D::Error>> {
+    fn derive_addresses(&mut self) -> Result<(), WatchOnlyError> {
         let mut stats = self.get_stats();
         let descriptors = self.database.descs_get()?;
         let descriptors = parse_descriptors(&descriptors).expect("We validate those descriptors");
@@ -401,7 +374,7 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
             }
         }
     }
-    pub fn find_unconfirmed(&self) -> Result<Vec<Transaction>, WatchOnlyError<D::Error>> {
+    pub fn find_unconfirmed(&self) -> Result<Vec<Transaction>, WatchOnlyError> {
         let transactions = self.database.list_transactions()?;
         let mut unconfirmed = Vec::new();
 

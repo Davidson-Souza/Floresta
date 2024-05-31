@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use floresta_errors::florestad::commom::FlorestadError;
 
 #[derive(Default, Debug, Deserialize)]
 pub struct Wallet {
@@ -13,7 +14,7 @@ pub struct ConfigFile {
 }
 
 impl ConfigFile {
-    pub fn from_file(filename: &str) -> Result<Self, crate::error::Error> {
+    pub fn from_file(filename: &str) -> Result<Self, FlorestadError> {
         let file = std::fs::read_to_string(filename)?;
         Ok(toml::from_str(&file)?)
     }

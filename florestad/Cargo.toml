@@ -21,14 +21,13 @@ bitcoin = { version = "0.31", features = ["serde", "std", "bitcoinconsensus"] }
 ctrlc = "3.2.5"
 fern = { version = "0.6", features = ["colored"] }
 chrono = "0.4.19"
+floresta-errors = { path = "../crates/floresta-errors"}
 floresta-chain = { path = "../crates/floresta-chain" }
 floresta-common = { path = "../crates/floresta-common" }
 floresta-electrum = { path = "../crates/floresta-electrum" }
 floresta-watch-only = { path = "../crates/floresta-watch-only" }
 floresta-wire = { path = "../crates/floresta-wire" }
 floresta-compact-filters = { path = "../crates/floresta-compact-filters", optional=true }
-
-anyhow = "1.0.40"
 jsonrpc-http-server = { version = "18.0.0", optional = true }
 jsonrpc-derive = { version = "18.0.0", optional = true }
 jsonrpc-core = { version = "18.0.0", optional = true }

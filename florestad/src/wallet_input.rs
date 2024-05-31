@@ -7,19 +7,21 @@ use bitcoin::Address;
 use miniscript::Descriptor;
 use miniscript::DescriptorPublicKey;
 
+use floresta_errors::florestad::commom::FlorestadError;
+
+
 pub mod extended_pub_key {
     use bitcoin::bip32::Xpub;
+    use floresta_errors::florestad::slip123::Slip32Errors;
 
     use crate::slip132;
 
-    pub fn from_str(s: &str) -> Result<Xpub, slip132::Error> {
+    pub fn from_str(s: &str) -> Result<Xpub, Slip32Errors> {
         slip132::FromSlip132::from_slip132_str(s)
     }
 }
 
-fn parse_xpubs(
-    xpubs: &[String],
-) -> Result<Vec<Descriptor<DescriptorPublicKey>>, crate::error::Error> {
+fn parse_xpubs(xpubs: &[String]) -> Result<Vec<Descriptor<DescriptorPublicKey>>, FlorestadError> {
     let mut descriptors = Vec::new();
     for key in xpubs {
         // Parses the descriptor and get an external and change descriptors
@@ -48,7 +50,7 @@ impl InitialWalletSetup {
         addresses: &[String],
         network: bitcoin::Network,
         addresses_per_descriptor: u32,
-    ) -> Result<Self, crate::error::Error> {
+    ) -> Result<Self, FlorestadError> {
         let mut descriptors = parse_xpubs(xpubs)?;
         descriptors.extend(parse_descriptors(initial_descriptors)?);
         descriptors.sort();
@@ -83,7 +85,7 @@ impl InitialWalletSetup {
 
 pub fn parse_descriptors(
     descriptors: &[String],
-) -> Result<Vec<Descriptor<DescriptorPublicKey>>, crate::error::Error> {
+) -> Result<Vec<Descriptor<DescriptorPublicKey>>, FlorestadError> {
     let descriptors = descriptors
         .iter()
         .map(|descriptor| {

@@ -14,10 +14,6 @@ extern crate strict_encoding;
 #[cfg(feature = "serde")]
 #[macro_use]
 extern crate serde_crate as serde;
-
-use std::fmt::Debug;
-use std::str::FromStr;
-
 use bitcoin::base58;
 use bitcoin::bip32;
 use bitcoin::bip32::Xpriv;
@@ -83,39 +79,7 @@ pub const VERSION_MAGIC_VPUB_MULTISIG: [u8; 4] = [0x02, 0x57, 0x54, 0x83];
 pub const VERSION_MAGIC_VPRV_MULTISIG: [u8; 4] = [0x02, 0x57, 0x50, 0x48];
 
 /// Extended public and private key processing errors
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Error {
-    /// error in BASE58 key encoding. Details: {0}
-    Base58(base58::Error),
 
-    /// error in hex key encoding. Details: {0}
-    Hex(bitcoin::hashes::hex::HexToArrayError),
-
-    /// pk->pk derivation was attempted on a hardened key.
-    CannotDeriveFromHardenedKey,
-
-    /// child number {0} is out of range.
-    InvalidChildNumber(u32),
-
-    /// invalid child number format.
-    InvalidChildNumberFormat,
-
-    /// invalid derivation path format.
-    InvalidDerivationPathFormat,
-
-    /// unknown version magic bytes {0:#06X?}
-    UnknownVersion([u8; 4]),
-
-    /// encoded extended key data has wrong length {0}
-    WrongExtendedKeyLength(usize),
-
-    /// unrecognized or unsupported extended key prefix (please check SLIP 32
-    /// for possible values)
-    UnknownSlip32Prefix,
-
-    /// failure in rust bitcoin library
-    InternalFailure,
-}
 
 #[cfg(feature = "strict_encoding")]
 impl strict_encoding::StrictEncode for Error {
@@ -131,28 +95,6 @@ impl strict_encoding::StrictDecode for Error {
     }
 }
 
-impl From<bip32::Error> for Error {
-    fn from(err: bip32::Error) -> Self {
-        match err {
-            bip32::Error::CannotDeriveFromHardenedKey => Error::CannotDeriveFromHardenedKey,
-            bip32::Error::InvalidChildNumber(no) => Error::InvalidChildNumber(no),
-            bip32::Error::InvalidChildNumberFormat => Error::InvalidChildNumberFormat,
-            bip32::Error::InvalidDerivationPathFormat => Error::InvalidDerivationPathFormat,
-            bip32::Error::Secp256k1(_) => Error::InternalFailure,
-            bip32::Error::UnknownVersion(ver) => Error::UnknownVersion(ver),
-            bip32::Error::WrongExtendedKeyLength(len) => Error::WrongExtendedKeyLength(len),
-            bip32::Error::Base58(err) => Error::Base58(err),
-            bip32::Error::Hex(err) => Error::Hex(err),
-            _ => Error::InternalFailure,
-        }
-    }
-}
-
-impl From<base58::Error> for Error {
-    fn from(err: base58::Error) -> Self {
-        Error::Base58(err)
-    }
-}
 
 /// Structure holding 4 version bytes with magical numbers representing
 /// different versions of extended public and private keys according to BIP-32.
@@ -219,14 +161,10 @@ pub enum KeyApplication {
     #[cfg_attr(feature = "serde", serde(rename = "bip48-nested"))]
     NestedMultisig,
 }
-
-/// Unknown string representation of [`KeyApplication`] enum
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct UnknownKeyApplicationError;
-
+use floresta_errors::florestad::slip123::{Slip32Errors, Slip32Errors::UnknownKeyApplicationError};
+use std::str::FromStr;
 impl FromStr for KeyApplication {
-    type Err = UnknownKeyApplicationError;
-
+    type Err = Slip32Errors;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s.to_lowercase().as_str() {
             "bip44" => KeyApplication::Hashed,
@@ -234,7 +172,7 @@ impl FromStr for KeyApplication {
             "bip48-native" => KeyApplication::SegWitMultisig,
             "bip49" => KeyApplication::Nested,
             "bip48-nested" => KeyApplication::NestedMultisig,
-            _ => return Err(UnknownKeyApplicationError),
+            _ => return Err(UnknownKeyApplicationError(s.to_string())),
         })
     }
 }
@@ -242,13 +180,13 @@ impl FromStr for KeyApplication {
 /// Trait for building standard BIP32 extended keys from SLIP132 variant.
 pub trait FromSlip132 {
     /// Constructs standard BIP32 extended key from SLIP132 string.
-    fn from_slip132_str(s: &str) -> Result<Self, Error>
+    fn from_slip132_str(s: &str) -> Result<Self, Slip32Errors>
     where
         Self: Sized;
 }
 
 impl FromSlip132 for Xpub {
-    fn from_slip132_str(s: &str) -> Result<Self, Error> {
+    fn from_slip132_str(s: &str) -> Result<Self, Slip32Errors> {
         let mut data = base58::decode_check(s)?;
 
         let mut prefix = [0u8; 4];
@@ -266,7 +204,7 @@ impl FromSlip132 for Xpub {
             | VERSION_MAGIC_UPUB_MULTISIG
             | VERSION_MAGIC_VPUB_MULTISIG => VERSION_MAGIC_TPUB,
 
-            _ => return Err(Error::UnknownSlip32Prefix),
+            _ => return Err(Slip32Errors::UnknownSlip32Prefix),
         };
         data[0..4].copy_from_slice(&slice);
 
@@ -277,7 +215,7 @@ impl FromSlip132 for Xpub {
 }
 
 impl FromSlip132 for Xpriv {
-    fn from_slip132_str(s: &str) -> Result<Self, Error> {
+    fn from_slip132_str(s: &str) -> Result<Self, Slip32Errors> {
         let mut data = base58::decode_check(s)?;
 
         let mut prefix = [0u8; 4];
@@ -295,7 +233,7 @@ impl FromSlip132 for Xpriv {
             | VERSION_MAGIC_UPRV_MULTISIG
             | VERSION_MAGIC_VPRV_MULTISIG => VERSION_MAGIC_TPRV,
 
-            _ => return Err(Error::UnknownSlip32Prefix),
+            _ => return Err(Slip32Errors::UnknownSlip32Prefix),
         };
         data[0..4].copy_from_slice(&slice);
 

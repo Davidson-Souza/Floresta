@@ -1,0 +1,21 @@
+[package]
+name = "floresta-errors"
+version = "0.1.0"
+edition = "2021"
+authors = ["Joao Leal <jgleal@protonmail.com>"]
+description = """
+    A lib including all floresta's errors
+"""
+repository = "https://github.com/Davidson-Souza/Floresta"
+license = "MIT"
+readme = "README.md"
+keywords = ["bitcoin", "utreexo", "node", "blockchain", "rust"]
+categories = ["bitcoin", "blockchain", "node"]
+
+[dependencies]
+kv = "0.24.0"
+bitcoin = { version = "0.31", features = ["std"] }
+thiserror = "1.0.60"
+serde_json = "1.0" 
+miniscript = "11"
+toml = "0.5.10"

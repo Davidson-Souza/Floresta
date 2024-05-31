@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use anyhow::Ok;
+use crate::error::AppError;
 use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::Txid;
@@ -9,11 +9,12 @@ use clap::Subcommand;
 use floresta_cli::reqwest_client::ReqwestClient;
 use floresta_cli::rpc::FlorestaRPC;
 
+mod error;
 mod reqwest_client;
 mod rpc;
 mod rpc_types;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), AppError> {
     let cli = Cli::parse();
 
     let client = ReqwestClient::new(get_host(&cli));
@@ -21,7 +22,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("{}", res);
 
-    anyhow::Ok(())
+    Ok(())
 }
 
 fn get_host(cmd: &Cli) -> String {
@@ -38,7 +39,7 @@ fn get_host(cmd: &Cli) -> String {
     }
 }
 
-fn do_request(cmd: &Cli, client: ReqwestClient) -> anyhow::Result<String> {
+fn do_request(cmd: &Cli, client: ReqwestClient) -> Result<String, AppError> {
     Ok(match cmd.methods.clone() {
         Methods::GetBlockchainInfo => serde_json::to_string_pretty(&client.get_blockchain_info()?)?,
         Methods::GetBlockHash { height } => {

@@ -1,7 +1,6 @@
-use std::fmt::Display;
-
 use serde::Deserialize;
 use serde::Serialize;
+use thiserror::Error;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct GetBlockchainInfoRes {
@@ -248,41 +247,20 @@ pub struct GetBlockRes {
     pub nextblockhash: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 /// All possible errors returned by the jsonrpc
 pub enum Error {
+    #[error(transparent)]
     /// An error while deserializing our response
-    Serde(serde_json::Error),
+    Serde(#[from] serde_json::Error),
     #[cfg(feature = "with-reqwest")]
     /// An internal reqwest error
-    Reqwest(reqwest::Error),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
     /// An error internal to our jsonrpc server
-    Api(serde_json::Value),
+    #[error(transparent)]
+    Api(#[from] serde_json::Value),
     /// The server sent an empty response
+    #[error("Empty response")]
     EmtpyResponse,
 }
-
-impl From<serde_json::Error> for Error {
-    fn from(value: serde_json::Error) -> Self {
-        Error::Serde(value)
-    }
-}
-
-impl From<reqwest::Error> for Error {
-    fn from(value: reqwest::Error) -> Self {
-        Error::Reqwest(value)
-    }
-}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Reqwest(e) => write!(f, "reqwest returned an error {e}"),
-            Error::Api(e) => write!(f, "general jsonrpc error: {e}"),
-            Error::Serde(e) => write!(f, "error while deserializing the response: {e}"),
-            Error::EmtpyResponse => write!(f, "got an empty response from server"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
