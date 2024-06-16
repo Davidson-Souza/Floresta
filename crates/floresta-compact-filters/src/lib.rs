@@ -24,7 +24,9 @@ use log::error;
 
 mod bip158;
 pub mod kv_filter_database;
+pub mod network_filters;
 
+pub use bip158::BlockFilter;
 use bip158::*;
 
 /// A database that stores our compact filters
@@ -90,9 +92,6 @@ pub struct BlockFilterBackend {
     /// an actual block hash
     key: [u8; 32],
 }
-
-unsafe impl Sync for BlockFilterBackend {}
-unsafe impl Send for BlockFilterBackend {}
 
 /// Keeps track of a unfinnished BIP-158 block filter. We use this to add new elements
 /// to the filter, until there's nothing more to add
@@ -255,7 +254,7 @@ impl BlockConsumer for BlockFilterBackend {
 /// Fields have the same meaning as in the backend itself.
 #[derive(Default)]
 pub struct FilterBackendBuilder {
-    /// Were we should store our filter.
+    /// Where we should store our filter.
     storage: Option<Box<dyn BlockFilterStore>>,
     /// What types of outputs should we store.
     whitelisted_outputs: u8,

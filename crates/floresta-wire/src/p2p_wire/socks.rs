@@ -123,11 +123,11 @@ pub enum Socks5Error {
     InvalidAuthMethod,
     ConnectionFailed,
     InvalidAddress,
-    ReadError(futures::io::Error),
+    ReadError,
 }
 
 impl From<futures::io::Error> for Socks5Error {
-    fn from(error: futures::io::Error) -> Self {
-        Socks5Error::ReadError(error)
+    fn from(_error: futures::io::Error) -> Self {
+        Socks5Error::ReadError
     }
 }

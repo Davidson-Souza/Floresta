@@ -23,8 +23,8 @@ use floresta_chain::pruned_utreexo::BlockchainInterface;
 use floresta_chain::pruned_utreexo::UpdatableChainstate;
 use floresta_chain::ChainState;
 use floresta_chain::KvChainStore;
-use floresta_compact_filters::BlockFilterBackend;
-use floresta_compact_filters::QueryType;
+use floresta_compact_filters::kv_filter_database::KvFilterStore;
+use floresta_compact_filters::network_filters::NetworkFilters;
 use floresta_watch_only::kv_database::KvDatabase;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::CachedTransaction;
@@ -35,6 +35,7 @@ use futures::executor::block_on;
 use jsonrpc_core::Result;
 use jsonrpc_derive::rpc;
 use jsonrpc_http_server::ServerBuilder;
+use log::info;
 use serde_json::json;
 use serde_json::Value;
 
@@ -84,13 +85,14 @@ pub trait Rpc {
 }
 
 pub struct RpcImpl {
-    block_filter_storage: Option<Arc<BlockFilterBackend>>,
+    block_filter_storage: Option<Arc<NetworkFilters<KvFilterStore>>>,
     network: Network,
-    chain: Arc<ChainState<KvChainStore>>,
+    chain: Arc<ChainState<KvChainStore<'static>>>,
     wallet: Arc<RwLock<AddressCache<KvDatabase>>>,
     node: Arc<NodeInterface>,
     kill_signal: Arc<RwLock<bool>>,
 }
+
 impl Rpc for RpcImpl {
     fn get_tx_out(&self, tx_id: Txid, outpoint: u32) -> Result<Value> {
         fn has_input(block: &Block, expected_input: OutPoint) -> bool {
@@ -119,17 +121,17 @@ impl Rpc for RpcImpl {
                 vout: outpoint,
             };
 
-            let filter_outpoint = QueryType::Input(vout.into());
-            let filter_txid = QueryType::Txid(tx_id);
+            let filter_outpoint = bitcoin::consensus::serialize(&vout);
+            let filter_txid = bitcoin::consensus::serialize(&tx_id);
 
-            let candidates = cfilters
-                .match_any(1, tip as u64, &[filter_outpoint, filter_txid])
-                .unwrap();
+            let candidates = cfilters.match_any(
+                vec![filter_outpoint.as_slice(), filter_txid.as_slice()],
+                1,
+                tip,
+                self.chain.clone(),
+            );
 
-            let candidates = candidates
-                .into_iter()
-                .flat_map(|height| self.chain.get_block_hash(height as u32))
-                .map(|hash| self.node.get_block(hash));
+            let candidates = candidates.into_iter().map(|hash| self.node.get_block(hash));
 
             for candidate in candidates {
                 let candidate = match candidate {
@@ -396,6 +398,7 @@ impl Rpc for RpcImpl {
         Ok(true)
     }
 }
+
 impl RpcImpl {
     fn make_vin(&self, input: TxIn) -> TxInJson {
         let txid = serialize_hex(&input.previous_output.txid);
@@ -512,13 +515,12 @@ impl RpcImpl {
 
     #[allow(clippy::too_many_arguments)]
     pub fn create(
-        chain: Arc<ChainState<KvChainStore>>,
+        chain: Arc<ChainState<KvChainStore<'static>>>,
         wallet: Arc<RwLock<AddressCache<KvDatabase>>>,
-        net: &Network,
         node: Arc<NodeInterface>,
         kill_signal: Arc<RwLock<bool>>,
         network: Network,
-        block_filter_storage: Option<Arc<BlockFilterBackend>>,
+        block_filter_storage: Option<Arc<NetworkFilters<KvFilterStore>>>,
         address: Option<SocketAddr>,
     ) -> jsonrpc_http_server::Server {
         let mut io = jsonrpc_core::IoHandler::new();
@@ -532,10 +534,11 @@ impl RpcImpl {
         };
         io.extend_with(rpc_impl.to_delegate());
         let address = address.unwrap_or_else(|| {
-            format!("127.0.0.1:{}", Self::get_port(net))
+            format!("127.0.0.1:{}", Self::get_port(&network))
                 .parse()
                 .unwrap()
         });
+        info!("Starting JSON-RPC server on {:?}", address);
         ServerBuilder::new(io)
             .threads(1)
             .start_http(&address)

@@ -20,7 +20,7 @@
 //! handle the peer-to-peer protocol. It is not a full node, it doesn't store the blockchain
 //! or validate data, it just sends and receives messages.
 //!
-//! Floresta also provides a simple watch-only wallet an an electrum server implementation.
+//! Floresta also provides a simple watch-only wallet and an electrum server implementation.
 //! They are meant to be used in `florestad`, a full node implementation that uses all the
 //! crates in this project.
 //!

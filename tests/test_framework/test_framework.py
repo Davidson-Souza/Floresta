@@ -21,7 +21,7 @@ class TestFramework:
             "--",
             "--network",
             net
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ])
         self.nodes.append(FlorestaRPC(node))
 
     def wait_for_rpc_connection(self):

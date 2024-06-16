@@ -19,6 +19,8 @@
 //!                  will handle new blocks (even if `SyncNode` haven't returned) and handle
 //!                  requests by users.
 
+use bitcoin::p2p::ServiceFlags;
+
 /// This trait mainly defines a bunch of constants that we need for the node, but we may tweak
 /// those values for each one. It's also an organized way of defining those constants anyway.
 pub trait NodeContext {
@@ -32,7 +34,7 @@ pub trait NodeContext {
     /// Attempt to open a new connection (if needed) every TRY_NEW_CONNECTION seconds
     const TRY_NEW_CONNECTION: u64 = 10; // 10 seconds
     /// If ASSUME_STALE seconds passed since our last tip update, treat it as stale
-    const ASSUME_STALE: u64 = 30 * 60; // 30 minutes
+    const ASSUME_STALE: u64 = 15 * 60; // 15 minutes
     /// While on IBD, if we've been without blocks for this long, ask for headers again
     const IBD_REQUEST_BLOCKS_AGAIN: u64 = 30; // 30 seconds
     /// How often we broadcast transactions
@@ -49,6 +51,9 @@ pub trait NodeContext {
     const BLOCK_CHECK_INTERVAL: u64 = 60 * 5; // 5 minutes
     /// How often we send our addresses to our peers
     const SEND_ADDRESSES_INTERVAL: u64 = 60 * 60; // 1 hour
+    fn get_required_services(&self) -> ServiceFlags {
+        ServiceFlags::NETWORK
+    }
 }
 
 pub(crate) type PeerId = u32;

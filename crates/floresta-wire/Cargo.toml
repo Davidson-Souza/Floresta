@@ -16,7 +16,7 @@ categories = ["bitcoin", "blockchain", "node"]
 
 
 [dependencies]
-rustreexo = "0.1.0"
+rustreexo = "0.2.0"
 sha2 = "^0.10.6"
 async-std = { version = "1.12.0", features = ["attributes", "alloc"] }
 tokio = { version = "1", features = ["full"] }
@@ -30,6 +30,7 @@ rand = "0.8.5"
 bitcoin = { version = "0.31", features = ["serde", "std", "bitcoinconsensus"] }
 dns-lookup = "1.0.8"
 floresta-chain = { path = "../floresta-chain" }
+floresta-compact-filters = { path = "../floresta-compact-filters" }
 thiserror = "1.0"
 floresta-common = { path = "../floresta-common" }
 oneshot = "0.1.5"

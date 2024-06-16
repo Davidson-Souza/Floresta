@@ -29,6 +29,8 @@ pub enum WireError {
     NoUtreexoPeersAvailable,
     #[error("We couldn't find a peer to send the request")]
     NoPeerToSendRequest,
+    #[error("Peer timed out")]
+    PeerTimeout,
 }
 impl_error_from!(WireError, PeerError, PeerError);
 impl_error_from!(WireError, BlockchainError, Blockchain);

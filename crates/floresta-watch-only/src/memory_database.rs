@@ -82,7 +82,7 @@ impl AddressCacheDatabase for MemoryDatabase {
                 inner
                     .addresses
                     .entry(address.script_hash)
-                    .and_modify(|addr| *addr = address.to_owned());
+                    .and_modify(|addr| addr.clone_from(address));
             })
             .unwrap();
     }

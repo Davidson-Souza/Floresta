@@ -21,7 +21,7 @@ floresta-watch-only = { path = "../floresta-watch-only" }
 floresta-compact-filters = { path = "../floresta-compact-filters" }
 floresta-wire = { path = "../floresta-wire" }
 
-rustreexo = "0.1.0"
+rustreexo = "0.2.0"
 sha2 = "^0.10.6"
 async-std = { version = "1.12.0", features = ["attributes"] }
 log = "0.4"

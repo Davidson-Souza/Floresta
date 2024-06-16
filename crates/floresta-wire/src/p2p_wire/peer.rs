@@ -19,6 +19,7 @@ use tokio::time::timeout;
 // use async_std::sync::RwLock;
 // use async_std::task::spawn;
 
+use bitcoin::bip158;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::serialize;
 use bitcoin::hashes::Hash;
@@ -248,6 +249,15 @@ impl Peer {
 
                 let _ = self.write(NetworkMessage::GetData(inv)).await;
             }
+            NodeRequest::GetUtreexoState((block_hash, height)) => {
+                let get_filter = bitcoin::p2p::message_filter::GetCFilters {
+                    filter_type: 1,
+                    start_height: height,
+                    stop_hash: block_hash,
+                };
+
+                let _ = self.write(NetworkMessage::GetCFilters(get_filter)).await;
+            }
             NodeRequest::GetHeaders(locator) => {
                 let _ = self
                     .write(NetworkMessage::GetHeaders(
@@ -276,6 +286,15 @@ impl Peer {
             }
             NodeRequest::SendAddresses(addresses) => {
                 self.write(NetworkMessage::AddrV2(addresses)).await?;
+            }
+            NodeRequest::GetFilter((stop_hash, start_height)) => {
+                let get_filter = bitcoin::p2p::message_filter::GetCFilters {
+                    filter_type: 0,
+                    start_height,
+                    stop_hash,
+                };
+
+                self.write(NetworkMessage::GetCFilters(get_filter)).await?;
             }
         }
         Ok(())
@@ -350,6 +369,29 @@ impl Peer {
                 NetworkMessage::Unknown { command, payload } => {
                     warn!("Unknown message: {} {:?}", command, payload);
                 }
+                NetworkMessage::CFilter(filter_msg) => match filter_msg.filter_type {
+                    0 => {
+                        let filter = bip158::BlockFilter::new(&filter_msg.filter);
+
+                        // FIXME
+                        let filter = unsafe {
+                            std::mem::transmute::<
+                                bitcoin::bip158::BlockFilter,
+                                floresta_compact_filters::BlockFilter,
+                            >(filter)
+                        };
+                        self.send_to_node(PeerMessages::BlockFilter((
+                            filter_msg.block_hash,
+                            filter,
+                        )))
+                        .await;
+                    }
+                    1 => {
+                        self.send_to_node(PeerMessages::UtreexoState(filter_msg.filter))
+                            .await;
+                    }
+                    _ => {}
+                },
                 // Explicitly ignore these messages, if something changes in the future
                 // this would cause a compile error.
                 NetworkMessage::Verack
@@ -360,7 +402,6 @@ impl Peer {
                 | NetworkMessage::BlockTxn(_)
                 | NetworkMessage::CFCheckpt(_)
                 | NetworkMessage::CFHeaders(_)
-                | NetworkMessage::CFilter(_)
                 | NetworkMessage::CmpctBlock(_)
                 | NetworkMessage::FilterAdd(_)
                 | NetworkMessage::FilterClear
@@ -660,4 +701,6 @@ pub enum PeerMessages {
     NotFound(Inventory),
     /// Remote peer sent us a transaction
     Transaction(Transaction),
+    UtreexoState(Vec<u8>),
+    BlockFilter((BlockHash, floresta_compact_filters::BlockFilter)),
 }

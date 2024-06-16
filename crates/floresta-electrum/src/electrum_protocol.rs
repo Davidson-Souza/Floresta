@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,7 +15,6 @@ use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::sha256;
-use bitcoin::hashes::Hash;
 use bitcoin::ScriptBuf;
 use bitcoin::Transaction;
 use bitcoin::TxOut;
@@ -23,8 +23,8 @@ use floresta_chain::pruned_utreexo::BlockchainInterface;
 use floresta_common::get_hash_from_u8;
 use floresta_common::get_spk_hash;
 use floresta_common::spsc::Channel;
-use floresta_compact_filters::BlockFilterBackend;
-use floresta_compact_filters::QueryType;
+use floresta_compact_filters::kv_filter_database::KvFilterStore;
+use floresta_compact_filters::network_filters::NetworkFilters;
 use floresta_watch_only::kv_database::KvDatabase;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::CachedTransaction;
@@ -102,7 +102,7 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
     pub client_addresses: HashMap<sha256::Hash, Arc<Client>>,
     /// A Arc-ed copy of the block filters backend that we can use to check if a
     /// block contains a transaction that we are interested in.
-    pub block_filters: Option<Arc<BlockFilterBackend>>,
+    pub block_filters: Option<Arc<NetworkFilters<KvFilterStore>>>,
     /// An interface to a running node, used to broadcast transactions and request
     /// blocks.
     pub node_interface: Arc<NodeInterface>,
@@ -120,7 +120,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         address: String,
         address_cache: Arc<RwLock<AddressCache<KvDatabase>>>,
         chain: Arc<Blockchain>,
-        block_filters: Option<Arc<BlockFilterBackend>>,
+        block_filters: Option<Arc<NetworkFilters<KvFilterStore>>>,
         node_interface: Arc<NodeInterface>,
     ) -> Result<ElectrumServer<Blockchain>, Box<dyn std::error::Error>> {
         let listener = Arc::new(TcpListener::bind(address).await?);
@@ -442,40 +442,32 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
     /// transactions, once a new address is added by subscription.
     async fn rescan_with_block_filters(
         &self,
-        cfilters: &BlockFilterBackend,
+        cfilters: &Arc<NetworkFilters<KvFilterStore>>,
         addresses: Vec<sha256::Hash>,
     ) -> Result<(), super::error::Error> {
         // By default, we look from 1..tip
         let height = self.chain.get_height().unwrap_or(0) as u64;
-
-        let addresses = addresses
-            .into_iter()
-            .map(|a| QueryType::ScriptHash(a.to_byte_array()))
+        let mut _addresses = addresses
+            .iter()
+            .map(|hash| hash.borrow())
             .collect::<Vec<_>>();
 
         // TODO (Davidson): Let users select what the starting and end height is
         let blocks: Vec<_> = cfilters
-            .match_any(1, height, &addresses)
-            .unwrap_or_default()
+            .match_any(_addresses, 1, height as u32, self.chain.clone())
             .into_iter()
-            .flat_map(|height| {
-                self.chain
-                    .get_block_hash(height as u32)
-                    .into_iter()
-                    .zip(Some(height))
-            })
-            .flat_map(|(hash, height)| {
-                self.node_interface
-                    .get_block(hash)
-                    .ok()
-                    .flatten()
-                    .map(|block| (block, height))
-            })
+            .flat_map(|hash| self.node_interface.get_block(hash).ok().flatten())
             .collect();
 
         // Tells users about the transactions we found
-        for (block, height) in blocks {
-            self.handle_block(block, height as u32).await;
+        for block in blocks {
+            let height = self
+                .chain
+                .get_block_height(&block.block_hash())
+                .ok()
+                .flatten()
+                .unwrap();
+            self.handle_block(block, height).await;
         }
 
         Ok(())

@@ -8,16 +8,21 @@ use bitcoin::consensus::serialize;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
 use bitcoin::BlockHash;
+use kv::Batch;
+use kv::Bucket;
+use spin::RwLock;
 
 use crate::prelude::*;
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum DiskBlockHeader {
     FullyValid(BlockHeader, u32),
+    AssumedValid(BlockHeader, u32),
     Orphan(BlockHeader),
     HeadersOnly(BlockHeader, u32),
     InFork(BlockHeader, u32),
     InvalidChain(BlockHeader),
 }
+
 impl DiskBlockHeader {
     pub fn block_hash(&self) -> BlockHash {
         self.deref().block_hash()
@@ -29,6 +34,7 @@ impl DiskBlockHeader {
             DiskBlockHeader::HeadersOnly(_, height) => Some(*height),
             DiskBlockHeader::InFork(_, height) => Some(*height),
             DiskBlockHeader::InvalidChain(_) => None,
+            DiskBlockHeader::AssumedValid(_, height) => Some(*height),
         }
     }
 }
@@ -41,6 +47,7 @@ impl Deref for DiskBlockHeader {
             DiskBlockHeader::HeadersOnly(header, _) => header,
             DiskBlockHeader::InFork(header, _) => header,
             DiskBlockHeader::InvalidChain(header) => header,
+            DiskBlockHeader::AssumedValid(header, _) => header,
         }
     }
 }
@@ -67,6 +74,10 @@ impl Decodable for DiskBlockHeader {
                 Ok(Self::InFork(header, height))
             }
             0x04 => Ok(Self::InvalidChain(header)),
+            0x05 => {
+                let height = u32::consensus_decode(reader)?;
+                Ok(Self::AssumedValid(header, height))
+            }
             _ => unreachable!(),
         }
     }
@@ -76,7 +87,7 @@ impl Encodable for DiskBlockHeader {
         &self,
         writer: &mut W,
     ) -> core::result::Result<usize, ioError> {
-        let mut len = 80 + 1; // Header + tag + height
+        let mut len = 80 + 1; // Header + tag
         match self {
             DiskBlockHeader::FullyValid(header, height) => {
                 0x00_u8.consensus_encode(writer)?;
@@ -104,6 +115,12 @@ impl Encodable for DiskBlockHeader {
                 0x04_u8.consensus_encode(writer)?;
                 header.consensus_encode(writer)?;
             }
+            DiskBlockHeader::AssumedValid(header, height) => {
+                0x05_u8.consensus_encode(writer)?;
+                header.consensus_encode(writer)?;
+                height.consensus_encode(writer)?;
+                len += 4;
+            }
         };
         Ok(len)
     }
@@ -114,91 +131,122 @@ use kv::Store;
 
 use super::chain_state::BestChain;
 use super::ChainStore;
-pub struct KvChainStore(Store);
-impl KvChainStore {
-    pub fn new(datadir: String) -> Result<KvChainStore, kv::Error> {
+
+pub struct KvChainStore<'a> {
+    _store: Store,
+    headers: Bucket<'a, Vec<u8>, Vec<u8>>,
+    index: Bucket<'a, Integer, Vec<u8>>,
+    meta: Bucket<'a, &'a str, Vec<u8>>,
+    headers_cache: RwLock<HashMap<BlockHash, DiskBlockHeader>>,
+    index_cache: RwLock<HashMap<u32, BlockHash>>,
+}
+
+impl<'a> KvChainStore<'a> {
+    pub fn new(datadir: String) -> Result<KvChainStore<'a>, kv::Error> {
         // Configure the database
         let cfg = Config::new(datadir + "/chain_data").cache_capacity(100_000_000);
 
         // Open the key/value store
         let store = Store::new(cfg)?;
 
-        Ok(KvChainStore(store))
+        Ok(KvChainStore {
+            headers: store.bucket(Some("headers"))?,
+            index: store.bucket(Some("index"))?,
+            meta: store.bucket(None)?,
+            _store: store,
+            headers_cache: RwLock::new(HashMap::new()),
+            index_cache: RwLock::new(HashMap::new()),
+        })
     }
 }
-impl ChainStore for KvChainStore {
+
+impl<'a> ChainStore for KvChainStore<'a> {
     type Error = kv::Error;
     fn load_roots(&self) -> Result<Option<Vec<u8>>, Self::Error> {
-        let bucket = self.0.bucket::<&str, Vec<u8>>(None)?;
-        bucket.get(&"roots")
+        self.meta.get(&"roots")
     }
-    fn save_roots(&self, roots: Vec<u8>) -> Result<(), Self::Error> {
-        let bucket = self.0.bucket::<&str, Vec<u8>>(None)?;
 
-        bucket.set(&"roots", &roots)?;
+    fn save_roots(&self, roots: Vec<u8>) -> Result<(), Self::Error> {
+        self.meta.set(&"roots", &roots)?;
         Ok(())
     }
 
     fn load_height(&self) -> Result<Option<BestChain>, Self::Error> {
-        let bucket = self.0.bucket::<&str, Vec<u8>>(None)?;
-        let height = bucket.get(&"height")?;
-
+        let height = self.meta.get(&"height")?;
         if let Some(height) = height {
             return Ok(Some(deserialize(&height).unwrap()));
         }
+
         Ok(None)
     }
 
     fn save_height(&self, height: &BestChain) -> Result<(), Self::Error> {
-        let bucket = self.0.bucket::<&str, Vec<u8>>(None)?;
         let height = serialize(height);
-        bucket.set(&"height", &height)?;
+        self.meta.set(&"height", &height)?;
         Ok(())
     }
-    fn get_header(&self, block_hash: &BlockHash) -> Result<Option<DiskBlockHeader>, Self::Error> {
-        let bucket = self.0.bucket::<&[u8], Vec<u8>>(Some("header"))?;
-        let block_hash = serialize(&block_hash);
 
-        let header = bucket.get(&&*block_hash)?;
-        if let Some(header) = header {
-            return Ok(Some(deserialize(&header).unwrap()));
+    fn get_header(&self, block_hash: &BlockHash) -> Result<Option<DiskBlockHeader>, Self::Error> {
+        match self.headers_cache.read().get(block_hash) {
+            Some(header) => Ok(Some(*header)),
+            None => {
+                let block_hash = serialize(&block_hash);
+                Ok(self
+                    .headers
+                    .get(&block_hash)?
+                    .and_then(|b| deserialize(&b).ok()))
+            }
         }
-        Ok(None)
     }
+
     fn flush(&self) -> Result<(), Self::Error> {
+        // save all headers in batch
+        let mut batch = Batch::new();
+        for header in self.headers_cache.read().iter() {
+            let ser_header = serialize(header.1);
+            let block_hash = serialize(&header.1.block_hash());
+            batch.set(&block_hash, &ser_header)?;
+        }
+        self.headers.batch(batch)?;
+        self.headers_cache.write().clear();
+
+        // save all index in batch
+        let mut batch = Batch::new();
+        for (height, hash) in self.index_cache.read().iter() {
+            let ser_hash = serialize(hash);
+            batch.set(&Integer::from(*height), &ser_hash)?;
+        }
+        self.index.batch(batch)?;
+        self.index_cache.write().clear();
+
         // Flush the header bucket
-        let bucket = self.0.bucket::<&[u8], Vec<u8>>(Some("header"))?;
-        bucket.flush()?;
+        self.headers.flush()?;
         // Flush the block index
-        let bucket = self.0.bucket::<&[u8], Vec<u8>>(Some("index"))?;
-        bucket.flush()?;
+        self.index.flush()?;
         // Flush the default bucket with meta-info
-        let bucket = self.0.bucket::<&[u8], Vec<u8>>(None)?;
-        bucket.flush()?;
+        self.meta.flush()?;
         Ok(())
     }
+
     fn save_header(&self, header: &DiskBlockHeader) -> Result<(), Self::Error> {
-        let ser_header = serialize(header);
-        let block_hash = serialize(&header.block_hash());
-        let bucket = self.0.bucket::<&[u8], Vec<u8>>(Some("header"))?;
-        bucket.set(&&*block_hash, &ser_header)?;
+        self.headers_cache
+            .write()
+            .insert(header.block_hash(), *header);
         Ok(())
     }
 
     fn get_block_hash(&self, height: u32) -> Result<Option<BlockHash>, Self::Error> {
-        let bucket = self.0.bucket::<Integer, Vec<u8>>(Some("index"))?;
-        let block = bucket.get(&Integer::from(height))?;
-        if let Some(block) = block {
-            return Ok(Some(deserialize(&block).unwrap()));
+        match self.index_cache.read().get(&height).cloned() {
+            Some(hash) => Ok(Some(hash)),
+            None => Ok(self
+                .index
+                .get(&Integer::from(height))?
+                .and_then(|b| deserialize(&b).ok())),
         }
-        Ok(None)
     }
 
     fn update_block_index(&self, height: u32, hash: BlockHash) -> Result<(), Self::Error> {
-        let bucket = self.0.bucket::<Integer, Vec<u8>>(Some("index"))?;
-        let block_hash = serialize(&hash);
-
-        bucket.set(&Integer::from(height), &block_hash)?;
+        self.index_cache.write().insert(height, hash);
         Ok(())
     }
 }

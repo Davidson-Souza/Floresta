@@ -2,7 +2,7 @@
 //     Dr. Maxim Orlovsky <orlovsky@lnp-bp.org>
 //
 // Adapted for Floresta by:
-//     Davidson Sousa <davidson.lucas.souza@outlook.com>
+//     Davidson Sousa <me@dlsouza.lol>
 
 //! Bitcoin SLIP-132 standard implementation for parsing custom xpub/xpriv key
 //! formats

@@ -19,6 +19,8 @@ use bitcoin::consensus::deserialize_partial;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::sha256;
+use bitcoin::hashes::Hash;
+use bitcoin::p2p::utreexo::UtreexoBlock;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::OutPoint;
@@ -303,6 +305,9 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
                     header = *self.get_ancestor(&block)?;
                     continue;
                 }
+                Some(DiskBlockHeader::AssumedValid(block, _)) => {
+                    return Ok(block);
+                }
                 Some(DiskBlockHeader::Orphan(header)) => {
                     return Err(BlockchainError::InvalidTip(format(format_args!(
                         "Block {} doesn't have a known ancestor (i.e an orphan block)",
@@ -359,7 +364,9 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         while !self.is_genesis(&header) {
             let _header = self.get_ancestor(&header)?;
             match _header {
-                DiskBlockHeader::FullyValid(_, _) => return Ok(header.block_hash()),
+                DiskBlockHeader::FullyValid(_, _) | DiskBlockHeader::AssumedValid(_, _) => {
+                    return Ok(header.block_hash())
+                }
                 DiskBlockHeader::Orphan(_) => {
                     return Err(BlockchainError::InvalidTip(format(format_args!(
                         "Block {} doesn't have a known ancestor (i.e an orphan block)",
@@ -766,15 +773,61 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         Consensus::verify_block_transactions(inputs, &block.txdata, subsidy, verify_script, flags)?;
         Ok(())
     }
-
-    fn get_assumeutreexo_index(&self) -> (BlockHash, u32) {
-        let guard = read_lock!(self);
-        guard.consensus.parameters.assumeutreexo_index
-    }
 }
 
 impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedState> {
     type Error = BlockchainError;
+
+    fn get_fork_point(&self, block: BlockHash) -> Result<BlockHash, Self::Error> {
+        let fork_point = self.find_fork_point(&self.get_block_header(&block)?)?;
+        Ok(fork_point.block_hash())
+    }
+
+    fn update_acc(
+        &self,
+        acc: Stump,
+        block: UtreexoBlock,
+        height: u32,
+        proof: Proof,
+        del_hashes: Vec<sha256::Hash>,
+    ) -> Result<Stump, Self::Error> {
+        Consensus::update_acc(&acc, &block.block, height, proof, del_hashes)
+    }
+
+    fn get_chain_tips(&self) -> Result<Vec<BlockHash>, Self::Error> {
+        let inner = read_lock!(self);
+        let mut tips = Vec::new();
+
+        tips.push(inner.best_block.best_block);
+        tips.extend(inner.best_block.alternative_tips.iter());
+
+        Ok(tips)
+    }
+
+    fn validate_block(
+        &self,
+        block: &Block,
+        proof: Proof,
+        inputs: HashMap<OutPoint, TxOut>,
+        del_hashes: Vec<sha256::Hash>,
+        acc: Stump,
+    ) -> Result<(), Self::Error> {
+        // verify the proof
+        let del_hashes = del_hashes
+            .iter()
+            .map(|hash| NodeHash::from(hash.as_byte_array()))
+            .collect::<Vec<_>>();
+
+        if !acc.verify(&proof, &del_hashes)? {
+            return Err(BlockValidationErrors::InvalidProof.into());
+        }
+
+        let height = self
+            .get_block_height(&block.block_hash())?
+            .ok_or(BlockchainError::BlockNotPresent)?;
+
+        self.validate_block(block, height, inputs)
+    }
 
     fn get_block_locator_for_tip(&self, tip: BlockHash) -> Result<Vec<BlockHash>, BlockchainError> {
         let mut hashes = Vec::new();
@@ -815,6 +868,7 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     fn is_in_idb(&self) -> bool {
         self.inner.read().ibd
     }
+
     fn get_block_height(&self, hash: &BlockHash) -> Result<Option<u32>, Self::Error> {
         self.get_disk_block_header(hash)
             .map(|header| header.height())
@@ -915,7 +969,9 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
         if let DiskBlockHeader::FullyValid(_, height) = header {
             Ok(height)
         } else {
-            unreachable!("Validation index is in an invalid state, you should re-index your node")
+            unreachable!(
+                "Validation index is in an invalid state, you should re-index your node {header:?}"
+            )
         }
     }
 
@@ -925,49 +981,27 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
 
         Ok(height + chain_params.coinbase_maturity <= current_height)
     }
+
     fn get_unbroadcasted(&self) -> Vec<Transaction> {
         let mut inner = write_lock!(self);
         inner.broadcast_queue.drain(..).collect()
     }
 }
 impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedState> {
-    fn mark_chain_as_valid(&self) -> Result<bool, BlockchainError> {
-        let (assume_utreexo_hash, assume_utreexo_height) = self.get_assumeutreexo_index();
-        let curr_validation_index = self.get_validation_index()?;
+    fn switch_chain(&self, new_tip: BlockHash) -> Result<(), BlockchainError> {
+        let new_tip = self.get_block_header(&new_tip)?;
+        self.reorg(new_tip)
+    }
 
-        // We already ran once
-        if curr_validation_index >= assume_utreexo_height {
-            return Ok(true);
-        }
+    fn mark_block_as_valid(&self, block: BlockHash) -> Result<(), BlockchainError> {
+        let header = self.get_disk_block_header(&block)?;
+        let height = header.height().unwrap();
+        let new_header = DiskBlockHeader::FullyValid(*header, height);
+        self.update_header(&new_header)
+    }
 
-        let mut assumed_hash = self.get_best_block()?.1;
-        // Walks the chain until finding our assumeutxo block.
-        // Since this block was passed in before starting florestad, this value should be
-        // lesser than or equal our current tip. If we don't find that block, it means the
-        // assumeutxo block was reorged out (or never was in the main chain). That's weird, but we
-        // should take precoution against it
-        while let Ok(header) = self.get_block_header(&assumed_hash) {
-            if header.block_hash() == assume_utreexo_hash {
-                break;
-            }
-            // We've reached genesis and didn't our block
-            if self.is_genesis(&header) {
-                break;
-            }
-            assumed_hash = self.get_ancestor(&header)?.block_hash();
-        }
-
-        // The assumeutreexo value passed is **not** in the main chain, start validaton from geneis
-        if assumed_hash != assume_utreexo_hash {
-            warn!("We are in a diffenrent chain than our default or provided assumeutreexo value. Restarting from genesis");
-
-            let mut guard = write_lock!(self);
-
-            guard.best_block.validation_index = assumed_hash; // Should be equal to genesis
-            guard.acc = Stump::new();
-
-            return Ok(false);
-        }
+    fn mark_chain_as_assumed(&self, acc: Stump) -> Result<bool, BlockchainError> {
+        let assumed_hash = self.get_best_block()?.1;
 
         let mut curr_header = self.get_block_header(&assumed_hash)?;
 
@@ -985,8 +1019,8 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         }
 
         let mut guard = write_lock!(self);
-        let acc = guard.consensus.parameters.network_roots.clone();
         guard.best_block.validation_index = assumed_hash;
+        guard.best_block.rescan_index = None;
         info!("assuming chain with hash={assumed_hash}");
         guard.acc = acc;
 
@@ -1016,10 +1050,12 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         );
         Ok(())
     }
+
     fn toggle_ibd(&self, is_ibd: bool) {
         let mut inner = write_lock!(self);
         inner.ibd = is_ibd;
     }
+
     fn process_rescan_block(&self, block: &Block) -> Result<(), BlockchainError> {
         let header = self.get_disk_block_header(&block.block_hash())?;
         let height = header.height().expect("Recaning in an invalid tip");
@@ -1037,6 +1073,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         }
         Ok(())
     }
+
     fn connect_block(
         &self,
         block: &Block,
@@ -1052,6 +1089,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
             }
             // If it's valid or orphan, we don't validate
             DiskBlockHeader::Orphan(_)
+            | DiskBlockHeader::AssumedValid(_, _) // this will be validated by a partial chain
             | DiskBlockHeader::InFork(_, _)
             | DiskBlockHeader::InvalidChain(_) => return Ok(0),
             DiskBlockHeader::HeadersOnly(_, height) => height,
@@ -1158,6 +1196,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
 
         Ok(())
     }
+
     fn get_root_hashes(&self) -> Vec<NodeHash> {
         let inner = read_lock!(self);
         inner.acc.roots.clone()
@@ -1170,7 +1209,16 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         acc: Stump,
     ) -> Result<super::partial_chain::PartialChainState, BlockchainError> {
         let blocks = (initial_height..=final_height)
-            .map(|height| self.get_block_header_by_height(height))
+            .flat_map(|height| {
+                let hash = self
+                    .get_block_hash(height)
+                    .expect("Block should be present");
+                self.get_disk_block_header(&hash)
+            })
+            .filter_map(|header| match header {
+                DiskBlockHeader::FullyValid(header, _) => Some(header),
+                _ => None,
+            })
             .collect();
 
         let inner = PartialChainStateInner {

@@ -16,6 +16,7 @@ use bitcoin::pow::U256;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::OutPoint;
+use bitcoin::ScriptBuf;
 use bitcoin::Target;
 use bitcoin::Transaction;
 use bitcoin::TxOut;
@@ -228,10 +229,11 @@ impl Consensus {
                 block_inputs.insert((input.previous_output.txid, input.previous_output.vout));
             }
         }
+
         // Get all leaf hashes that will be added to the accumulator
         for transaction in block.txdata.iter() {
             for (i, output) in transaction.output.iter().enumerate() {
-                if !output.script_pubkey.is_provably_unspendable()
+                if !Self::is_unspendable(&output.script_pubkey)
                     && !block_inputs.contains(&(transaction.txid(), i as u32))
                 {
                     leaf_hashes.push(Self::get_leaf_hashes(
@@ -251,5 +253,17 @@ impl Consensus {
         // Update the accumulator
         let acc = acc.modify(&hashes, &del_hashes, &proof)?.0;
         Ok(acc)
+    }
+
+    fn is_unspendable(script: &ScriptBuf) -> bool {
+        if script.len() > 10_000 {
+            return true;
+        }
+
+        if !script.is_empty() && script.as_bytes()[0] == 0x6a {
+            return true;
+        }
+
+        false
     }
 }

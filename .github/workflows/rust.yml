@@ -10,22 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
-
-    steps:
-    # try to build
-    - uses: actions/checkout@v3
-    - name: Build
-      run: cargo build --verbose
-    # run all tests
-    - uses: actions/checkout@v3
-    - name: Run tests
-      run: cargo build && cargo test --verbose
-
   linting:
-
     runs-on: ubuntu-latest
 
     steps:
@@ -38,7 +23,6 @@ jobs:
       run: cargo +nightly fmt --all --check
 
     # run cargo clippy
-    - uses: actions/checkout@v3
     - name: Clippy
       run: cargo +nightly clippy --all-targets
 
@@ -53,5 +37,5 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
 
-      - name: Cross compile
-        run: cargo build && cargo test --verbose
+      - run: cargo build --verbose
+      - run: cargo test --verbose

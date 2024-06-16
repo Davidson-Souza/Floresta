@@ -19,6 +19,7 @@ use floresta::wire::node::UtreexoNode;
 use floresta_chain::AssumeValidArg;
 use floresta_wire::node_interface::NodeMethods;
 use floresta_wire::running_node::RunningNode;
+use floresta_wire::UtreexoNodeConfig;
 
 const DATA_DIR: &str = "./data";
 
@@ -55,24 +56,24 @@ async fn main() {
     // If you want a node to IBD only, you can use the IBDNode context.
     // Finally, we are using the chain state created above, the node will use it to determine
     // what blocks and headers to download, and hand them to it to validate.
-    let p2p: UtreexoNode<RunningNode, ChainState<KvChainStore>> = UtreexoNode::new(
+    let config = UtreexoNodeConfig::default();
+    let p2p: UtreexoNode<RunningNode, Arc<ChainState<KvChainStore>>> = UtreexoNode::new(
+        config,
         chain.clone(),
         Arc::new(RwLock::new(Mempool::new())),
-        Network::Bitcoin,
-        DATA_DIR.into(),
-        None,
-        None,
         None,
     );
     // A handle is a simple way to interact with the node. It implements a queue of requests
     // that will be processed by the node.
     let handle = p2p.get_handle();
 
+    let (sender, _receiver) = futures::channel::oneshot::channel();
+
     // Start the node. This will start the IBD process, and will return once the node is synced.
     // It will also start the mempool, which will start rebroadcasting our transactions every hour.
     // The node will keep running until the process is killed, by setting kill_signal to true. In
     // this example, we don't kill the node, so it will keep running forever.
-    p2p.run(&Arc::new(RwLock::new(false))).await;
+    p2p.run(Arc::new(RwLock::new(false)), sender).await;
 
     // That's it! The node is now running, and will keep running until the process is killed.
     // You can now use the chain state to query the current state of the accumulator, or the

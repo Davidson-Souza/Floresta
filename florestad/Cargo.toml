@@ -4,7 +4,7 @@ version = "0.5.1"
 edition = "2021"
 
 [dependencies]
-rustreexo = "0.1.0"
+rustreexo = "0.2.0"
 clap = { version = "4.0.29", features = ["derive"] }
 sha2 = "^0.10.6"
 async-std = { version = "1.12.0", features = ["attributes"] }
@@ -13,13 +13,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 kv = "0.24.0"
 miniscript = "11"
-pretty_env_logger = "0.4.0"
 futures = "0.3.4"
 toml = "0.5.10"
 dirs = "4.0.0"
 rand = "0.8.5"
 bitcoin = { version = "0.31", features = ["serde", "std", "bitcoinconsensus"] }
 ctrlc = "3.2.5"
+fern = { version = "0.6", features = ["colored"] }
+chrono = "0.4.19"
 floresta-chain = { path = "../crates/floresta-chain" }
 floresta-common = { path = "../crates/floresta-common" }
 floresta-electrum = { path = "../crates/floresta-electrum" }
@@ -36,6 +37,14 @@ jsonrpc-core-client = { version = "18.0.0", features = [
 ], optional = true }
 zmq = { version = "0.10.0", optional = true }
 latest = "0.1.1"
+
+[lib]
+name = "florestad"
+path = "src/lib.rs"
+
+[[bin]]
+name = "florestad"
+path = "src/main.rs"
 
 [dev-dependencies]
 pretty_assertions = "1"

@@ -374,6 +374,10 @@ impl AddressMan {
     }
     /// Updates the state of an address
     pub fn update_set_state(&mut self, idx: usize, state: AddressState) -> &mut Self {
+        if matches!(state, AddressState::Banned(_)) {
+            return self;
+        }
+
         match state {
             AddressState::Banned(_) => {
                 self.good_addresses.retain(|&x| x != idx);

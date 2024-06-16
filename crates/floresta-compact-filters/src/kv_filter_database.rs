@@ -1,3 +1,6 @@
+use core::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::path::PathBuf;
 
 use kv::Bucket;
@@ -11,6 +14,12 @@ use crate::BlockFilterStore;
 #[derive(Clone)]
 pub struct KvFilterStore {
     bucket: Bucket<'static, Integer, Vec<u8>>,
+}
+
+impl Debug for KvFilterStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KvFilterStore").finish()
+    }
 }
 
 impl KvFilterStore {
@@ -33,6 +42,7 @@ impl KvFilterStore {
         let bucket = store.bucket(Some("cfilters")).unwrap();
         KvFilterStore { bucket }
     }
+
     /// Creates a new [KvFilterStore] that stores it's content with a given config
     pub fn with_config(config: Config) -> Self {
         let store = kv::Store::new(config).expect("Could not open database");

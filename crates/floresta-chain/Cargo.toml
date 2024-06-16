@@ -18,7 +18,7 @@ categories = ["bitcoin", "blockchain", "node"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rustreexo = "0.1.0"
+rustreexo = "0.2.0"
 sha2 = "^0.10.6"
 log = "0.4"
 kv = "0.24.0"

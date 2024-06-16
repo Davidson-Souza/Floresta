@@ -114,9 +114,9 @@ pub trait JsonRPCClient: Sized {
     /// Calls a method on the client
     ///
     /// This should call the appropriated rpc method and return a parsed response or error.
-    fn call<T: serde::de::DeserializeOwned>(&self, method: &str, params: &[Value]) -> Result<T>
+    fn call<T>(&self, method: &str, params: &[Value]) -> Result<T>
     where
-        T: for<'a> serde::de::Deserialize<'a> + Debug;
+        T: for<'a> serde::de::Deserialize<'a> + serde::de::DeserializeOwned + Debug;
 }
 
 impl<T: JsonRPCClient> FlorestaRPC for T {

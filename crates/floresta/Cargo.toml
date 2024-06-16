@@ -32,7 +32,7 @@ floresta-watch-only = { path = "../floresta-watch-only", features = [
 floresta-electrum = { path = "../floresta-electrum", optional = true, version = "0.1.0" }
 
 [dev-dependencies]
-rustreexo = "0.1.0"
+rustreexo = "0.2.0"
 miniscript = "10"
 async-std = "1.12.0"
 bitcoin = { version = "0.31", features = [
@@ -46,6 +46,7 @@ floresta = { version = "0.1.0", path = "../floresta", features = [
     "electrum-server",
     "watch-only-wallet",
 ] }
+futures = "0.3.30"
 
 [features]
 default = ["bitcoinconsensus", "electrum-server", "watch-only-wallet"]
