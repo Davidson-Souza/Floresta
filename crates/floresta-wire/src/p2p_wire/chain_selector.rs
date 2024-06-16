@@ -48,8 +48,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use async_std::future::timeout;
-use async_std::sync::RwLock;
+use tokio::time::timeout;
+use tokio::sync::RwLock;
 use bitcoin::block::Header;
 use bitcoin::BlockHash;
 use floresta_chain::pruned_utreexo::BlockchainInterface;
@@ -234,10 +234,10 @@ where
         info!("Starting ibd, selecting the best chain");
 
         loop {
-            while let Ok(notification) =
-                timeout(Duration::from_millis(10), self.node_rx.recv()).await
+            while let Some(notification) =
+                timeout(Duration::from_millis(10), self.node_rx.recv()).await.unwrap()
             {
-                try_and_log!(self.handle_notification(notification).await);
+                try_and_log!(self.handle_notification(Some(notification)).await);
             }
 
             periodic_job!(
@@ -278,10 +278,10 @@ where
 
     async fn handle_notification(
         &mut self,
-        notification: Result<NodeNotification, async_std::channel::RecvError>,
+        notification: Option<NodeNotification>,
     ) -> Result<(), WireError> {
-        match notification? {
-            NodeNotification::FromPeer(peer, message) => match message {
+        match notification {
+            Some(NodeNotification::FromPeer(peer, message)) => match message {
                 PeerMessages::Headers(headers) => {
                     self.inflight.remove(&InflightRequests::Headers);
                     return self.handle_headers(peer, headers).await;
@@ -306,6 +306,8 @@ where
 
                 _ => {}
             },
+
+            None => {}
         }
         Ok(())
     }

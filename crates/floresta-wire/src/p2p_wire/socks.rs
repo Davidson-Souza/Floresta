@@ -10,10 +10,10 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 
-use futures::AsyncRead;
-use futures::AsyncReadExt;
-use futures::AsyncWrite;
-use futures::AsyncWriteExt;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Clone, Debug)]
 pub struct Socks5StreamBuilder {
@@ -52,7 +52,7 @@ impl Socks5StreamBuilder {
     pub fn new(address: SocketAddr) -> Self {
         Self { address }
     }
-    pub async fn connect<Stream: AsyncRead + AsyncWrite + Clone + Unpin>(
+    pub async fn connect<Stream: AsyncRead + AsyncWrite + Unpin>(
         mut socket: Stream,
         address: Socks5Addr,
         port: u16,

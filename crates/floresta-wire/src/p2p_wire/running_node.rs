@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use async_std::channel::SendError;
-use async_std::future::timeout;
-use async_std::sync::RwLock;
+use tokio::sync::mpsc::error::SendError;
+use tokio::time::timeout;
+use tokio::sync::RwLock;
 use bitcoin::p2p::address::AddrV2;
 use bitcoin::p2p::address::AddrV2Message;
 use bitcoin::p2p::message_blockdata::Inventory;
@@ -271,10 +271,10 @@ where
         info!("starting running node...");
         self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
         loop {
-            while let Ok(notification) =
-                timeout(Duration::from_millis(100), self.node_rx.recv()).await
+            while let Some(notification) =
+                timeout(Duration::from_millis(100), self.node_rx.recv()).await.unwrap()
             {
-                try_and_log!(self.handle_notification(notification).await);
+                try_and_log!(self.handle_notification(Some(notification)).await);
             }
 
             if *kill_signal.read().await {
@@ -584,10 +584,10 @@ where
 
     pub(crate) async fn handle_notification(
         &mut self,
-        notification: Result<NodeNotification, async_std::channel::RecvError>,
+        notification: Option<NodeNotification>,
     ) -> Result<(), WireError> {
-        match notification? {
-            NodeNotification::FromPeer(peer, message) => match message {
+        match notification {
+            Some(NodeNotification::FromPeer(peer, message)) => match message {
                 PeerMessages::NewBlock(block) => {
                     trace!("We got an inv with block {block} requesting it");
                     self.handle_new_block().await?;
@@ -642,6 +642,10 @@ where
                     );
                 }
             },
+            None => {
+                // We got a kill signal
+                return Ok(());
+            }
         }
         Ok(())
     }
