@@ -207,7 +207,7 @@ where
         let mut peer1_version = None;
         let mut peer2_version = None;
         for _ in 0..2 {
-            if let Ok(Ok(NodeNotification::FromPeer(peer, PeerMessages::UtreexoState(state)))) =
+            if let Ok(Some(NodeNotification::FromPeer(peer, PeerMessages::UtreexoState(state)))) =
                 timeout(Duration::from_secs(60), self.node_rx.recv()).await
             {
                 if peer == peer1 {
@@ -479,7 +479,7 @@ where
         .await?;
 
         let block = loop {
-            let Ok(NodeNotification::FromPeer(_, PeerMessages::Block(block))) =
+            let Some(NodeNotification::FromPeer(_, PeerMessages::Block(block))) =
                 self.node_rx.recv().await
             else {
                 continue;
@@ -672,7 +672,7 @@ where
                 break;
             }
 
-            if let Ok(Ok(message)) = timeout(Duration::from_secs(60), self.node_rx.recv()).await {
+            if let Ok(Some(message)) = timeout(Duration::from_secs(60), self.node_rx.recv()).await {
                 match message {
                     NodeNotification::FromPeer(peer, message) => {
                         if let PeerMessages::UtreexoState(state) = message {

@@ -440,7 +440,6 @@ where
             .unwrap()
             .channel
             .send(req)
-            .await
             .map_err(WireError::ChannelSend)?;
 
         Ok(peer)
