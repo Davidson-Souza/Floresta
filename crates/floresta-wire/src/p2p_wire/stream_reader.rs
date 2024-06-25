@@ -8,18 +8,18 @@
 
 use std::marker::PhantomData;
 
-use async_std::channel::Sender;
-use async_std::io::ReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::mpsc::UnboundedSender;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::deserialize_partial;
 use bitcoin::consensus::Decodable;
 use bitcoin::p2p::Magic;
-use futures::AsyncRead;
+
 
 use super::peer::PeerError;
 
 /// A simple type that wraps a stream and returns T, if T is [Decodable].
-pub struct StreamReader<Source: Sync + Send + ReadExt + Unpin + AsyncRead, Item: Decodable + Send> {
+pub struct StreamReader<Source: Sync + Send + AsyncReadExt + Unpin + AsyncRead, Item: Decodable + Send> {
     /// Were we read bytes from, usually a TcpStream
     source: Source,
     /// Item is what we return, since we don't actually hold any concrete type, just use a
@@ -28,15 +28,15 @@ pub struct StreamReader<Source: Sync + Send + ReadExt + Unpin + AsyncRead, Item:
     /// Magic bits, we expect this at the beginning of all messages
     magic: Magic,
     /// Where should we send data
-    sender: Sender<Result<Item, PeerError>>,
+    sender: UnboundedSender<Result<Item, PeerError>>,
 }
 impl<Source, Item> StreamReader<Source, Item>
 where
     Item: Decodable + Unpin + Send + 'static,
-    Source: Sync + Send + ReadExt + Unpin + AsyncRead,
+    Source: Sync + Send + AsyncReadExt + Unpin + AsyncRead,
 {
     /// Creates a new reader from a given stream
-    pub fn new(stream: Source, magic: Magic, sender: Sender<Result<Item, PeerError>>) -> Self {
+    pub fn new(stream: Source, magic: Magic, sender: UnboundedSender<Result<Item, PeerError>>) -> Self {
         StreamReader {
             source: stream,
             phantom: PhantomData,
@@ -63,7 +63,7 @@ where
             // Read everything else
             self.source.read_exact(&mut data[24..]).await?;
             let message = deserialize(&data)?;
-            let _ = self.sender.send(Ok(message)).await;
+            let _ = self.sender.send(Ok(message));
         }
     }
     /// Tries to read from a parsed [Item] from [Source]. Only returns on error or if we have
@@ -71,7 +71,7 @@ where
     pub async fn read_loop(mut self) {
         let value = self.read_loop_inner().await;
         if let Err(e) = value {
-            let _ = self.sender.send(Err(e)).await;
+            let _ = self.sender.send(Err(e));
         }
     }
 }

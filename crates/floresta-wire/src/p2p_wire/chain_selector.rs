@@ -48,8 +48,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use async_std::future::timeout;
-use async_std::sync::RwLock;
+use tokio::time::timeout;
+use tokio::sync::RwLock;
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 use bitcoin::p2p::utreexo::UtreexoBlock;
@@ -207,7 +207,7 @@ where
         let mut peer1_version = None;
         let mut peer2_version = None;
         for _ in 0..2 {
-            if let Ok(Ok(NodeNotification::FromPeer(peer, PeerMessages::UtreexoState(state)))) =
+            if let Ok(Some(NodeNotification::FromPeer(peer, PeerMessages::UtreexoState(state)))) =
                 timeout(Duration::from_secs(60), self.node_rx.recv()).await
             {
                 if peer == peer1 {
@@ -479,7 +479,7 @@ where
         .await?;
 
         let block = loop {
-            let Ok(NodeNotification::FromPeer(_, PeerMessages::Block(block))) =
+            let Some(NodeNotification::FromPeer(_, PeerMessages::Block(block))) =
                 self.node_rx.recv().await
             else {
                 continue;
@@ -603,10 +603,10 @@ where
         info!("Starting ibd, selecting the best chain");
 
         loop {
-            while let Ok(notification) =
-                timeout(Duration::from_millis(10), self.node_rx.recv()).await
+            while let Some(notification) =
+                timeout(Duration::from_millis(10), self.node_rx.recv()).await.unwrap()
             {
-                try_and_log!(self.handle_notification(notification).await);
+                try_and_log!(self.handle_notification(Some(notification)).await);
             }
 
             periodic_job!(
@@ -675,7 +675,7 @@ where
                 break;
             }
 
-            if let Ok(Ok(message)) = timeout(Duration::from_secs(60), self.node_rx.recv()).await {
+            if let Ok(Some(message)) = timeout(Duration::from_secs(60), self.node_rx.recv()).await {
                 match message {
                     NodeNotification::FromPeer(peer, message) => {
                         if let PeerMessages::UtreexoState(state) = message {
@@ -716,10 +716,10 @@ where
 
     async fn handle_notification(
         &mut self,
-        notification: Result<NodeNotification, async_std::channel::RecvError>,
+        notification: Option<NodeNotification>,
     ) -> Result<(), WireError> {
-        match notification? {
-            NodeNotification::FromPeer(peer, message) => match message {
+        match notification {
+            Some(NodeNotification::FromPeer(peer, message)) => match message {
                 PeerMessages::Headers(headers) => {
                     self.inflight.remove(&InflightRequests::Headers);
                     return self.handle_headers(peer, headers).await;
@@ -744,6 +744,8 @@ where
 
                 _ => {}
             },
+
+            None => {}
         }
         Ok(())
     }

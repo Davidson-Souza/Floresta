@@ -14,14 +14,12 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use async_std::channel::bounded;
-use async_std::channel::Receiver;
-use async_std::channel::Sender;
-use async_std::channel::{self};
-use async_std::future::timeout;
-use async_std::net::TcpStream;
-use async_std::sync::RwLock;
-use async_std::task::spawn;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::time::timeout;
+use tokio::net::TcpStream;
+use tokio::sync::RwLock;
+use tokio::spawn;
 use bitcoin::p2p::address::AddrV2;
 use bitcoin::p2p::address::AddrV2Message;
 use bitcoin::p2p::utreexo::UtreexoBlock;
@@ -57,6 +55,7 @@ use super::socks::Socks5Error;
 use super::socks::Socks5StreamBuilder;
 use super::UtreexoNodeConfig;
 use crate::node_context::PeerId;
+
 
 #[derive(Debug)]
 pub enum NodeNotification {
@@ -99,7 +98,7 @@ pub(crate) enum InflightRequests {
 pub struct LocalPeerView {
     pub(crate) state: PeerStatus,
     pub(crate) address_id: u32,
-    pub(crate) channel: Sender<NodeRequest>,
+    pub(crate) channel: UnboundedSender<NodeRequest>,
     pub(crate) services: ServiceFlags,
     pub(crate) user_agent: String,
     pub(crate) address: IpAddr,
@@ -147,8 +146,8 @@ pub struct NodeCommon<Chain: BlockchainInterface + UpdatableChainstate> {
     pub(crate) chain: Chain,
     pub(crate) blocks: HashMap<BlockHash, (PeerId, UtreexoBlock)>,
     pub(crate) inflight: HashMap<InflightRequests, (u32, Instant)>,
-    pub(crate) node_rx: Receiver<NodeNotification>,
-    pub(crate) node_tx: Sender<NodeNotification>,
+    pub(crate) node_rx: UnboundedReceiver<NodeNotification>,
+    pub(crate) node_tx: UnboundedSender<NodeNotification>,
     pub(crate) mempool: Arc<RwLock<Mempool>>,
     pub(crate) datadir: String,
     pub(crate) address_man: AddressMan,
@@ -196,7 +195,7 @@ where
         mempool: Arc<RwLock<Mempool>>,
         block_filters: Option<Arc<NetworkFilters<KvFilterStore>>>,
     ) -> Self {
-        let (node_tx, node_rx) = channel::unbounded();
+        let (node_tx, node_rx) = unbounded_channel();
         let socks5 = config.proxy.map(Socks5StreamBuilder::new);
         UtreexoNode(
             NodeCommon {
@@ -243,7 +242,7 @@ where
     }
     pub(crate) fn handle_disconnection(&mut self, peer: u32, idx: usize) -> Result<(), WireError> {
         if let Some(p) = self.peers.remove(&peer) {
-            p.channel.close();
+            p.channel.closed();
             if !p.feeler && p.state == PeerStatus::Ready {
                 info!("Peer disconnected: {}", peer);
             }
@@ -357,7 +356,6 @@ where
             if peer.state == PeerStatus::Ready {
                 peer.channel
                     .send(req)
-                    .await
                     .map_err(WireError::ChannelSend)?;
             }
         }
@@ -382,7 +380,7 @@ where
         // This peer is misbehaving too often, ban it
         if peer.banscore >= self.0.max_banscore {
             warn!("banning peer {} for misbehaving", peer_id);
-            let _ = peer.channel.send(NodeRequest::Shutdown).await;
+            let _ = peer.channel.send(NodeRequest::Shutdown);
             self.0.address_man.update_set_state(
                 peer.address_id as usize,
                 AddressState::Banned(RunningNode::BAN_TIME),
@@ -442,7 +440,6 @@ where
             .unwrap()
             .channel
             .send(req)
-            .await
             .map_err(WireError::ChannelSend)?;
 
         Ok(peer)
@@ -487,14 +484,12 @@ where
                 self.mempool.write().await.accept_to_mempool(transaction);
                 peer.channel
                     .send(NodeRequest::BroadcastTransaction(txid))
-                    .await
                     .map_err(WireError::ChannelSend)?;
             }
             let stale = self.mempool.write().await.get_stale();
             for tx in stale {
                 peer.channel
                     .send(NodeRequest::BroadcastTransaction(tx))
-                    .await
                     .map_err(WireError::ChannelSend)?;
             }
         }
@@ -594,13 +589,13 @@ where
         feeler: bool,
         peer_id: usize,
         address: LocalAddress,
-        requests_rx: Receiver<NodeRequest>,
+        requests_rx: UnboundedReceiver<NodeRequest>,
         peer_id_count: u32,
         mempool: Arc<RwLock<Mempool>>,
         network: bitcoin::Network,
-        node_tx: Sender<NodeNotification>,
+        node_tx: UnboundedSender<NodeNotification>,
     ) -> impl Future<Output = ()> + Send + 'static {
-        Peer::<TcpStream>::create_outbound_connection(
+        Peer::create_outbound_connection(
             peer_id_count,
             (address.get_net_address(), address.get_port()),
             mempool,
@@ -618,10 +613,10 @@ where
         feeler: bool,
         mempool: Arc<RwLock<Mempool>>,
         network: bitcoin::Network,
-        node_tx: Sender<NodeNotification>,
+        node_tx: UnboundedSender<NodeNotification>,
         peer_id: usize,
         address: LocalAddress,
-        requests_rx: Receiver<NodeRequest>,
+        requests_rx: UnboundedReceiver<NodeRequest>,
         peer_id_count: u32,
     ) -> Result<(), Socks5Error> {
         let addr = match address.get_address() {
@@ -660,7 +655,7 @@ where
         peer_id: usize,
         address: LocalAddress,
     ) {
-        let (requests_tx, requests_rx) = bounded(1024);
+        let (requests_tx, requests_rx) = unbounded_channel();
         if let Some(ref proxy) = self.socks5 {
             spawn(timeout(
                 Duration::from_secs(10),

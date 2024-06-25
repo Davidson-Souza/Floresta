@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use async_std::future::timeout;
-use async_std::sync::RwLock;
+use tokio::time::timeout;
+use tokio::sync::RwLock;
 use bitcoin::p2p::utreexo::UtreexoBlock;
 use bitcoin::p2p::ServiceFlags;
 use floresta_chain::pruned_utreexo::BlockchainInterface;
@@ -71,7 +71,7 @@ where
         info!("Starting sync node");
         self.1.last_block_requested = self.chain.get_validation_index().unwrap();
         loop {
-            while let Ok(Ok(msg)) = timeout(Duration::from_secs(1), self.node_rx.recv()).await {
+            while let Ok(Some(msg)) = timeout(Duration::from_secs(1), self.node_rx.recv()).await {
                 self.handle_message(msg).await;
             }
 
