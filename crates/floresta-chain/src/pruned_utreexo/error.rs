@@ -1,6 +1,6 @@
 use core::fmt::Debug;
 
-use bitcoin::{blockdata::script};
+use bitcoin::blockdata::script;
 #[cfg(feature = "cli-blockchain")]
 use btcd_rpc::error::UtreexodError;
 use floresta_common::impl_error_from;
@@ -50,7 +50,7 @@ impl Display for BlockValidationErrors {
             BlockValidationErrors::BlockTooBig => write!(f, "Block too big"),
             BlockValidationErrors::InvalidCoinbase(e) => {
                 write!(f, "Invalid coinbase: {:?}", e)
-            },
+            }
             BlockValidationErrors::TooManyCoins => write!(f, "Moving more coins that exists"),
             BlockValidationErrors::InvalidTx(e) => {
                 write!(f, "This block contains an invalid transaction {}", e)

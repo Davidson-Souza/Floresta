@@ -770,7 +770,14 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         let flags = self.get_validation_flags(height);
         #[cfg(not(feature = "bitcoinconsensus"))]
         let flags = 0;
-        Consensus::verify_block_transactions(height.try_into().unwrap(), inputs, &block.txdata, subsidy, verify_script, flags)?;
+        Consensus::verify_block_transactions(
+            height.try_into().unwrap(),
+            inputs,
+            &block.txdata,
+            subsidy,
+            verify_script,
+            flags,
+        )?;
         Ok(())
     }
 }

@@ -2,21 +2,16 @@
 //! This module contains functions that are used to verify blocks and transactions, and doesn't
 //! assume anything about the chainstate, so it can be used in any context.
 //! We use this to avoid code reuse among the different implementations of the chainstate.
-extern crate std;
 extern crate alloc;
+extern crate std;
 
-use std::time::SystemTime;
-use core::ffi::c_uint;
-use core::ops::Mul;
 use bitcoin::absolute::Height;
-use bitcoin::absolute::LockTime;
 use bitcoin::absolute::Time;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::pow::U256;
-use bitcoin::transaction;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::OutPoint;
@@ -27,13 +22,15 @@ use bitcoin::TxIn;
 use bitcoin::TxOut;
 use bitcoin::Txid;
 use bitcoin::WitnessVersion;
+use core::ffi::c_uint;
+use core::ops::Mul;
 use floresta_common::prelude::*;
-use futures::future::ok;
 use rustreexo::accumulator::node_hash::NodeHash;
 use rustreexo::accumulator::proof::Proof;
 use rustreexo::accumulator::stump::Stump;
 use sha2::Digest;
 use sha2::Sha512_256;
+use std::time::SystemTime;
 
 use super::chainparams::ChainParams;
 use super::error::BlockValidationErrors;
@@ -136,10 +133,10 @@ impl Consensus {
         // Skip the coinbase tx
         for (n, transaction) in transactions.iter().enumerate() {
             //We cannot break during value calculation, so we wait until the next iteration.
-       
+
             // We don't need to verify the coinbase inputs, as it spends newly generated coins
             if transaction.is_coinbase() {
-                Self::verify_coinbase(transaction.clone(), height, n as u16)?;
+                Self::verify_coinbase(transaction.clone(), n as u16)?;
                 continue;
             }
             // Amount of all outputs
@@ -191,9 +188,13 @@ impl Consensus {
         Ok(())
     }
     /// Consumes the UTXOs from the hashmap, and returns the value of the consumed UTXOs.
-    /// If we do not find the UTXO, we return an error invalidating the input that tried to 
+    /// If we do not find the UTXO, we return an error invalidating the input that tried to
     /// consume that UTXO.
-    fn consume_utxos(input: &TxIn ,utxos: & mut HashMap<OutPoint, TxOut>, value_var: &mut u64) -> Result<(), BlockchainError> {
+    fn consume_utxos(
+        input: &TxIn,
+        utxos: &mut HashMap<OutPoint, TxOut>,
+        value_var: &mut u64,
+    ) -> Result<(), BlockchainError> {
         match utxos.get(&input.previous_output) {
             Some(prevout) => {
                 *value_var += prevout.value.to_sat();
@@ -212,75 +213,101 @@ impl Consensus {
         };
         Ok(())
     }
-    fn validate_locktime(input: &TxIn,transaction: &Transaction, height: u32) -> Result<(), BlockchainError> {
-        if input.sequence.is_height_locked() || input.sequence.enables_absolute_lock_time(){
-            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).expect("valid time").as_secs();
-            if transaction.is_absolute_timelock_satisfied(Height::from_consensus(height).unwrap(), Time::from_consensus(now.try_into().unwrap()).unwrap()){
-                return Err(BlockValidationErrors::InvalidTx(alloc::format!("Transaction {:?} is locked", transaction.txid())).into());
+    fn validate_locktime(
+        input: &TxIn,
+        transaction: &Transaction,
+        height: u32,
+    ) -> Result<(), BlockchainError> {
+        if input.sequence.is_height_locked() || input.sequence.enables_absolute_lock_time() {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("valid time")
+                .as_secs();
+            if transaction.is_absolute_timelock_satisfied(
+                Height::from_consensus(height).unwrap(),
+                Time::from_consensus(now.try_into().unwrap()).unwrap(),
+            ) {
+                return Err(BlockValidationErrors::InvalidTx(alloc::format!(
+                    "Transaction {:?} is locked",
+                    transaction.txid()
+                ))
+                .into());
             }
         }
-        if input.sequence.is_relative_lock_time(){
+        if input.sequence.is_relative_lock_time() {
             let timelock = input.sequence.clone().to_relative_lock_time().unwrap();
-            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).expect("valid time").as_secs();
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("valid time")
+                .as_secs();
             let height: u16 = height.try_into().unwrap();
-            if !timelock.is_satisfied_by(bitcoin::relative::Height::from(height), bitcoin::relative::Time::from_seconds_ceil(now.try_into().unwrap()).unwrap()){
-                return Err(BlockValidationErrors::InvalidTx(alloc::format!("Transaction {:?} is locked", transaction.txid())).into());
+            if !timelock.is_satisfied_by(
+                bitcoin::relative::Height::from(height),
+                bitcoin::relative::Time::from_seconds_ceil(now.try_into().unwrap()).unwrap(),
+            ) {
+                return Err(BlockValidationErrors::InvalidTx(alloc::format!(
+                    "Transaction {:?} is locked",
+                    transaction.txid()
+                ))
+                .into());
             }
         }
-        if input.sequence.is_rbf(){
-            //validates the RBF 
+        if input.sequence.is_rbf() {
+            //validates the RBF
         }
         Ok(())
     }
     /// Validates the script size and the number of sigops in a script.
     fn validate_script_size(script: &ScriptBuf) -> Result<(), BlockchainError> {
         let scriptpubkeysize = script.clone().into_bytes().len();
-        let is_taproot = script.witness_version() == Some(WitnessVersion::V1) && scriptpubkeysize == 32; 
-        if  scriptpubkeysize > 520 || scriptpubkeysize < 2 && !is_taproot {
+        let is_taproot =
+            script.witness_version() == Some(WitnessVersion::V1) && scriptpubkeysize == 32;
+        if scriptpubkeysize > 520 || scriptpubkeysize < 2 && !is_taproot {
             //the scriptsig size must be between 2 and 100 bytes unless is taproot
-            return Err(BlockValidationErrors::InvalidTx(alloc::format!("Some input's Scriptsig has more than 520 bytes on")).into());
+            return Err(BlockValidationErrors::InvalidTx(alloc::format!(
+                "Some input's Scriptsig has more than 520 bytes on"
+            ))
+            .into());
         }
         if script.count_sigops() > 80_000 {
-            return Err(BlockValidationErrors::InvalidTx(alloc::format!("Some Transaction has more than 80_000 sigops")).into());
-        }
-        Ok(())
-    }
-    fn get_out_value<'a>(out: &TxOut, value_var: & mut u64) -> Result<(), BlockchainError> {
-        if out.value.to_sat() > 0 {
-            *value_var += out.value.to_sat()
-        } else {
             return Err(BlockValidationErrors::InvalidTx(alloc::format!(
-                "Invalid output",
+                "Some Transaction has more than 80_000 sigops"
             ))
             .into());
         }
         Ok(())
     }
-    fn verify_coinbase(transaction: Transaction, height: u32, index: u16) -> Result<(), BlockchainError> {
+    fn get_out_value(out: &TxOut, value_var: &mut u64) -> Result<(), BlockchainError> {
+        if out.value.to_sat() > 0 {
+            *value_var += out.value.to_sat()
+        } else {
+            return Err(BlockValidationErrors::InvalidTx(alloc::format!("Invalid output",)).into());
+        }
+        Ok(())
+    }
+    fn verify_coinbase(transaction: Transaction, index: u16) -> Result<(), BlockchainError> {
         if index != 0 {
             // A block must contain only one coinbase, and it should be the fist thing inside it
-            return Err(BlockValidationErrors::FirstTxIsnNotCoinbase.into());    
+            return Err(BlockValidationErrors::FirstTxIsnNotCoinbase.into());
         }
         //the prevout input of a coinbase must be all zeroes
-        if transaction.input[0].previous_output.txid != Txid::all_zeros() { return Err(BlockValidationErrors::InvalidCoinbase("Invalid coinbase txid".to_string()).into());}
-        let scriptsig =  transaction.input[0].script_sig.clone();
-        let scriptsigsize = scriptsig.clone().into_bytes().len();
-        if  scriptsigsize > 100 || scriptsigsize < 2 {
-            //the scriptsig size must be between 2 and 100 bytes
-            return Err(BlockValidationErrors::InvalidCoinbase("Invalid ScriptSig size".to_string()).into());
+        if transaction.input[0].previous_output.txid != Txid::all_zeros() {
+            return Err(BlockValidationErrors::InvalidCoinbase(
+                "Invalid coinbase txid".to_string(),
+            )
+            .into());
         }
-        //according BIP 34, the scriptsig of a coinbase must be the height of the block;
-        //the first byte is the number of bytes of the height
-        let height_index = u8::from_le(scriptsig.as_script().as_bytes()[0]);
-        //gets the height in bytes (including sign)
-        let in_script_height = &scriptsig.as_script().as_bytes()[1..height_index as usize];
-        //height from le to i64
-        let in_script_height = u32::from_le_bytes(in_script_height.try_into().unwrap()); 
-        if in_script_height != height{
-            return Err(BlockValidationErrors::InvalidCoinbase("Invalid declared Block Height in Coinbase`s ScriptSig".to_string()).into());
-        };
+        let scriptsig = transaction.input[0].script_sig.clone();
+        let scriptsigsize = scriptsig.clone().into_bytes().len();
+        if scriptsigsize > 100 || scriptsigsize < 2 {
+            //the scriptsig size must be between 2 and 100 bytes
+            return Err(BlockValidationErrors::InvalidCoinbase(
+                "Invalid ScriptSig size".to_string(),
+            )
+            .into());
+        }
         Ok(())
-    }   
+    }
     /// Calculates the next target for the proof of work algorithm, given the
     /// current target and the time it took to mine the last 2016 blocks.
     pub fn calc_next_work_required(
@@ -376,36 +403,121 @@ impl Consensus {
 }
 #[cfg(test)]
 mod tests {
-    #[warn(unused_imports)]
     use super::*;
+    use bitcoin::{
+        absolute::LockTime, hashes::sha256d::Hash, transaction::Version, Amount, OutPoint,
+        ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    };
 
-    #[allow(dead_code)]
-    fn get_invalid_tx() {
-            unimplemented!(
-                "
-            Implement function that returns only the invalid transactions from testdata/test_txs.json
-            "
+    fn coinbase(is_valid: bool) -> Transaction {
+        //This coinbase transactions was retrieved from https://learnmeabitcoin.com/explorer/block/0000000000000a0f82f8be9ec24ebfca3d5373fde8dc4d9b9a949d538e9ff679
+        // Create inputs
+        let input_txid = Txid::from_raw_hash(Hash::from_str(&format!("{:0>64}", "")).unwrap());
+
+        let input_vout = 0;
+        let input_outpoint = OutPoint::new(input_txid, input_vout);
+        let input_script_sig = if is_valid {
+            ScriptBuf::from_hex("03f0a2a4d9f0a2").unwrap()
+        } else {
+            //This should invalidate the coinbase transaction since is a big, really big, script.
+            ScriptBuf::from_hex(&format!("{:0>420}", "")).unwrap()
+        };
+
+        let input_sequence = Sequence::MAX;
+        let input = TxIn {
+            previous_output: input_outpoint,
+            script_sig: input_script_sig,
+            sequence: input_sequence,
+            witness: Witness::new(),
+        };
+
+        // Create outputs
+        let output_value = Amount::from_sat(5_000_350_000);
+        let output_script_pubkey = ScriptBuf::from_hex("41047eda6bd04fb27cab6e7c28c99b94977f073e912f25d1ff7165d9c95cd9bbe6da7e7ad7f2acb09e0ced91705f7616af53bee51a238b7dc527f2be0aa60469d140ac").unwrap();
+        let output = TxOut {
+            value: output_value,
+            script_pubkey: output_script_pubkey,
+        };
+
+        // Create transaction
+        let version = Version(1);
+        let lock_time = LockTime::from_height(150_007).unwrap();
+
+        Transaction {
+            version,
+            lock_time,
+            input: vec![input],
+            output: vec![output],
+        }
+    }
+
+    #[test]
+    fn test_validate_coinbase() {
+        let valid_one = coinbase(true);
+        let invalid_one = coinbase(false);
+        //The case that should be valid
+        assert_eq!(
+            Consensus::verify_coinbase(valid_one.clone(), 0).unwrap(),
+            ()
+        );
+        //Coinbase at wrong index
+        assert_eq!(
+            Consensus::verify_coinbase(valid_one, 1)
+                .unwrap_err()
+                .to_string(),
+            "BlockValidation(FirstTxIsnNotCoinbase)"
+        );
+        //Invalid coinbase script
+        assert_eq!(
+            Consensus::verify_coinbase(invalid_one, 0)
+                .unwrap_err()
+                .to_string(),
+            "BlockValidation(InvalidCoinbase(\"Invalid ScriptSig size\"))"
+        );
+    }
+    #[test]
+    fn test_consume_utxos() {
+        // Transaction extracted from https://learnmeabitcoin.com/explorer/tx/0094492b6f010a5e39c2aacc97396ce9b6082dc733a7b4151ccdbd580f789278
+        // Mock data for testing
+
+        let mut utxos = HashMap::new();
+        let outpoint1 = OutPoint::new(
+            Txid::from_raw_hash(
+                Hash::from_str("5baf640769ebdf2b79868d0a259db69a2c1587232f83ba226ecf3dd0737759bd")
+                    .unwrap(),
+            ),
+            1,
+        );
+        let input = TxIn {
+            previous_output: outpoint1.clone(),
+            script_sig: ScriptBuf::from_hex("493046022100841d4f503f44dd6cef8781270e7260db73d0e3c26c4f1eea61d008760000b01e022100bc2675b8598773984bcf0bb1a7cad054c649e8a34cb522a118b072a453de1bf6012102de023224486b81d3761edcd32cedda7cbb30a4263e666c87607883197c914022").unwrap(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        };
+        let prevout = TxOut {
+            value: Amount::from_sat(018000000),
+            script_pubkey: ScriptBuf::from_hex(
+                "76a9149206a30c09cc853bb03bd917a4f9f29b089c1bc788ac",
             )
-    }
-    #[allow(dead_code)]
-    fn get_valid_tx() {
-        unimplemented!(
-            "
-        Implement function that returns only the valid transactions from testdata/test_txs.json
-        "
-        )
-    }
+            .unwrap(),
+        };
 
-    #[test]
-    fn test_validate_transactions() {
-        unimplemented!("
-        Implement test that uses the verify_block_transactions function to accept valid transactions.
-        ")
-    }
-    #[test]
-    fn test_invalidate_transactions() {
-        unimplemented!("
-        Implement test that uses the verify_block_transactions function to deny invalid transactions.
-        ")
+        utxos.insert(outpoint1, prevout.clone());
+
+        // Test consuming UTXOs
+        let mut value_var: u64 = 0;
+        assert_eq!(
+            Consensus::consume_utxos(&input, &mut utxos, &mut value_var).unwrap(),
+            ()
+        );
+        assert_eq!(value_var, prevout.value.to_sat());
+
+        // Test double consuming UTXOs
+        assert_eq!(
+            Consensus::consume_utxos(&input, &mut utxos, &mut value_var)
+                .unwrap_err()
+                .to_string(),
+             "BlockValidation(InvalidTx(\"Invalid input: OutPoint { txid: 0x5baf640769ebdf2b79868d0a259db69a2c1587232f83ba226ecf3dd0737759bd, vout: 1 }\"))"
+        );
     }
 }
