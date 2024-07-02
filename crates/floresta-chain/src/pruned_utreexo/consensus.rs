@@ -475,6 +475,46 @@ mod tests {
             "BlockValidation(InvalidCoinbase(\"Invalid ScriptSig size\"))"
         );
     }
+
+    #[test]
+    fn test_validate_script_size() {
+        //valid script
+        let valid_script =
+            ScriptBuf::from_hex("76a9149206a30c09cc853bb03bd917a4f9f29b089c1bc788ac").unwrap();
+        //invalid script
+        let invalid_script = ScriptBuf::from_hex(&format!("{:0>520}", "")).unwrap();
+        //valid script size
+        assert_eq!(Consensus::validate_script_size(&valid_script).unwrap(), ());
+        //invalid script size
+        assert_eq!(
+            Consensus::validate_script_size(&invalid_script)
+                .unwrap_err()
+                .to_string(),
+            "BlockValidation(InvalidTx(\"Some input's Scriptsig has more than 520 bytes on\"))"
+        );
+    }
+
+    #[test]
+    fn test_get_out_value() {
+        //random output
+        let prevout = TxOut {
+            value: Amount::from_sat(018000000),
+            script_pubkey: ScriptBuf::from_hex(
+                "76a9149206a30c09cc853bb03bd917a4f9f29b089c1bc788ac",
+            )
+            .unwrap(),
+        };
+        let mut value_var: u64 = 0;
+        //Works just fine
+        assert_eq!(
+            Consensus::get_out_value(&prevout, &mut value_var).unwrap(),
+            ()
+        );
+        //should be equal to the value of the output
+        assert_eq!(value_var, prevout.value.to_sat());
+        //Technically a negative value will not be viable to exist in this code due to rust type system, so no need to test it, but function covers it for the sake of completeness.
+    }
+
     #[test]
     fn test_consume_utxos() {
         // Transaction extracted from https://learnmeabitcoin.com/explorer/tx/0094492b6f010a5e39c2aacc97396ce9b6082dc733a7b4151ccdbd580f789278
