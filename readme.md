@@ -39,6 +39,7 @@ cargo install --path ./florestad
 
 If you're using Nix, you can add Florestad to your system with its overlay.
 
+
 ```nix
 {
   #Here you declare the import for your flake
@@ -142,6 +143,7 @@ and use our flake for development with include
 - Typos for good spelling.
 
 If you do not have Nix
+
 [Check their guide](https://nixos.org/download/).
 
 ### License

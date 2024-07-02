@@ -696,7 +696,10 @@ where
                     // to be invalidated.
                     match e {
                         BlockValidationErrors::InvalidTx(_)
+                        | BlockValidationErrors::InvalidCoinbase(_)
+                        | BlockValidationErrors::BlockTooBig
                         | BlockValidationErrors::NotEnoughPow
+                        | BlockValidationErrors::TooManyCoins
                         | BlockValidationErrors::BadMerkleRoot
                         | BlockValidationErrors::BadWitnessCommitment
                         | BlockValidationErrors::NotEnoughMoney
