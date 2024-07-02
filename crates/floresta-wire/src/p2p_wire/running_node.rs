@@ -132,10 +132,16 @@ where
                         IpAddr::V4(addr) => AddrV2::Ipv4(addr),
                         IpAddr::V6(addr) => AddrV2::Ipv6(addr),
                     };
-                    let id = rand::random::<usize>();
-                    let local_addr =
-                        LocalAddress::new(addr_v2, 0, AddressState::NeverTried, 0.into(), port, id);
+                    let local_addr = LocalAddress::new(
+                        addr_v2,
+                        0,
+                        AddressState::NeverTried,
+                        0.into(),
+                        port,
+                        self.peer_id_count as usize,
+                    );
                     self.open_connection(false, 0, local_addr).await;
+                    self.peer_id_count += 1;
                     self.1.user_requests.send_answer(
                         UserRequest::Connect((addr, port)),
                         Some(NodeResponse::Connect(true)),
@@ -190,8 +196,10 @@ where
                 continue;
             };
 
-            // Punnishing this peer for taking too long to respond
-            self.increase_banscore(peer, 2).await?;
+            if !matches!(request, InflightRequests::Connect(_)) {
+                // Punnishing this peer for taking too long to respond
+                self.increase_banscore(peer, 2).await?;
+            }
 
             match request {
                 InflightRequests::UtreexoState(_) => {}
@@ -341,6 +349,10 @@ where
 
         self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
 
+        if let Some(ref cfilters) = self.block_filters {
+            self.last_filter = self.chain.get_block_hash(cfilters.get_height()).unwrap();
+        }
+
         info!("starting running node...");
         loop {
             while let Ok(notification) =
@@ -421,8 +433,6 @@ where
                 RunningNode
             );
 
-            try_and_log!(self.request_rescan_block().await);
-
             // Check whether we are in a stale tip
             periodic_job!(
                 self.check_for_stale_tip().await,
@@ -430,9 +440,12 @@ where
                 ASSUME_STALE,
                 RunningNode
             );
+
+            try_and_log!(self.request_rescan_block().await);
             try_and_log!(self.download_filters().await);
+
             // requests that need a utreexo peer
-            if self.has_utreexo_peers() {
+            if !self.has_utreexo_peers() {
                 continue;
             }
 
@@ -452,7 +465,6 @@ where
 
         if !self.has_compact_filters_peer() {
             // open a feeler connection to find more peers with COMPACT_BLOCK_FILTERS flag
-            self.create_connection(true).await;
             return Ok(());
         }
 
@@ -672,13 +684,12 @@ where
                 &block.block.txdata,
                 &self.chain,
             )?;
-
+            async_std::task::yield_now().await;
             if let Err(e) = self
                 .chain
                 .connect_block(&block.block, proof, inputs, del_hashes)
             {
                 error!("Invalid block received by peer {} reason: {:?}", peer, e);
-
                 if let BlockchainError::BlockValidation(e) = e {
                     // Because the proof isn't committed to the block, we can't invalidate
                     // it if the proof is invalid. Any other error should cause the block
@@ -773,7 +784,10 @@ where
                     }
                 }
                 PeerMessages::Ready(version) => {
-                    debug!("handshake with peer={peer} succeeded");
+                    debug!(
+                        "handshake with peer={peer} succeeded feeler={}",
+                        version.feeler
+                    );
                     self.handle_peer_ready(peer, &version).await?;
                 }
                 PeerMessages::Disconnected(idx) => {
@@ -788,10 +802,11 @@ where
                 PeerMessages::BlockFilter((hash, filter)) => {
                     debug!("Got a block filter from peer {}", peer);
                     let height = self.chain.get_block_height(&hash)?.unwrap_or(0);
-                    self.block_filters
-                        .as_ref()
-                        .map(|filters| filters.push_filter(height, filter));
-                    if hash == self.last_filter {
+                    if let Some(filters) = self.block_filters.as_ref() {
+                        filters.push_filter(height, filter)
+                    }
+
+                    if self.inflight.len() < RunningNode::MAX_INFLIGHT_REQUESTS {
                         self.download_filters().await?;
                     }
                 }

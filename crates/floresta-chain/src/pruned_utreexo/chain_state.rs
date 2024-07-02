@@ -630,22 +630,45 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
     fn check_chain_integrity(&self) {
         let best_height = self.get_best_block().expect("should have this loaded").0;
-        for height in 0..=best_height {
-            let Ok(hash) = self.get_block_hash(height) else {
-                self.reindex_chain();
-                return;
-            };
-            match self.get_disk_block_header(&hash) {
-                Ok(DiskBlockHeader::FullyValid(_, _)) => continue,
-                Ok(DiskBlockHeader::HeadersOnly(_, _)) => continue,
+        // make sure our index is right for the latest block
+        let best_block_heigh = self
+            .get_disk_block_header(&self.get_best_block().expect("should have this loaded").1)
+            .expect("should have this loaded")
+            .height()
+            .expect("should have this loaded");
 
-                _ => {
-                    warn!("our chain is corrupted, reindexing");
-                    self.reindex_chain();
-                }
+        if best_height != best_block_heigh {
+            self.reindex_chain();
+        }
+
+        // make sure our validation index is pointing to a valid block
+        let validation_index = self.get_best_block().expect("should have this loaded").1;
+        let validation_index = self
+            .get_disk_block_header(&validation_index)
+            .expect("should have this loaded");
+
+        if !matches!(validation_index, DiskBlockHeader::FullyValid(_, _)) {
+            self.reindex_chain();
+        }
+
+        // make sure our rescan index is pointing to a valid block
+        let rescan_index = read_lock!(self).best_block.rescan_index;
+        if let Some(rescan_index) = rescan_index {
+            let hash = self
+                .get_block_hash(rescan_index)
+                .expect("should have this loaded");
+
+            let rescan_index = self
+                .get_disk_block_header(&hash)
+                .expect("should have this loaded");
+
+            match rescan_index {
+                DiskBlockHeader::FullyValid(_, _) | DiskBlockHeader::HeadersOnly(_, _) => {}
+                _ => write_lock!(self).best_block.rescan_index = None,
             }
         }
     }
+
     fn load_acc<Storage: ChainStore>(data_storage: &Storage) -> Stump {
         let acc = data_storage
             .load_roots()
@@ -1007,14 +1030,14 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         self.update_header(&new_header)
     }
 
-    fn mark_chain_as_assumed(&self, acc: Stump) -> Result<bool, BlockchainError> {
-        let assumed_hash = self.get_best_block()?.1;
-
+    fn mark_chain_as_assumed(
+        &self,
+        acc: Stump,
+        assumed_hash: BlockHash,
+    ) -> Result<bool, BlockchainError> {
         let mut curr_header = self.get_block_header(&assumed_hash)?;
 
-        // The assumeutreexo value passed is inside our main chain, start from that point
         while let Ok(header) = self.get_disk_block_header(&curr_header.block_hash()) {
-            // We've reached genesis and didn't our block
             if self.is_genesis(&header) {
                 break;
             }
@@ -1028,7 +1051,6 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         let mut guard = write_lock!(self);
         guard.best_block.validation_index = assumed_hash;
         guard.best_block.rescan_index = None;
-        info!("assuming chain with hash={assumed_hash}");
         guard.acc = acc;
 
         Ok(true)
@@ -1112,34 +1134,18 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
 
         self.validate_block(block, height, inputs)?;
         let acc = Consensus::update_acc(&self.acc(), block, height, proof, del_hashes)?;
-        let ibd = self.is_in_idb();
-        // ... If we came this far, we consider this block valid ...
-        if ibd && height % 10_000 == 0 {
-            info!(
-                "Downloading blocks: height={height} hash={}",
-                block.block_hash()
-            );
-            self.flush()?;
-        }
-
-        match ibd {
-            false => {
-                info!(
-                    "New tip! hash={} height={height} tx_count={}",
-                    block.block_hash(),
-                    block.txdata.len()
-                );
-                self.flush()?;
-            }
-            true => {
-                if block.block_hash() == self.get_best_block()?.1 {
-                    info!("Tip reached, toggle IBD off");
-                    self.toggle_ibd(false);
-                }
-            }
-        }
 
         self.update_view(height, &block.header, acc)?;
+
+        info!(
+            "New tip! hash={} height={height} tx_count={}",
+            block.block_hash(),
+            block.txdata.len()
+        );
+
+        if !self.is_in_idb() {
+            self.flush()?;
+        }
 
         // Notify others we have a new block
         self.notify(block, height);
@@ -1379,6 +1385,7 @@ mod test {
     use bitcoin::hashes::hex::FromHex;
     use bitcoin::Block;
     use bitcoin::BlockHash;
+    use rand::Rng;
     use rustreexo::accumulator::proof::Proof;
 
     use super::BlockchainInterface;
@@ -1391,6 +1398,7 @@ mod test {
     use crate::AssumeValidArg;
     use crate::KvChainStore;
     use crate::Network;
+
     #[test]
     fn accept_mainnet_headers() {
         // Accepts the first 10235 mainnet headers
@@ -1495,5 +1503,55 @@ mod test {
             }
             panic!("Block {} is not in the store", i);
         }
+    }
+    #[test]
+    fn test_chainstate_functions() {
+        let file = include_bytes!("./testdata/signet_headers.zst");
+        let uncompressed: Vec<u8> = zstd::decode_all(std::io::Cursor::new(file)).unwrap();
+        let mut cursor = Cursor::new(uncompressed);
+
+        let test_id = rand::random::<u64>();
+        let chainstore = KvChainStore::new(format!("./data/{test_id}/")).unwrap();
+        let chain =
+            ChainState::<KvChainStore>::new(chainstore, Network::Signet, AssumeValidArg::Hardcoded);
+        let mut headers: Vec<BlockHeader> = Vec::new();
+        while let Ok(header) = BlockHeader::consensus_decode(&mut cursor) {
+            headers.push(header);
+        }
+        headers.remove(0);
+
+        // push_headers
+        assert!(chain.push_headers(headers.clone(), 1).is_ok());
+
+        // get_block_header_by_height
+        assert_eq!(chain.get_block_header_by_height(1), headers[0]);
+
+        // reindex_chain
+        assert_eq!(chain.reindex_chain().depth, 2015);
+
+        // get_block_locator_for_tip
+        assert!(!chain
+            .get_block_locator_for_tip(read_lock!(chain).best_block.best_block)
+            .unwrap()
+            .is_empty());
+
+        // get_block_locator
+        assert!(!chain.get_block_locator().unwrap().is_empty());
+
+        // invalidate_block
+        let random_height = rand::thread_rng().gen_range(1..=2014);
+
+        chain
+            .invalidate_block(headers[random_height].prev_blockhash)
+            .unwrap();
+
+        assert_eq!(chain.get_height().unwrap() as usize, random_height - 1);
+
+        // update_tip
+        chain.update_tip(headers[1].prev_blockhash, 1);
+        assert_eq!(
+            read_lock!(chain).best_block.best_block,
+            headers[1].prev_blockhash
+        );
     }
 }

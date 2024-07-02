@@ -15,6 +15,7 @@ use floresta_chain::BlockchainError;
 use log::debug;
 use log::error;
 use log::info;
+use log::warn;
 
 use super::error::WireError;
 use super::peer::PeerMessages;
@@ -40,7 +41,7 @@ impl NodeContext for SyncNode {
 
     const MAX_OUTGOING_PEERS: usize = 5; // don't need many peers, half the default
     const TRY_NEW_CONNECTION: u64 = 10; // ten seconds
-    const REQUEST_TIMEOUT: u64 = 30; // 30 seconds
+    const REQUEST_TIMEOUT: u64 = 10 * 60; // 10 minutes
     const MAX_INFLIGHT_REQUESTS: usize = 100; // double the default
 }
 
@@ -49,9 +50,28 @@ where
     WireError: From<<Chain as BlockchainInterface>::Error>,
     Chain: BlockchainInterface + UpdatableChainstate + 'static,
 {
+    async fn get_blocks_to_download(&mut self) {
+        let mut blocks = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let next_block = self.1.last_block_requested + 1;
+            let next_block = self.chain.get_block_hash(next_block);
+            match next_block {
+                Ok(next_block) => {
+                    blocks.push(next_block);
+                    self.1.last_block_requested += 1;
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+        try_and_log!(self.request_blocks(blocks).await);
+    }
+
     pub async fn run(&mut self, kill_signal: Arc<RwLock<bool>>, done_cb: impl FnOnce(&Chain)) {
         info!("Starting sync node");
         self.1.last_block_requested = self.chain.get_validation_index().unwrap();
+
         loop {
             while let Ok(Ok(msg)) = timeout(Duration::from_secs(1), self.node_rx.recv()).await {
                 self.handle_message(msg).await;
@@ -61,7 +81,9 @@ where
                 break;
             }
 
-            if !self.chain.is_in_idb() {
+            if self.chain.get_validation_index().unwrap() == self.chain.get_best_block().unwrap().0
+            {
+                self.chain.toggle_ibd(false);
                 break;
             }
 
@@ -72,28 +94,28 @@ where
                 SyncNode
             );
 
-            self.handle_timeout().await;
-
-            if self.has_utreexo_peers() {
+            if Instant::now()
+                .duration_since(self.0.last_tip_update)
+                .as_secs()
+                > SyncNode::ASSUME_STALE
+            {
+                self.1.last_block_requested = self.chain.get_validation_index().unwrap();
+                self.create_connection(false).await;
+                self.last_tip_update = Instant::now();
                 continue;
             }
 
-            if self.inflight.len() < SyncNode::MAX_INFLIGHT_REQUESTS {
-                let mut blocks = Vec::with_capacity(100);
-                for _ in 0..100 {
-                    let next_block = self.1.last_block_requested + 1;
-                    let next_block = self.chain.get_block_hash(next_block);
-                    match next_block {
-                        Ok(next_block) => {
-                            blocks.push(next_block);
-                            self.1.last_block_requested += 1;
-                        }
-                        Err(_) => {
-                            break;
-                        }
-                    }
+            self.handle_timeout().await;
+
+            if !self.has_utreexo_peers() {
+                continue;
+            }
+
+            if self.chain.get_validation_index().unwrap() + 10 > self.1.last_block_requested {
+                if self.inflight.len() > 10 {
+                    continue;
                 }
-                try_and_log!(self.request_blocks(blocks).await);
+                self.get_blocks_to_download().await;
             }
         }
 
@@ -157,7 +179,10 @@ where
                 .chain
                 .connect_block(&block.block, proof, inputs, del_hashes)
             {
-                error!("Invalid block received by peer {} reason: {:?}", peer, e);
+                error!(
+                    "Invalid block {:?} received by peer {} reason: {:?}",
+                    block.block.header, peer, e
+                );
 
                 if let BlockchainError::BlockValidation(e) = e {
                     // Because the proof isn't committed to the block, we can't invalidate
@@ -205,6 +230,10 @@ where
             debug!("accepted block {}", block.block.block_hash());
         }
 
+        if self.inflight.len() < 4 {
+            self.get_blocks_to_download().await;
+        }
+
         Ok(())
     }
 
@@ -221,6 +250,12 @@ where
                 }
                 PeerMessages::Disconnected(idx) => {
                     try_and_log!(self.handle_disconnection(peer, idx));
+                    if !self.has_utreexo_peers() {
+                        warn!("No utreexo peers connected, trying to create a new one");
+                        try_and_log!(self.maybe_open_connection().await);
+                        self.1.last_block_requested = self.chain.get_validation_index().unwrap();
+                        self.inflight.clear();
+                    }
                 }
                 _ => {}
             },

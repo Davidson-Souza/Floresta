@@ -52,7 +52,7 @@ impl KvFilterStore {
 }
 
 impl BlockFilterStore for KvFilterStore {
-    fn get_filter(&self, block_height: u64) -> Option<BlockFilter> {
+    fn get_filter(&self, block_height: u32) -> Option<BlockFilter> {
         let value = self
             .bucket
             .get(&Integer::from(block_height))
@@ -60,9 +60,30 @@ impl BlockFilterStore for KvFilterStore {
             .flatten()?;
         Some(BlockFilter::new(&value))
     }
-    fn put_filter(&self, block_height: u64, block_filter: BlockFilter) {
+
+    fn put_filter(&self, block_height: u32, block_filter: BlockFilter) {
         self.bucket
             .set(&Integer::from(block_height), &block_filter.content)
+            .expect("Bucket should be open");
+    }
+
+    fn get_height(&self) -> Option<u32> {
+        // A bit of a hack to avoid opening a new bucket just for the height
+        // write the height as the 0th block
+        self.bucket
+            .get(&Integer::from(0))
+            .ok()
+            .flatten()
+            .map(|height| {
+                let mut _height = [0u8; 4];
+                _height.copy_from_slice(&height);
+                u32::from_le_bytes(_height)
+            })
+    }
+
+    fn put_height(&self, height: u32) {
+        self.bucket
+            .set(&Integer::from(0), &height.to_le_bytes().to_vec())
             .expect("Bucket should be open");
     }
 }

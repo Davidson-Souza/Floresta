@@ -37,7 +37,8 @@ cargo install --path ./florestad
 
 ### Building with nix
 
-If you're using nix, u can add Florestad to your system with its overlay.
+If you're using Nix, you can add Florestad to your system with its overlay.
+
 
 ```nix
 {
@@ -122,7 +123,7 @@ If you want to contribute but don't know where to start, take a look at the issu
 Here's some Guidelines:
 - Has to compile.
 - Has to run.
-- Use pre-commit for the language that you're using (if possible 👍).
+- Use [pre-commit](https://pre-commit.com/) for the language that you're using (if possible 👍).
 
 You can accomplish that using our flake.nix for development.
 
@@ -141,7 +142,8 @@ and use our flake for development with include
 - Clippy and some libs so rust can compile.
 - Typos for good spelling.
 
-If you do not have nix(Why?)
+If you do not have Nix
+
 [Check their guide](https://nixos.org/download/).
 
 ### License

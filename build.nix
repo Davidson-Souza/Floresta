@@ -33,7 +33,7 @@ buildRustPackage {
   meta = with lib; {
     description = "A full bitcoin node with Utreexo";
     homepage = "https://github.com/Davidson-Souza/Floresta";
-    license = licenses.agpl3;
+    license = licenses.mit;
     maintainers = [ maintainers.Davidson maintainers.afm maintainers.jaoleal ];
     platforms = platforms.all;
   };

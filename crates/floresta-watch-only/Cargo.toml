@@ -20,6 +20,9 @@ thiserror = "1.0"
 floresta-common = { path = "../floresta-common" }
 hex = "0.4.3"
 
+[dev-dependencies]
+rand = "0.8.5"
+
 [features]
 default = []
 memory-database = []

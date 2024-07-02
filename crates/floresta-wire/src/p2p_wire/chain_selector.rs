@@ -158,7 +158,7 @@ where
             }
         }
 
-        self.request_headers(headers.last().unwrap().block_hash())
+        self.request_headers(headers.last().unwrap().block_hash(), peer)
             .await
     }
 
@@ -235,16 +235,10 @@ where
     ) -> Result<Option<PeerId>, WireError> {
         let (mut height, mut hash) = self.chain.get_best_block()?;
         let mut prev_height = 0;
-        let agree = false;
         // we first norrow down the possible fork point to a couple of blocks, looking
         // for all blocks in a linear search would be too slow
         loop {
             // ask both peers for the utreexo state
-            self.send_to_peer(peer1, NodeRequest::GetUtreexoState((hash, height)))
-                .await?;
-            self.send_to_peer(peer2, NodeRequest::GetUtreexoState((hash, height)))
-                .await?;
-
             let (peer1_acc, peer2_acc) = self
                 .grab_both_peers_version(peer1, peer2, hash, height)
                 .await?;
@@ -278,6 +272,21 @@ where
         info!("Fork point is arround height={height} hash={hash}");
         // at the end, this variable should hold the last block where they agreed
         let mut fork = 0;
+
+        // Getting the acc for the block on which we landed on
+        let (peer1_acc, peer2_acc) = self
+            .grab_both_peers_version(peer1, peer2, hash, height)
+            .await?;
+
+        // Intializing the agree bool for the block on which we landed on
+        let agree = peer1_acc == peer2_acc;
+
+        if agree {
+            height += 1;
+        } else {
+            height -= 1;
+        }
+
         loop {
             // keep asking blocks until we find the fork point
             let (peer1_acc, peer2_acc) = self
@@ -446,12 +455,23 @@ where
                     }
                 }
 
-                if let Some(assume_utreexo) = self.config.assume_utreexo.as_ref() {
+                if let Some(assume_utreexo) = self.0.config.assume_utreexo.as_ref() {
+                    self.1.state = ChainSelectorState::Done;
+                    // already assumed the chain
+                    if self.chain.get_validation_index().unwrap() >= assume_utreexo.height {
+                        return Ok(());
+                    }
+                    info!(
+                        "Assuming chain with height={} tip={}",
+                        assume_utreexo.height, assume_utreexo.block_hash
+                    );
                     let acc = Stump {
                         leaves: assume_utreexo.leaves,
                         roots: assume_utreexo.roots.clone(),
                     };
-                    self.chain.mark_chain_as_assumed(acc)?;
+                    self.chain
+                        .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
+                    return Ok(());
                 }
 
                 let has_peers = self
@@ -523,7 +543,7 @@ where
                 );
 
                 self.1.state = ChainSelectorState::Done;
-                self.chain.mark_chain_as_assumed(acc).unwrap();
+                self.chain.mark_chain_as_assumed(acc, tips[0]).unwrap();
                 self.chain.toggle_ibd(false);
             }
             // if we have more than one tip, we need to check if our best chain has an invalid block
@@ -546,12 +566,12 @@ where
     /// peer is following a chain with `tip` inside it. We use this in case some of
     /// our peer is in a fork, so we can learn about all blocks in that fork and
     /// compare the candidate chains to pick the best one.
-    async fn request_headers(&mut self, tip: BlockHash) -> Result<(), WireError> {
+    async fn request_headers(&mut self, tip: BlockHash, peer: PeerId) -> Result<(), WireError> {
         let locator = self
             .chain
             .get_block_locator_for_tip(tip)
             .unwrap_or_default();
-        self.send_to_peer(self.1.sync_peer, NodeRequest::GetHeaders(locator))
+        self.send_to_peer(peer, NodeRequest::GetHeaders(locator))
             .await?;
 
         let peer = self.1.sync_peer;
@@ -622,7 +642,10 @@ where
                     let new_sync_peer = rand::random::<usize>() % self.peer_ids.len();
                     self.1.sync_peer = *self.peer_ids.get(new_sync_peer).unwrap();
 
-                    try_and_log!(self.request_headers(self.chain.get_best_block()?.1).await);
+                    try_and_log!(
+                        self.request_headers(self.chain.get_best_block()?.1, self.1.sync_peer)
+                            .await
+                    );
 
                     self.1.state = ChainSelectorState::DownloadingHeaders;
                 }

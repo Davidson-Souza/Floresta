@@ -29,6 +29,7 @@ use futures::AsyncRead;
 use futures::AsyncWrite;
 use futures::AsyncWriteExt;
 use futures::FutureExt;
+use log::debug;
 use log::error;
 use log::warn;
 use thiserror::Error;
@@ -121,9 +122,10 @@ type Result<T> = std::result::Result<T, PeerError>;
 impl<T: Transport> Peer<T> {
     pub async fn read_loop(mut self) -> Result<()> {
         let err = self.peer_loop_inner().await;
-
+        // force the stream to shutdown to prevent leaking resources
+        let _ = self.stream.shutdown();
         if let Err(err) = err {
-            warn!("Peer {} connection loop closed: {err:?}", self.id);
+            debug!("Peer {} connection loop closed: {err:?}", self.id);
         }
 
         self.send_to_node(PeerMessages::Disconnected(self.address_id))
@@ -166,13 +168,16 @@ impl<T: Transport> Peer<T> {
             // Send a ping to check if this peer is still good
             let last_message = self.last_message.elapsed().as_secs();
             if last_message > SEND_PING_TIMEOUT {
+                if self.last_ping.is_some() {
+                    continue;
+                }
                 let nonce = rand::random();
                 self.last_ping = Some(Instant::now());
                 self.write(NetworkMessage::Ping(nonce)).await?;
             }
 
             // divide the number of messages by the number of seconds we've been connected,
-            // if it's more than 100 msg/sec, this peer is sending us too many messages, and we should
+            // if it's more than 10 msg/sec, this peer is sending us too many messages, and we should
             // disconnect.
             let msg_sec = self
                 .messages
@@ -195,6 +200,8 @@ impl<T: Transport> Peer<T> {
         }
     }
     pub async fn handle_node_request(&mut self, request: NodeRequest) -> Result<()> {
+        assert_eq!(self.state, State::Connected);
+        debug!("Handling node request: {:?}", request);
         match request {
             NodeRequest::GetBlock((block_hashes, proof)) => {
                 let inv = if proof {
@@ -263,7 +270,7 @@ impl<T: Transport> Peer<T> {
     }
     pub async fn handle_peer_message(&mut self, message: RawNetworkMessage) -> Result<()> {
         self.last_message = Instant::now();
-
+        debug!("Received {} from peer {}", message.command(), self.id);
         match self.state {
             State::Connected => match message.payload().to_owned() {
                 NetworkMessage::Inv(inv) => {
@@ -380,16 +387,6 @@ impl<T: Transport> Peer<T> {
             State::None | State::SentVersion(_) => match message.payload().to_owned() {
                 bitcoin::p2p::message::NetworkMessage::Version(version) => {
                     self.handle_version(version).await?;
-                    self.send_to_node(PeerMessages::Ready(Version {
-                        user_agent: self.user_agent.clone(),
-                        protocol_version: 0,
-                        id: self.id,
-                        blocks: self.current_best_block.unsigned_abs(),
-                        address_id: self.address_id,
-                        services: self.services,
-                        feeler: self.feeler,
-                    }))
-                    .await;
                 }
                 _ => {
                     warn!(
@@ -403,6 +400,19 @@ impl<T: Transport> Peer<T> {
             State::SentVerack => match message.payload() {
                 bitcoin::p2p::message::NetworkMessage::Verack => {
                     self.state = State::Connected;
+                    self.send_to_node(PeerMessages::Ready(Version {
+                        user_agent: self.user_agent.clone(),
+                        protocol_version: 0,
+                        id: self.id,
+                        blocks: self.current_best_block.unsigned_abs(),
+                        address_id: self.address_id,
+                        services: self.services,
+                        feeler: self.feeler,
+                    }))
+                    .await;
+                    if self.feeler {
+                        self.shutdown = true;
+                    }
                 }
                 bitcoin::p2p::message::NetworkMessage::SendAddrV2 => {
                     self.wants_addrv2 = true;
@@ -426,6 +436,7 @@ impl<T: Transport> Peer<T> {
 }
 impl<T: Transport> Peer<T> {
     pub async fn write(&mut self, msg: NetworkMessage) -> Result<()> {
+        debug!("Writing {} to peer {}", msg.command(), self.id);
         let data = &mut RawNetworkMessage::new(self.network.magic(), msg);
         let data = serialize(&data);
         self.stream.write_all(data.as_slice()).await?;
@@ -507,6 +518,7 @@ impl<T: Transport> Peer<T> {
                 .await;
             return;
         };
+        stream.set_nodelay(true).unwrap();
         let peer = Peer {
             address_id,
             blocks_only: false,

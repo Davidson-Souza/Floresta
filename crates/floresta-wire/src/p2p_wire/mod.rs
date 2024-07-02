@@ -3,9 +3,8 @@
 
 use std::net::SocketAddr;
 
-use bitcoin::BlockHash;
 use bitcoin::Network;
-use rustreexo::accumulator::node_hash::NodeHash;
+use floresta_chain::AssumeUtreexoValue;
 
 use self::address_man::LocalAddress;
 
@@ -56,22 +55,6 @@ pub struct UtreexoNodeConfig {
     /// is that we are vulnerable to a fraud proof attack for a few hours, but we can spot it
     /// and react in a couple of hours at most, so the attack window is very small.
     pub backfill: bool,
-}
-
-/// If enabled, the node will assume that the provided Utreexo state is valid, and will
-/// start running from there. You may use this to make your node start faster, but you
-/// should be sure that the provided state is valid. You may or not verify the state,
-/// by downloading all blocks on background, and then verifying the final Utreexo state.
-#[derive(Debug, Clone)]
-pub struct AssumeUtreexoValue {
-    /// The latest block assumed to be valid. This acc is the roots at this block
-    pub block_hash: BlockHash,
-    /// Same as block_hash, but in height
-    pub height: u32,
-    /// The roots of the Utreexo accumulator at this block
-    pub roots: Vec<NodeHash>,
-    /// The number of leaves in the Utreexo accumulator at this block
-    pub leaves: u64,
 }
 
 impl Default for UtreexoNodeConfig {

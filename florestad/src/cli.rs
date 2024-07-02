@@ -13,6 +13,17 @@ pub enum Network {
     Regtest,
 }
 
+impl From<Network> for floresta_chain::Network {
+    fn from(network: Network) -> Self {
+        match network {
+            Network::Bitcoin => floresta_chain::Network::Bitcoin,
+            Network::Signet => floresta_chain::Network::Signet,
+            Network::Testnet => floresta_chain::Network::Testnet,
+            Network::Regtest => floresta_chain::Network::Regtest,
+        }
+    }
+}
+
 impl std::fmt::Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -33,8 +44,8 @@ pub struct Cli {
     #[arg(short, long, default_value_t=Network::Bitcoin)]
     pub network: Network,
     /// Turn debugging information on
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    pub debug: u8,
+    #[arg(short, long, default_value_t = false)]
+    pub debug: bool,
 
     /// option for saving log into data_Dir
     /// if set, log will be saved into dataDir/output.log

@@ -372,6 +372,10 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
         let known_descs = self.database.descs_get()?;
         Ok(known_descs.contains(desc))
     }
+    /// Tells wheter an address is already cached
+    pub fn is_address_cached(&self, script_hash: &Hash) -> bool {
+        self.address_map.contains_key(script_hash)
+    }
     pub fn push_descriptor(&self, descriptor: &str) -> Result<(), WatchOnlyError<D::Error>> {
         Ok(self.database.desc_save(descriptor)?)
     }
@@ -550,13 +554,10 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
             // We can track this address from now onwards, but the past history is only
             // available with full rescan
             let new_address = CachedAddress {
-                balance: transaction.output[index].value.to_sat(),
+                balance: 0,
                 script_hash: hash,
-                transactions: Vec::from([transaction_to_cache.hash]),
-                utxos: Vec::from([OutPoint {
-                    txid: transaction.txid(),
-                    vout: index as u32,
-                }]),
+                transactions: Vec::new(),
+                utxos: Vec::new(),
             };
             self.database.save(&new_address);
 
@@ -588,6 +589,7 @@ mod test {
     use bitcoin::hashes::hex::FromHex;
     use bitcoin::hashes::sha256;
     use bitcoin::Address;
+    use bitcoin::OutPoint;
     use bitcoin::ScriptBuf;
     use bitcoin::Txid;
     use floresta_common::get_spk_hash;
@@ -601,6 +603,7 @@ mod test {
     }
     use super::memory_database::MemoryDatabase;
     use super::AddressCache;
+    use crate::merkle::MerkleProof;
     fn get_test_cache() -> AddressCache<MemoryDatabase> {
         let database = MemoryDatabase::new();
         AddressCache::new(database)
@@ -628,6 +631,18 @@ mod test {
         assert_eq!(cache.get_address_history(&script_hash), Some(Vec::new()));
     }
     #[test]
+    fn test_cache_address_hash() {
+        let (_, script_hash) = get_test_address();
+        let mut cache = get_test_cache();
+        assert!(cache.address_map.is_empty());
+
+        cache.cache_address_hash(script_hash);
+        // Assert we indeed have one cached address
+        assert_eq!(cache.address_map.len(), 1);
+        assert_eq!(cache.get_address_balance(&script_hash), 0);
+        assert_eq!(cache.get_address_history(&script_hash), Some(Vec::new()));
+    }
+    #[test]
     fn test_cache_transaction() {
         // Signet transaction with id 6bb0665122c7dcecc6e6c45b6384ee2bdce148aea097896e6f3e9e08070353ea
         // block hash 0000009298f9e75a91fa763c78b66d1555cb059d9ca9d45601eed2b95166a151.
@@ -639,9 +654,8 @@ mod test {
         let merkle_block = Vec::from_hex(merkle_block).unwrap();
         let merkle_block = deserialize(&merkle_block).unwrap();
 
-        let (address, script_hash) = get_test_address();
+        let (_, script_hash) = get_test_address();
         let mut cache = get_test_cache();
-        cache.cache_address(address.payload().script_pubkey());
 
         cache.cache_transaction(
             &transaction,
@@ -652,6 +666,11 @@ mod test {
             0,
             false,
             get_spk_hash(&transaction.output[0].script_pubkey),
+        );
+
+        assert_eq!(
+            script_hash,
+            get_spk_hash(&transaction.output[0].script_pubkey)
         );
 
         let balance = cache.get_address_balance(&script_hash);
@@ -666,6 +685,49 @@ mod test {
             "e7d6e69230db7dd074cc2610c32be013468f1c224172b347eccdef98f36e0834",
         )]);
         assert_eq!(cached_merkle_block, (expected_hashes, 1));
+
+        // TESTS FOR SMALL, HELPER FUNCTIONS
+
+        // [get_position]
+        assert_eq!(cache.get_position(&transaction.txid()).unwrap(), 1);
+
+        // [get_height]
+        assert_eq!(cache.get_height(&transaction.txid()).unwrap(), 118511);
+
+        // [get_cached_transaction]
+        assert!(cache.get_cached_transaction(&transaction.txid()).is_some());
+
+        // [get_address_utxos]
+        let tx_out = transaction.output[0].clone();
+        let outpoint = OutPoint {
+            txid: transaction.txid(),
+            vout: 0,
+        };
+        assert_eq!(
+            cache.get_address_utxos(&script_hash).unwrap(),
+            vec![(tx_out, outpoint)]
+        );
+
+        // [find_unconfirmed] Caching am unconfirmed transaction
+        let transaction = "01000000010b7e3ac7e68944dc7a7115362391c3b7975d60f4fbe4af0ca924a172bfe7a7d9000000006b483045022100e0ff6984e5c2e16df6f309b759b75e04adf6930593b6043cd9134f87efb7e07c02206544a9f265f6041f0e3e2bd11a95ea75a112d3dc05647a9b01eca0d352feeb380121024f9c3deb05e81a3ddb17dadcf283fb132894aa70ab127395a03a3e9d382f13a3ffffffff022c92ae00000000001976a914ca9755ffb8f0e5aeca43478d8620e1a35b3baada88acc0894601000000001976a914b62ad08a3ffc469e9c0df75d1ceca49a88345fc888ac00000000";
+        let transaction = Vec::from_hex(transaction).unwrap();
+        let transaction = deserialize(&transaction).unwrap();
+
+        cache.cache_transaction(
+            &transaction,
+            0,
+            transaction.output[1].value.to_sat(),
+            MerkleProof::default(),
+            2,
+            1,
+            false,
+            get_spk_hash(&transaction.output[1].script_pubkey),
+        );
+
+        assert_eq!(
+            cache.find_unconfirmed().unwrap()[0].txid(),
+            transaction.txid()
+        );
     }
     #[test]
     fn test_process_block() {
@@ -693,6 +755,21 @@ mod test {
             "e7d6e69230db7dd074cc2610c32be013468f1c224172b347eccdef98f36e0834",
         )]);
         assert_eq!(cached_merkle_block, (expected_hashes, 1));
+
+        // TESTS FOR SMALL HELPER FUNCTIONS
+
+        // [bump_height], [get_cache_height], [set_cache_height]
+        cache.bump_height(118511);
+        assert_eq!(cache.get_cache_height(), 118511);
+
+        // [is_cached], [push_descriptor]
+        let desc = "wsh(sortedmulti(1,[54ff5a12/48h/1h/0h/2h]tpubDDw6pwZA3hYxcSN32q7a5ynsKmWr4BbkBNHydHPKkM4BZwUfiK7tQ26h7USm8kA1E2FvCy7f7Er7QXKF8RNptATywydARtzgrxuPDwyYv4x/<0;1>/*,[bcf969c0/48h/1h/0h/2h]tpubDEFdgZdCPgQBTNtGj4h6AehK79Jm4LH54JrYBJjAtHMLEAth7LuY87awx9ZMiCURFzFWhxToRJK6xp39aqeJWrG5nuW3eBnXeMJcvDeDxfp/<0;1>/*))#fuw35j0q";
+        cache.push_descriptor(&desc.to_string()).unwrap();
+        assert!(cache.is_cached(&desc.to_string()).unwrap());
+
+        // [derive_addresses]
+        cache.derive_addresses().unwrap();
+        assert_eq!(cache.get_stats().derivation_index, 100);
     }
     #[test]
     fn test_multiple_transaction() {

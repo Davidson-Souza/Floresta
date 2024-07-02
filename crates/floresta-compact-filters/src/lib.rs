@@ -32,9 +32,13 @@ use bip158::*;
 /// A database that stores our compact filters
 pub trait BlockFilterStore: Send + Sync {
     /// Fetches a block filter
-    fn get_filter(&self, block_height: u64) -> Option<bip158::BlockFilter>;
+    fn get_filter(&self, block_height: u32) -> Option<bip158::BlockFilter>;
     /// Stores a new filter
-    fn put_filter(&self, block_height: u64, block_filter: bip158::BlockFilter);
+    fn put_filter(&self, block_height: u32, block_filter: bip158::BlockFilter);
+    /// Persists the height of the last filter we have
+    fn put_height(&self, height: u32);
+    /// Fetches the height of the last filter we have
+    fn get_height(&self) -> Option<u32>;
 }
 
 /// All standard outputs type define in the Bitcoin network
@@ -147,11 +151,11 @@ impl BlockFilterBackend {
     }
     /// Returns a given filter
     pub fn get_filter(&self, block_height: u32) -> Option<bip158::BlockFilter> {
-        self.storage.get_filter(block_height as u64)
+        self.storage.get_filter(block_height)
     }
 
     /// Build and index a given block height
-    pub fn filter_block(&self, block: &Block, block_height: u64) -> Result<(), bip158::Error> {
+    pub fn filter_block(&self, block: &Block, block_height: u32) -> Result<(), bip158::Error> {
         let mut writer = Vec::new();
         let mut filter = FilterBuilder::new(&mut writer, FILTER_M, FILTER_P, self.k0, self.k1);
 
@@ -177,7 +181,7 @@ impl BlockFilterBackend {
     /// This function will run over each filter inside the range `[start, end]` and sees
     /// if at least one query mathes. It'll return a vector of block heights where it matches.
     /// you should download those blocks and see what if there's anything interesting.
-    pub fn match_any(&self, start: u64, end: u64, query: &[QueryType]) -> Option<Vec<u64>> {
+    pub fn match_any(&self, start: u32, end: u32, query: &[QueryType]) -> Option<Vec<u32>> {
         let mut blocks = Vec::new();
         let key = BlockHash::from_byte_array(self.key);
         let values = query
@@ -243,7 +247,7 @@ impl BlockFilterBackend {
 
 impl BlockConsumer for BlockFilterBackend {
     fn consume_block(&self, block: &Block, height: u32) {
-        if let Err(e) = self.filter_block(block, height as u64) {
+        if let Err(e) = self.filter_block(block, height) {
             error!("while creating filter for block {height}: {e}");
         }
     }
@@ -388,11 +392,15 @@ unsafe impl Sync for MemoryBlockFilterStorage {}
 #[doc(hidden)]
 #[cfg(test)]
 impl BlockFilterStore for MemoryBlockFilterStorage {
-    fn get_filter(&self, block_height: u64) -> Option<bip158::BlockFilter> {
+    fn get_filter(&self, block_height: u32) -> Option<bip158::BlockFilter> {
         self.filters.borrow().get(block_height as usize).cloned()
     }
-    fn put_filter(&self, _block_height: u64, block_filter: bip158::BlockFilter) {
+    fn put_filter(&self, _block_height: u32, block_filter: bip158::BlockFilter) {
         self.filters.borrow_mut().push(block_filter);
+    }
+    fn put_height(&self, _height: u32) {}
+    fn get_height(&self) -> Option<u32> {
+        None
     }
 }
 

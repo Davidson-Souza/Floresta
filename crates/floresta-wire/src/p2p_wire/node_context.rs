@@ -30,7 +30,7 @@ pub trait NodeContext {
     /// We ask for peers every ASK_FOR_PEERS_INTERVAL seconds
     const ASK_FOR_PEERS_INTERVAL: u64 = 60 * 60; // One hour
     /// Save our database of peers every PEER_DB_DUMP_INTERVAL seconds
-    const PEER_DB_DUMP_INTERVAL: u64 = 60 * 5; // 5 minutes
+    const PEER_DB_DUMP_INTERVAL: u64 = 30; // 30 seconds
     /// Attempt to open a new connection (if needed) every TRY_NEW_CONNECTION seconds
     const TRY_NEW_CONNECTION: u64 = 10; // 10 seconds
     /// If ASSUME_STALE seconds passed since our last tip update, treat it as stale
@@ -42,7 +42,7 @@ pub trait NodeContext {
     /// Max number of simultaneous inflight requests we allow
     const MAX_INFLIGHT_REQUESTS: usize = 1_000;
     /// Interval at which we open new feeler connections
-    const FEELER_INTERVAL: u64 = 60 * 5; // 5 minutes
+    const FEELER_INTERVAL: u64 = 30; // 30 seconds
     /// Interval at which we rearrange our addresses
     const ADDRESS_REARRANGE_INTERVAL: u64 = 60 * 60; // 1 hour
     /// How long we ban a peer for

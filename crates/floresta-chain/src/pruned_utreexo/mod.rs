@@ -159,7 +159,7 @@ pub trait UpdatableChainstate {
     ///
     /// This mimics the behavour of checking every block before this block, and continues
     /// from this point
-    fn mark_chain_as_assumed(&self, acc: Stump) -> Result<bool, BlockchainError>;
+    fn mark_chain_as_assumed(&self, acc: Stump, tip: BlockHash) -> Result<bool, BlockchainError>;
 }
 
 /// [ChainStore] is a trait defining how we interact with our chain database. This definitions
@@ -261,8 +261,8 @@ impl<T: UpdatableChainstate> UpdatableChainstate for Arc<T> {
         T::mark_block_as_valid(self, block)
     }
 
-    fn mark_chain_as_assumed(&self, acc: Stump) -> Result<bool, BlockchainError> {
-        T::mark_chain_as_assumed(self, acc)
+    fn mark_chain_as_assumed(&self, acc: Stump, tip: BlockHash) -> Result<bool, BlockchainError> {
+        T::mark_chain_as_assumed(self, acc, tip)
     }
 }
 

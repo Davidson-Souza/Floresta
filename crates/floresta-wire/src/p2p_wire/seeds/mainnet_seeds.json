@@ -10,4 +10,26 @@
         "services": 50331648,
         "port": 8333
     },
+    {
+        "address": {
+            "V4": "181.191.0.136"
+        },
+        "last_connected": 1678986166,
+        "state": {
+            "Tried": 0
+        },
+        "services": 50331648,
+        "port": 8333
+    },
+    {
+        "address": {
+            "V4": "18.27.124.231"
+        },
+        "last_connected": 1678986166,
+        "state": {
+            "Tried": 0
+        },
+        "services": 50331648,
+        "port": 8333
+    }
 ]

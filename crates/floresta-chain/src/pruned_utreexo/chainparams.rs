@@ -13,7 +13,6 @@ use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Target;
 use rustreexo::accumulator::node_hash::NodeHash;
-use rustreexo::accumulator::stump::Stump;
 
 use crate::prelude::*;
 use crate::Network;
@@ -51,8 +50,70 @@ pub struct ChainParams {
     /// A list of exceptions to the rules, where the key is the block hash and the value is the
     /// verification flags
     pub exceptions: HashMap<BlockHash, c_uint>,
-    pub network_roots: Stump,
-    pub assumeutreexo_index: (BlockHash, u32),
+}
+
+/// If enabled, the node will assume that the provided Utreexo state is valid, and will
+/// start running from there. You may use this to make your node start faster, but you
+/// should be sure that the provided state is valid. You may or not verify the state,
+/// by downloading all blocks on background, and then verifying the final Utreexo state.
+#[derive(Debug, Clone)]
+pub struct AssumeUtreexoValue {
+    /// The latest block assumed to be valid. This acc is the roots at this block
+    pub block_hash: BlockHash,
+    /// Same as block_hash, but in height
+    pub height: u32,
+    /// The roots of the Utreexo accumulator at this block
+    pub roots: Vec<NodeHash>,
+    /// The number of leaves in the Utreexo accumulator at this block
+    pub leaves: u64,
+}
+
+impl ChainParams {
+    pub fn get_assumeutreexo_value(network: Network) -> AssumeUtreexoValue {
+        match network {
+            Network::Bitcoin => AssumeUtreexoValue {
+                block_hash: BlockHash::from_str(
+                    "00000000000000000002447c802760582b80022f937d754aece888ec9e96f212",
+                )
+                .unwrap(),
+                height: 849070,
+                roots: [
+                    "d9eb4f63c9c302154cfde1d7c36f20674877653883f7d857550351ed3558545c",
+                    "7519893244433168ef4dc3a21e3221b87fa5b3802f4a745be33baa9defa7ac6b",
+                    "59be29510b035212adcffc970f71a889e81db2298ab3bff4d0e3e1b56caa8976",
+                    "3e4833c382dbfa4fd5e496b37ac6769036bba655534249a9d7d5a2a221718a39",
+                    "4569761976542d95af3c765b6fc7e149b71659e5f89ad1cc13a7b00bbd7e9d8d",
+                    "33fbd5f96c50327d309722970378bea7474b171097ba40bc98b360871a1f38c2",
+                    "d2955774ac37daa1e16a2fd9d419906acf6bdf6ffd6f171a9cf72935175cec6f",
+                    "ccac02fac6922f5082e893b83c0898636be24f47dd6c00f502425c9dedab2c25",
+                    "e418ad2e3b516c54a873cd89aec3bbf88513e16192f817b150f168a939f3ad3c",
+                    "1931c7dbc568c4fe92cceab72e870da307df88c8f6e7a01bf6dbfdac4dd88073",
+                ]
+                .into_iter()
+                .map(|x| NodeHash::from_str(x).unwrap())
+                .collect(),
+                leaves: 2554606658,
+            },
+            Network::Testnet => AssumeUtreexoValue {
+                block_hash: genesis_block(network.into()).block_hash(),
+                height: 0,
+                leaves: 0,
+                roots: Vec::new(),
+            },
+            Network::Signet => AssumeUtreexoValue {
+                block_hash: genesis_block(network.into()).block_hash(),
+                height: 0,
+                leaves: 0,
+                roots: Vec::new(),
+            },
+            Network::Regtest => AssumeUtreexoValue {
+                block_hash: genesis_block(network.into()).block_hash(),
+                height: 0,
+                leaves: 0,
+                roots: Vec::new(),
+            },
+        }
+    }
 }
 
 impl ChainParams {
@@ -63,32 +124,6 @@ impl ChainParams {
             Network::Signet => Target::MAX_ATTAINABLE_SIGNET,
             Network::Regtest => Target::MAX_ATTAINABLE_REGTEST,
         }
-    }
-}
-
-fn get_signet_roots() -> Stump {
-    let roots: Vec<NodeHash> = [
-        "8e6fcdcf05020fa1f7131a59a7050b33ca74852f5e82a5fbe236402bc4c8a928",
-        "f4c92949c71be7613699977eebf6d3bd5c8fd3e538a01380583e5aba14273425",
-        "d73ceb2748d342b14a269d7c0feb34aca1341a6367cc75cff6db8422eb01916d",
-        "a012e516784ccb7af26d7b356bf645e6a167cce5b48b9368c58c523acd25f6bf",
-        "e6e74ebc1d01ac47541c90afaac208c9b0f16226d2d046742032374e925a79ae",
-        "235b255558e994e6c5b6011469e891436cbf18107a939847e6e5df4cb939a96b",
-        "a9f45482564f0cb103067636c39fe30df1fa04b6b04d438c655530d991432761",
-        "d46716b7ccaf8d9eff11557527056f6100e016126df369eef95b9c9874467d40",
-        "7039b9053ef819d35c079eb4dcdd37029653a325bf416768e7de16bacf2c90af",
-        "f7a626339303030fc1b71d228e74aebdc2126cb7a2c5e01eb036225ea9dd41c2",
-        "b21123705cb4cef5a104705037ccd80ae7281789aa07cd468d5949c7e62df37b",
-        "ca931559f3ad9c91b9510f5dbfa42467e40ad8a0069d8f273de6079e9b115232",
-        "954ca698b58b6e6cdcc89948c841059d892578b7d67a249965fff83de5aaa7e3",
-    ]
-    .iter()
-    .map(|hash| NodeHash::from_str(hash).unwrap())
-    .collect();
-
-    Stump {
-        roots,
-        leaves: 1477499,
     }
 }
 
@@ -127,7 +162,6 @@ impl From<Network> for ChainParams {
         let exceptions = get_exceptions();
         match net {
             Network::Bitcoin => ChainParams {
-                assumeutreexo_index: (genesis.block_hash(), 0),
                 genesis,
                 max_target,
                 pow_allow_min_diff: false,
@@ -142,10 +176,8 @@ impl From<Network> for ChainParams {
                 segwit_activation_height: 481824,
                 csv_activation_height: 419328,
                 exceptions,
-                network_roots: Stump::default(),
             },
             Network::Testnet => ChainParams {
-                assumeutreexo_index: (genesis.block_hash(), 0),
                 genesis,
                 max_target,
                 pow_allow_min_diff: true,
@@ -160,7 +192,6 @@ impl From<Network> for ChainParams {
                 segwit_activation_height: 834_624,
                 csv_activation_height: 770_112,
                 exceptions,
-                network_roots: Stump::default(),
             },
             Network::Signet => ChainParams {
                 genesis,
@@ -177,17 +208,8 @@ impl From<Network> for ChainParams {
                 bip66_activation_height: 1,
                 segwit_activation_height: 1,
                 exceptions,
-                network_roots: get_signet_roots(),
-                assumeutreexo_index: (
-                    BlockHash::from_str(
-                        "0000001321625245a27e0be82a640106d019e35e48a024a17df1ceeb9b1f2131",
-                    )
-                    .unwrap(),
-                    74551,
-                ),
             },
             Network::Regtest => ChainParams {
-                assumeutreexo_index: (genesis.block_hash(), 0),
                 genesis,
                 max_target,
                 pow_allow_min_diff: false,
@@ -202,7 +224,6 @@ impl From<Network> for ChainParams {
                 bip66_activation_height: 0,
                 segwit_activation_height: 0,
                 exceptions,
-                network_roots: Stump::default(),
             },
         }
     }

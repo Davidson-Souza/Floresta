@@ -363,7 +363,7 @@ impl UpdatableChainstate for PartialChainState {
         unimplemented!("we don't do rescan")
     }
 
-    fn mark_chain_as_assumed(&self, _acc: Stump) -> Result<bool, BlockchainError> {
+    fn mark_chain_as_assumed(&self, _acc: Stump, _tip: BlockHash) -> Result<bool, BlockchainError> {
         unimplemented!("no need to mark as valid")
     }
 

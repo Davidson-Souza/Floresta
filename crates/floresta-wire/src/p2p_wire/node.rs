@@ -270,6 +270,7 @@ where
         peer: u32,
         version: &Version,
     ) -> Result<(), WireError> {
+        self.inflight.remove(&InflightRequests::Connect(peer));
         if version.feeler {
             self.send_to_peer(peer, NodeRequest::Shutdown).await?;
             self.address_man.update_set_state(
@@ -285,11 +286,11 @@ where
                 .update_set_service_flag(version.address_id, version.services);
             return Ok(());
         }
+
         info!(
             "New peer id={} version={} blocks={} services={}",
             version.id, version.user_agent, version.blocks, version.services
         );
-        self.inflight.remove(&InflightRequests::Connect(peer));
 
         if let Some(peer_data) = self.0.peers.get_mut(&peer) {
             // This peer doesn't have basic services, so we disconnect it
@@ -298,7 +299,17 @@ where
                 .has(ServiceFlags::NETWORK | ServiceFlags::WITNESS)
             {
                 self.send_to_peer(peer, NodeRequest::Shutdown).await?;
-                self.peers.remove(&peer);
+                self.address_man.update_set_state(
+                    version.address_id,
+                    AddressState::Tried(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    ),
+                );
+                self.address_man
+                    .update_set_service_flag(version.address_id, version.services);
                 return Ok(());
             }
             peer_data.state = PeerStatus::Ready;
@@ -404,7 +415,8 @@ where
     }
 
     pub(crate) fn has_utreexo_peers(&self) -> bool {
-        self.peer_by_service
+        !self
+            .peer_by_service
             .get(&ServiceFlags::UTREEXO)
             .unwrap_or(&Vec::new())
             .is_empty()
@@ -413,7 +425,7 @@ where
     pub(crate) fn has_compact_filters_peer(&self) -> bool {
         self.peer_by_service
             .get(&ServiceFlags::COMPACT_FILTERS)
-            .map(|peers| peers.is_empty())
+            .map(|peers| !peers.is_empty())
             .unwrap_or(false)
     }
 
@@ -427,8 +439,12 @@ where
             return Err(WireError::NoPeersAvailable);
         }
 
-        let Some(peers) = self.peer_by_service.get(&required_service) else {
-            return Err(WireError::NoPeersAvailable);
+        let peers = match required_service {
+            ServiceFlags::NONE => &self.peer_ids,
+            _ => self
+                .peer_by_service
+                .get(&required_service)
+                .ok_or(WireError::NoPeersAvailable)?,
         };
 
         if peers.is_empty() {
@@ -472,6 +488,16 @@ where
         }
         try_and_log!(self.save_peers());
         try_and_log!(self.chain.flush());
+
+        let last_filter_height = self
+            .chain
+            .get_block_height(&self.last_filter)
+            .unwrap()
+            .unwrap();
+
+        if let Some(filters) = &self.block_filters {
+            filters.save_height(last_filter_height);
+        }
     }
 
     pub(crate) async fn handle_broadcast(&self) -> Result<(), WireError> {
@@ -562,7 +588,12 @@ where
 
     pub(crate) async fn create_connection(&mut self, feeler: bool) -> Option<()> {
         // We should try to keep at least two utreexo connections
-        let required_services = self.1.get_required_services();
+        let mut required_services = self.1.get_required_services();
+        if required_services.has(ServiceFlags::UTREEXO) && !self.has_utreexo_peers() {
+            required_services = ServiceFlags::UTREEXO; // force utreexo peers
+        } else {
+            required_services = ServiceFlags::NETWORK;
+        }
 
         let (peer_id, address) = match &self.fixed_peer {
             Some(address) => (0, address.clone()),
