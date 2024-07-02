@@ -325,7 +325,16 @@ where
                 // if they disagree on this current block, we need to look in the previous one
                 height -= 1;
             }
+            hash = self.chain.get_block_hash(height).unwrap();
         }
+
+        hash = self.chain.get_block_hash(fork).unwrap();
+
+        let (aggreed, _) = self
+            .grab_both_peers_version(peer1, peer2, hash, fork)
+            .await?;
+
+        hash = self.chain.get_block_hash(fork + 1).unwrap();
 
         // now we know where the fork is, we need to check who is lying
         let (Some(peer1_acc), Some(peer2_acc)) = self
@@ -334,10 +343,6 @@ where
         else {
             return Ok(None);
         };
-
-        let (aggreed, _) = self
-            .grab_both_peers_version(peer1, peer2, hash, fork)
-            .await?;
 
         let agreed = match aggreed {
             Some(acc) => Self::parse_acc(acc)?,
@@ -423,6 +428,13 @@ where
                 } else {
                     invalid_accs.insert(peer[1].1.clone());
                 }
+            } else {
+                // Both peers were lying
+                self.send_to_peer(peer1, NodeRequest::Shutdown).await?;
+                self.send_to_peer(peer2, NodeRequest::Shutdown).await?;
+
+                invalid_accs.insert(peer[0].1.clone());
+                invalid_accs.insert(peer[1].1.clone());
             }
         }
         //filter out the invalid accs
@@ -654,6 +666,7 @@ where
             // We downloaded all headers in the most-pow chain, and all our peers agree
             // this is the most-pow chain, we're done!
             if self.1.state == ChainSelectorState::Done {
+                self.chain.toggle_ibd(false);
                 break;
             }
 

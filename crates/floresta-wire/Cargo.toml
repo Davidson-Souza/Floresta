@@ -33,6 +33,10 @@ floresta-compact-filters = { path = "../floresta-compact-filters" }
 thiserror = "1.0"
 floresta-common = { path = "../floresta-common" }
 oneshot = "0.1.5"
+zstd = "0.13.1"
+
+[dev-dependencies]
+hex = "0.4.3"
 
 [features]
 default = []

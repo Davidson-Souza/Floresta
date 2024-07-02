@@ -1009,6 +1009,7 @@ dependencies = [
  "floresta-common",
  "floresta-compact-filters",
  "futures 0.3.30",
+ "hex",
  "kv",
  "log",
  "oneshot",
@@ -1019,6 +1020,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "toml 0.5.11",
+ "zstd 0.13.1",
 ]
 
 [[package]]
