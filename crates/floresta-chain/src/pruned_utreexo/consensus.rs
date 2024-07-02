@@ -5,6 +5,10 @@
 extern crate alloc;
 extern crate std;
 
+use core::ffi::c_uint;
+use core::ops::Mul;
+use std::time::SystemTime;
+
 use bitcoin::absolute::Height;
 use bitcoin::absolute::Time;
 use bitcoin::block::Header as BlockHeader;
@@ -22,15 +26,12 @@ use bitcoin::TxIn;
 use bitcoin::TxOut;
 use bitcoin::Txid;
 use bitcoin::WitnessVersion;
-use core::ffi::c_uint;
-use core::ops::Mul;
 use floresta_common::prelude::*;
 use rustreexo::accumulator::node_hash::NodeHash;
 use rustreexo::accumulator::proof::Proof;
 use rustreexo::accumulator::stump::Stump;
 use sha2::Digest;
 use sha2::Sha512_256;
-use std::time::SystemTime;
 
 use super::chainparams::ChainParams;
 use super::error::BlockValidationErrors;
@@ -403,11 +404,20 @@ impl Consensus {
 }
 #[cfg(test)]
 mod tests {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::sha256d::Hash;
+    use bitcoin::transaction::Version;
+    use bitcoin::Amount;
+    use bitcoin::OutPoint;
+    use bitcoin::ScriptBuf;
+    use bitcoin::Sequence;
+    use bitcoin::Transaction;
+    use bitcoin::TxIn;
+    use bitcoin::TxOut;
+    use bitcoin::Txid;
+    use bitcoin::Witness;
+
     use super::*;
-    use bitcoin::{
-        absolute::LockTime, hashes::sha256d::Hash, transaction::Version, Amount, OutPoint,
-        ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
-    };
 
     fn coinbase(is_valid: bool) -> Transaction {
         //This coinbase transactions was retrieved from https://learnmeabitcoin.com/explorer/block/0000000000000a0f82f8be9ec24ebfca3d5373fde8dc4d9b9a949d538e9ff679
