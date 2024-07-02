@@ -482,7 +482,7 @@ mod tests {
         let valid_script =
             ScriptBuf::from_hex("76a9149206a30c09cc853bb03bd917a4f9f29b089c1bc788ac").unwrap();
         //invalid script
-        let invalid_script = ScriptBuf::from_hex(&format!("{:0>520}", "")).unwrap();
+        let invalid_script = ScriptBuf::from_hex(&format!("{:0>1220}", "")).unwrap();
         //valid script size
         assert_eq!(Consensus::validate_script_size(&valid_script).unwrap(), ());
         //invalid script size
