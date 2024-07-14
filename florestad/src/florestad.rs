@@ -7,7 +7,7 @@ use std::sync::Mutex;
 #[cfg(feature = "json-rpc")]
 use std::sync::OnceLock;
 
-use async_std::sync::RwLock;
+use tokio::sync::RwLock;
 use async_std::task;
 use async_std::task::block_on;
 pub use bitcoin::Network;
@@ -350,7 +350,7 @@ impl Florestad {
         let chain_provider = UtreexoNode::new(
             config,
             blockchain_state.clone(),
-            Arc::new(async_std::sync::RwLock::new(Mempool::new())),
+            Arc::new(tokio::sync::RwLock::new(Mempool::new())),
             cfilters.clone(),
         );
 

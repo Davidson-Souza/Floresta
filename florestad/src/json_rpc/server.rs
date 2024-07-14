@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use async_std::sync::RwLock;
+use tokio::sync::RwLock;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::serialize_hex;
@@ -446,7 +446,7 @@ impl Rpc for RpcImpl {
     }
 
     fn stop(&self) -> Result<bool> {
-        *async_std::task::block_on(self.kill_signal.write()) = true;
+        *block_on(self.kill_signal.write()) = true;
         Ok(true)
     }
 }
