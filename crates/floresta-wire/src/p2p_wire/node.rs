@@ -14,14 +14,6 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use async_std::channel;
-use async_std::channel::bounded;
-use async_std::channel::Receiver;
-use async_std::channel::Sender;
-use async_std::future::timeout;
-use async_std::net::TcpStream;
-use async_std::sync::RwLock;
-use async_std::task::spawn;
 use bitcoin::p2p::address::AddrV2;
 use bitcoin::p2p::address::AddrV2Message;
 use bitcoin::p2p::ServiceFlags;
@@ -34,10 +26,15 @@ use floresta_chain::Network;
 use floresta_chain::UtreexoBlock;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 use floresta_compact_filters::network_filters::NetworkFilters;
-use futures::Future;
 use log::debug;
 use log::info;
 use log::warn;
+use tokio::net::TcpStream;
+use tokio::spawn;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::RwLock;
+use tokio::time::timeout;
 
 use super::address_man::AddressMan;
 use super::address_man::AddressState;
@@ -48,6 +45,7 @@ use super::node_context::NodeContext;
 use super::node_interface::NodeInterface;
 use super::node_interface::PeerInfo;
 use super::node_interface::UserRequest;
+use super::peer::create_tcp_stream_actor;
 use super::peer::Peer;
 use super::peer::PeerMessages;
 use super::peer::Version;
@@ -99,7 +97,7 @@ pub(crate) enum InflightRequests {
 pub struct LocalPeerView {
     pub(crate) state: PeerStatus,
     pub(crate) address_id: u32,
-    pub(crate) channel: Sender<NodeRequest>,
+    pub(crate) channel: UnboundedSender<NodeRequest>,
     pub(crate) services: ServiceFlags,
     pub(crate) user_agent: String,
     pub(crate) address: IpAddr,
@@ -147,8 +145,8 @@ pub struct NodeCommon<Chain: BlockchainInterface + UpdatableChainstate> {
     pub(crate) chain: Chain,
     pub(crate) blocks: HashMap<BlockHash, (PeerId, UtreexoBlock)>,
     pub(crate) inflight: HashMap<InflightRequests, (u32, Instant)>,
-    pub(crate) node_rx: Receiver<NodeNotification>,
-    pub(crate) node_tx: Sender<NodeNotification>,
+    pub(crate) node_rx: UnboundedReceiver<NodeNotification>,
+    pub(crate) node_tx: UnboundedSender<NodeNotification>,
     pub(crate) mempool: Arc<RwLock<Mempool>>,
     pub(crate) datadir: String,
     pub(crate) address_man: AddressMan,
@@ -196,7 +194,7 @@ where
         mempool: Arc<RwLock<Mempool>>,
         block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
     ) -> Self {
-        let (node_tx, node_rx) = channel::unbounded();
+        let (node_tx, node_rx) = unbounded_channel();
         let socks5 = config.proxy.map(Socks5StreamBuilder::new);
         UtreexoNode(
             NodeCommon {
@@ -247,7 +245,7 @@ where
         idx: usize,
     ) -> Result<(), WireError> {
         if let Some(p) = self.peers.remove(&peer) {
-            p.channel.close();
+            std::mem::drop(p.channel);
             if !p.feeler && p.state == PeerStatus::Ready {
                 info!("Peer disconnected: {}", peer);
             }
@@ -444,10 +442,7 @@ where
     ) -> Result<(), WireError> {
         if let Some(peer) = &self.peers.get(&peer_id) {
             if peer.state == PeerStatus::Ready {
-                peer.channel
-                    .send(req)
-                    .await
-                    .map_err(WireError::ChannelSend)?;
+                peer.channel.send(req).map_err(WireError::ChannelSend)?;
             }
         }
         Ok(())
@@ -471,7 +466,7 @@ where
         // This peer is misbehaving too often, ban it
         if peer.banscore >= self.0.max_banscore {
             warn!("banning peer {} for misbehaving", peer_id);
-            let _ = peer.channel.send(NodeRequest::Shutdown).await;
+            let _ = peer.channel.send(NodeRequest::Shutdown);
             self.0.address_man.update_set_state(
                 peer.address_id as usize,
                 AddressState::Banned(RunningNode::BAN_TIME),
@@ -536,7 +531,6 @@ where
             .ok_or(WireError::NoPeersAvailable)?
             .channel
             .send(req)
-            .await
             .map_err(WireError::ChannelSend)?;
 
         Ok(peer)
@@ -582,14 +576,12 @@ where
                 self.mempool.write().await.accept_to_mempool(transaction);
                 peer.channel
                     .send(NodeRequest::BroadcastTransaction(txid))
-                    .await
                     .map_err(WireError::ChannelSend)?;
             }
             let stale = self.mempool.write().await.get_stale();
             for tx in stale {
                 peer.channel
                     .send(NodeRequest::BroadcastTransaction(tx))
-                    .await
                     .map_err(WireError::ChannelSend)?;
             }
         }
@@ -713,28 +705,48 @@ where
         Some(())
     }
 
-    /// Opens a new connection that doesn't require a proxy.
+    /// Opens a new connection that doesn't require a proxy and includes the functionalities of create_outbound_connection.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn open_non_proxy_connection(
+    pub(crate) async fn open_non_proxy_connection(
         feeler: bool,
         peer_id: usize,
         address: LocalAddress,
-        requests_rx: Receiver<NodeRequest>,
+        requests_rx: UnboundedReceiver<NodeRequest>,
         peer_id_count: u32,
         mempool: Arc<RwLock<Mempool>>,
         network: bitcoin::Network,
-        node_tx: Sender<NodeNotification>,
-    ) -> impl Future<Output = ()> + Send + 'static {
-        Peer::<TcpStream>::create_outbound_connection(
-            peer_id_count,
-            (address.get_net_address(), address.get_port()),
-            mempool,
-            network,
-            node_tx,
-            requests_rx,
-            peer_id,
-            feeler,
-        )
+        node_tx: UnboundedSender<NodeNotification>,
+    ) {
+        let address = (address.get_net_address(), address.get_port());
+        let stream = timeout(Duration::from_secs(10), TcpStream::connect(address)).await;
+
+        if let Ok(Ok(stream)) = stream {
+            stream.set_nodelay(true).unwrap();
+
+            // Assuming create_tcp_stream_actor returns (Sender, Actor)
+            let (stream_sender, actor) = create_tcp_stream_actor(stream);
+            tokio::spawn(async move {
+                actor.start().await;
+            });
+
+            // Use create_peer function instead of manually creating the peer
+            Peer::create_peer(
+                stream_sender,
+                peer_id_count,
+                mempool,
+                network,
+                node_tx,
+                requests_rx,
+                peer_id,
+                feeler,
+            )
+            .await;
+        } else {
+            let _ = node_tx.send(NodeNotification::FromPeer(
+                peer_id_count,
+                PeerMessages::Disconnected(peer_id),
+            ));
+        }
     }
     /// Opens a connection through a socks5 interface
     #[allow(clippy::too_many_arguments)]
@@ -743,10 +755,10 @@ where
         feeler: bool,
         mempool: Arc<RwLock<Mempool>>,
         network: bitcoin::Network,
-        node_tx: Sender<NodeNotification>,
+        node_tx: UnboundedSender<NodeNotification>,
         peer_id: usize,
         address: LocalAddress,
-        requests_rx: Receiver<NodeRequest>,
+        requests_rx: UnboundedReceiver<NodeRequest>,
         peer_id_count: u32,
     ) -> Result<(), Socks5Error> {
         let addr = match address.get_address() {
@@ -763,8 +775,10 @@ where
 
         let proxy = TcpStream::connect(proxy).await?;
         let stream = Socks5StreamBuilder::connect(proxy, addr, address.get_port()).await?;
-        Peer::create_peer_from_transport(
-            stream,
+        let (stream_sender, _actor) = create_tcp_stream_actor(stream);
+
+        Peer::create_peer(
+            stream_sender,
             peer_id_count,
             mempool,
             network,
@@ -772,7 +786,8 @@ where
             requests_rx,
             peer_id,
             feeler,
-        );
+        )
+        .await;
         Ok(())
     }
 
@@ -785,7 +800,7 @@ where
         peer_id: usize,
         address: LocalAddress,
     ) {
-        let (requests_tx, requests_rx) = bounded(1024);
+        let (requests_tx, requests_rx) = unbounded_channel();
         if let Some(ref proxy) = self.socks5 {
             spawn(timeout(
                 Duration::from_secs(10),

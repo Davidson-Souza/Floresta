@@ -6,37 +6,42 @@
 //! this header. With payload size we can finally read the entire message and return a parsed
 //! structure.
 
-use async_std::channel::Sender;
-use async_std::io::ReadExt;
+use std::marker::PhantomData;
+
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::deserialize_partial;
 use bitcoin::consensus::Decodable;
 use bitcoin::p2p::message::RawNetworkMessage;
 use bitcoin::p2p::Magic;
 use floresta_chain::UtreexoBlock;
-use futures::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::peer::PeerError;
 
 /// A simple type that wraps a stream and returns T, if T is [Decodable].
-pub struct StreamReader<Source: Sync + Send + ReadExt + Unpin + AsyncRead> {
+pub struct StreamReader<
+    Source: Sync + Send + AsyncReadExt + Unpin + AsyncRead,
+    Item: Decodable + Send,
+> {
     /// Were we read bytes from, usually a TcpStream
     source: Source,
     /// Magic bits, we expect this at the beginning of all messages
     magic: Magic,
     /// Where should we send data
-    sender: Sender<Result<ReaderMessage, PeerError>>,
+    sender: UnboundedSender<Result<Item, PeerError>>,
 }
 
 impl<Source> StreamReader<Source>
 where
-    Source: Sync + Send + ReadExt + Unpin + AsyncRead,
+    Item: Decodable + Unpin + Send + 'static,
+    Source: Sync + Send + AsyncReadExt + Unpin + AsyncRead,
 {
     /// Creates a new reader from a given stream
     pub fn new(
         stream: Source,
         magic: Magic,
-        sender: Sender<Result<ReaderMessage, PeerError>>,
+        sender: UnboundedSender<Result<Item, PeerError>>,
     ) -> Self {
         StreamReader {
             source: stream,
@@ -75,7 +80,7 @@ where
             }
 
             let message: RawNetworkMessage = deserialize(&data)?;
-            let _ = self.sender.send(Ok(message.into())).await;
+            let _ = self.sender.send(Ok(message.into()));
         }
     }
     /// Tries to read from a parsed [Item] from [Source]. Only returns on error or if we have
@@ -83,7 +88,7 @@ where
     pub async fn read_loop(mut self) {
         let value = self.read_loop_inner().await;
         if let Err(e) = value {
-            let _ = self.sender.send(Err(e)).await;
+            let _ = self.sender.send(Err(e));
         }
     }
 }
