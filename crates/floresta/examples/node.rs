@@ -8,7 +8,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use async_std::sync::RwLock;
+use tokio::sync::RwLock;
 use bitcoin::BlockHash;
 use floresta::chain::pruned_utreexo::BlockchainInterface;
 use floresta::chain::ChainState;
