@@ -48,6 +48,7 @@ async fn main() {
         electrum_address: params.electrum_address,
         wallet_descriptor: params.wallet_descriptor,
         filters_start_height: params.filters_start_height,
+        assumeutreexo_value: None,
     };
 
     let florestad = Florestad::from(config);

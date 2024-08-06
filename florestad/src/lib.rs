@@ -27,3 +27,4 @@ pub enum Network {
 
 pub use florestad::Config;
 pub use florestad::Florestad;
+pub use florestad::AssumeUtreexoValue;
