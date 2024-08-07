@@ -3,31 +3,30 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use futures::select;
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::spawn;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-// use async_std::channel::unbounded;
-// use async_std::channel::Receiver;
-// use async_std::channel::Sender;
-// use async_std::io::BufReader;
-// use async_std::net::TcpStream;
-// use async_std::net::ToSocketAddrs;
-// use async_std::sync::RwLock;
-// use async_std::task::spawn;
 
 use bitcoin::bip158;
 use bitcoin::block::Header as BlockHeader;
+use bitcoin::consensus::deserialize;
+use bitcoin::consensus::deserialize_partial;
 use bitcoin::consensus::serialize;
+use bitcoin::consensus::Decodable;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::AddrV2Message;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message::RawNetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
+use bitcoin::p2p::Magic;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::BlockHash;
 use bitcoin::Network;
@@ -62,63 +61,161 @@ enum State {
 // Define the messages
 pub enum TcpStreamCommand {
     Write(Vec<u8>),
-    Read(usize),
     Shutdown,
     // Add other commands here
 }
 
+// p2p message header struct
+// Define a newtype wrapper
+// struct UnpinFuture<F>(F);
+
+// // Implement Future for UnpinFuture
+// impl<F: Future> Future for UnpinFuture<F> {
+//     type Output = F::Output;
+
+//     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+//         // Safety: We're not moving the future, just polling it
+//         unsafe { self.map_unchecked_mut(|s| &mut s.0).poll(cx) }
+//     }
+// }
+// impl<F> Unpin for UnpinFuture<F> {}
+
+pub struct P2PMessageHeader {
+    magic: Magic,
+    _command: [u8; 12],
+    length: u32,
+    _checksum: u32,
+}
+impl Decodable for P2PMessageHeader {
+    fn consensus_decode<R: std::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> std::result::Result<Self, bitcoin::consensus::encode::Error> {
+        let magic = Magic::consensus_decode(reader)?;
+        let _command = <[u8; 12]>::consensus_decode(reader)?;
+        let length = u32::consensus_decode(reader)?;
+        let _checksum = u32::consensus_decode(reader)?;
+        Ok(Self {
+            _checksum,
+            _command,
+            length,
+            magic,
+        })
+    }
+}
+
+// Define the actor
 // Define the actor
 pub struct TcpStreamActor {
     pub stream: TcpStream,
     pub receiver: UnboundedReceiver<TcpStreamCommand>,
+    pub sender: UnboundedSender<ReaderMessage>,
+    pub network: Network,
 }
 
 impl TcpStreamActor {
     pub async fn start(mut self) {
-        while let Some(command) = self.receiver.recv().await {
-            match command {
-                TcpStreamCommand::Write(data) => {
-                    let _ = self.stream.write_all(&data).await;
-                }
-                TcpStreamCommand::Read(size) => {
-                    let mut buf = vec![0; size];
-                    let _ = self.stream.read_exact(&mut buf).await;
-                    // Do something with buf here
-                }
-                TcpStreamCommand::Shutdown => {
-                    let _ = self.stream.shutdown().await;
-                } // Handle other commands here
+        let (reader, mut writer) = tokio::io::split(self.stream);
+        let mut read_future = pin!(Self::read_loop_inner(reader));
+
+        loop {
+            futures::select! {
+                command = self.receiver.recv().fuse() => {
+                    let Some(command) = command else {
+                        return;
+                    };
+                    match command {
+                        TcpStreamCommand::Write(data) => {
+                            if let Err(e) = Self::handle_write(&mut writer, data).await {
+                                let _ = self.sender.send(ReaderMessage::Error(e));
+                                return;
+                            }
+                        }
+                        TcpStreamCommand::Shutdown => {
+                             if let Err(e) = Self::handle_shutdown(&mut writer).await {
+                                let _ = self.sender.send(ReaderMessage::Error(e));
+                            }
+                            return;
+                        }
+                    }
+                },
+                result = read_future.as_mut().fuse() => {
+                    match result {
+                        Ok(peer_message) => {
+                            match peer_message {
+                                PeerMessage::Block(block) => {
+                                    let _ = self.sender.send(ReaderMessage::Block(block));
+                                }
+                                PeerMessage::Message(message) => {
+                                    let _ = self.sender.send(ReaderMessage::Message(message));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = self.sender.send(ReaderMessage::Error(e));
+                            return;
+                        }
+                    }
+                },
             }
         }
     }
-}
 
+    async fn read_loop_inner(mut stream: ReadHalf<TcpStream>) -> Result<PeerMessage> {
+        let mut data: Vec<u8> = vec![0; 24];
+
+        // Read the header first, so learn the payload size
+        stream.read_exact(&mut data).await?;
+        let header: P2PMessageHeader = deserialize_partial(&data)?.0;
+
+        // Network Message too big
+        if header.length > (1024 * 1024 * 32) as u32 {
+            return Err(PeerError::MessageTooBig);
+        }
+
+        data.resize(24 + header.length as usize, 0);
+
+        // Read everything else
+        stream.read_exact(&mut data[24..]).await?;
+
+        // Intercept block messages
+        if header._command[0..5] == [0x62, 0x6c, 0x6f, 0x63, 0x6b] {
+            let mut block_data = vec![0; header.length as usize];
+            block_data.copy_from_slice(&data[24..]);
+
+            let message: UtreexoBlock = deserialize(&block_data)?;
+            return Ok(PeerMessage::Block(message));
+        }
+
+        let message: RawNetworkMessage = deserialize(&data)?;
+        return Ok(PeerMessage::Message(message));
+    }
+    async fn handle_write(writer: &mut WriteHalf<TcpStream>, data: Vec<u8>) -> Result<()> {
+        writer.write_all(&data).await.map_err(PeerError::from)
+    }
+
+    async fn handle_shutdown(writer: &mut WriteHalf<TcpStream>) -> Result<()> {
+        writer.shutdown().await.map_err(PeerError::from)
+    }
+}
 // Function to create a new actor and a sender
 pub fn create_tcp_stream_actor(
     stream: TcpStream,
+    network: Network,
 ) -> (
-    tokio::sync::mpsc::UnboundedSender<TcpStreamCommand>,
+    UnboundedSender<TcpStreamCommand>,
+    UnboundedReceiver<ReaderMessage>,
     TcpStreamActor,
 ) {
     let (sender, receiver) = unbounded_channel();
-    let actor = TcpStreamActor { stream, receiver };
-    (sender, actor)
+    let (actor_sender, actor_receiver) = unbounded_channel();
+    let actor = TcpStreamActor {
+        stream,
+        receiver,
+        sender: actor_sender,
+        network,
+    };
+    (sender, actor_receiver, actor)
 }
-
-/// A trait defining how the transport we use should behave. Transport is anything
-/// that allows to read/write from/into. Like a TcpStream or a Socks5 proxy
-// pub trait Transport:
-//     AsyncRead + AsyncWrite + Unpin + Clone + Sync + Send + AsyncWriteExt + 'static
-// {
-//     /// Asks the stream to shutdown, the final part of the disconnection process
-//     fn shutdown(&mut self) -> Result<()>;
-// }
-
-// impl Transport for TcpStream {
-//     fn shutdown(&mut self) -> Result<()> {
-//         Ok(TcpStream::shutdown(self, std::net::Shutdown::Both)?)
-//     }
-// }
 
 pub struct Peer {
     stream: UnboundedSender<TcpStreamCommand>,
@@ -141,6 +238,7 @@ pub struct Peer {
     feeler: bool,
     wants_addrv2: bool,
     shutdown: bool,
+    actor_receiver: UnboundedReceiver<ReaderMessage>, // Add the receiver for messages from TcpStreamActor
 }
 #[derive(Debug, Error)]
 pub enum PeerError {
@@ -160,6 +258,24 @@ pub enum PeerError {
     TooManyMessages,
     #[error("Peer timed a ping out")]
     Timeout,
+}
+
+pub enum ReaderMessage {
+    Block(UtreexoBlock),
+    Message(RawNetworkMessage),
+    Error(PeerError),
+}
+
+impl From<UtreexoBlock> for ReaderMessage {
+    fn from(block: UtreexoBlock) -> Self {
+        ReaderMessage::Block(block)
+    }
+}
+
+impl From<RawNetworkMessage> for ReaderMessage {
+    fn from(header: RawNetworkMessage) -> Self {
+        ReaderMessage::Message(header)
+    }
 }
 
 impl From<tokio::sync::mpsc::error::SendError<TcpStreamCommand>> for PeerError {
@@ -204,8 +320,22 @@ impl Peer {
                     if let Some(request) = request {
                         self.handle_node_request(request).await?;
                     }
+                },
+                message = self.actor_receiver.recv().fuse() => {
+                    if let Some(message) = message {
+                        match message {
+                            ReaderMessage::Message(msg) => {
+                                self.handle_peer_message(msg).await?;
+                            }
+                            ReaderMessage::Block(block) => {
+                                self.send_to_node(PeerMessages::Block(block)).await;
+                            }
+                            ReaderMessage::Error(e) => {
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
-                // No need to receive from the stream here, as the actor model handles it
             };
             if self.shutdown {
                 return Ok(());
@@ -251,6 +381,7 @@ impl Peer {
             }
         }
     }
+
     pub async fn handle_node_request(&mut self, request: NodeRequest) -> Result<()> {
         assert_eq!(self.state, State::Connected);
         debug!("Handling node request: {:?}", request);
@@ -488,12 +619,6 @@ impl Peer {
     }
 }
 impl Peer {
-    // pub async fn write(&mut self, msg: NetworkMessage) -> Result<()> {
-    //     let data = &mut RawNetworkMessage::new(self.network.magic(), msg);
-    //     let data = serialize(&data);
-    //     self.stream.write_all(data.as_slice()).await?;
-    //     Ok(())
-    // }
     pub async fn write(&mut self, msg: NetworkMessage) -> Result<()> {
         debug!("Writing {} to peer {}", msg.command(), self.id);
         let data = &mut RawNetworkMessage::new(self.network.magic(), msg);
@@ -530,6 +655,7 @@ impl Peer {
         node_requests: UnboundedReceiver<NodeRequest>,
         address_id: usize,
         feeler: bool,
+        actor_receiver: UnboundedReceiver<ReaderMessage>,
     ) {
         let peer = Peer {
             address_id,
@@ -552,99 +678,11 @@ impl Peer {
             feeler,
             wants_addrv2: false,
             shutdown: false,
+            actor_receiver, // Add the receiver for messages from TcpStreamActor
         };
         spawn(peer.read_loop());
     }
 
-    // #[allow(clippy::too_many_arguments)]
-    // // change the name as transport is removed
-    // pub fn create_peer_from_transport(
-    //     stream: TcpStream,
-    //     id: u32,
-    //     mempool: Arc<RwLock<Mempool>>,
-    //     network: Network,
-    //     node_tx: UnboundedSender<NodeNotification>,
-    //     node_requests: UnboundedReceiver<NodeRequest>,
-    //     address_id: usize,
-    //     feeler: bool,
-    // ) {
-    //     let (stream_sender, _actor) = create_tcp_stream_actor(stream);
-
-    //     let peer = Peer {
-    //         address_id,
-    //         blocks_only: false,
-    //         current_best_block: -1,
-    //         id,
-    //         mempool,
-    //         last_ping: None,
-    //         last_message: Instant::now(),
-    //         network,
-    //         node_tx,
-    //         services: ServiceFlags::NONE,
-    //         stream: stream_sender,
-    //         messages: 0,
-    //         start_time: Instant::now(),
-    //         user_agent: "".into(),
-    //         state: State::None,
-    //         send_headers: false,
-    //         node_requests,
-    //         feeler,
-    //         wants_addrv2: false,
-    //         shutdown: false,
-    //     };
-    //     spawn(peer.read_loop());
-    // }
-
-    // #[allow(clippy::too_many_arguments)]
-    // pub async fn create_outbound_connection<A: ToSocketAddrs + Debug>(
-    //     id: u32,
-    //     address: A,
-    //     mempool: Arc<RwLock<Mempool>>,
-    //     network: Network,
-    //     node_tx: UnboundedSender<NodeNotification>,
-    //     node_requests: UnboundedReceiver<NodeRequest>,
-    //     address_id: usize,
-    //     feeler: bool,
-    // ) {
-    //     let stream = timeout(Duration::from_secs(10), TcpStream::connect(address)).await;
-    //     if let Ok(Ok(stream)) = stream {
-    //         stream.set_nodelay(true).unwrap();
-
-    //         let (stream_sender, actor) = create_tcp_stream_actor(stream);
-    //         tokio::spawn(async move {
-    //             actor.start().await;
-    //         });
-    //         let peer = Peer {
-    //             address_id,
-    //             blocks_only: false,
-    //             current_best_block: -1,
-    //             id,
-    //             mempool,
-    //             last_ping: None,
-    //             last_message: Instant::now(),
-    //             network,
-    //             node_tx,
-    //             services: ServiceFlags::NONE,
-    //             stream: stream_sender,
-    //             messages: 0,
-    //             start_time: Instant::now(),
-    //             user_agent: "".into(),
-    //             state: State::None,
-    //             send_headers: false,
-    //             node_requests,
-    //             feeler,
-    //             wants_addrv2: false,
-    //             shutdown: false,
-    //         };
-    //         spawn(peer.read_loop());
-    //     } else {
-    //         let _ = node_tx
-    //             .send(NodeNotification::FromPeer(
-    //                 id,
-    //                 PeerMessages::Disconnected(id as usize),
-    //             ));
-    //     }
-    // }
     async fn handle_ping(&mut self, nonce: u64) -> Result<()> {
         let pong = make_pong(nonce);
         self.write(pong).await
@@ -769,4 +807,9 @@ pub enum PeerMessages {
     Transaction(Transaction),
     UtreexoState(Vec<u8>),
     BlockFilter((BlockHash, floresta_compact_filters::BlockFilter)),
+}
+
+pub enum PeerMessage {
+    Block(UtreexoBlock),
+    Message(RawNetworkMessage),
 }

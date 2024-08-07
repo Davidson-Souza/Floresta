@@ -724,7 +724,7 @@ where
             stream.set_nodelay(true).unwrap();
 
             // Assuming create_tcp_stream_actor returns (Sender, Actor)
-            let (stream_sender, actor) = create_tcp_stream_actor(stream);
+            let (stream_sender, actor_receiver, actor) = create_tcp_stream_actor(stream, network);
             tokio::spawn(async move {
                 actor.start().await;
             });
@@ -739,6 +739,7 @@ where
                 requests_rx,
                 peer_id,
                 feeler,
+                actor_receiver,
             )
             .await;
         } else {
@@ -775,7 +776,7 @@ where
 
         let proxy = TcpStream::connect(proxy).await?;
         let stream = Socks5StreamBuilder::connect(proxy, addr, address.get_port()).await?;
-        let (stream_sender, _actor) = create_tcp_stream_actor(stream);
+        let (stream_sender, actor_receiver, _actor) = create_tcp_stream_actor(stream, network);
 
         Peer::create_peer(
             stream_sender,
@@ -786,6 +787,7 @@ where
             requests_rx,
             peer_id,
             feeler,
+            actor_receiver,
         )
         .await;
         Ok(())

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use bitcoin::p2p::utreexo::UtreexoBlock;
 use bitcoin::p2p::ServiceFlags;
 use floresta_chain::pruned_utreexo::BlockchainInterface;
 use floresta_chain::pruned_utreexo::UpdatableChainstate;
