@@ -1364,6 +1364,9 @@ mod test {
         );
         assert!(batch_response[4]["result"].as_array().unwrap().is_empty());
         assert!(batch_response[5]["result"].is_null());
-        assert_eq!(batch_response[6]["result"][0], "Floresta 0.1.0".to_string());
+        assert_eq!(
+            batch_response[6]["result"][0],
+            format!("Floresta {}", env!("CARGO_PKG_VERSION"))
+        );
     }
 }
