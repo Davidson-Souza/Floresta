@@ -180,8 +180,8 @@ mod test {
 
     fn get_test_db() -> KvDatabase {
         let test_id = rand::random::<u32>();
-        let kv_database = KvDatabase::new(format!("./data/{test_id}.floresta/")).unwrap();
-        kv_database
+
+        KvDatabase::new(format!("./data/{test_id}.floresta/")).unwrap()
     }
     fn get_test_address() -> (Address<NetworkUnchecked>, sha256::Hash) {
         let address = Address::from_str("tb1q9d4zjf92nvd3zhg6cvyckzaqumk4zre26x02q9").unwrap();

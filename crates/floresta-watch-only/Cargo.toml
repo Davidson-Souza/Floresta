@@ -1,6 +1,6 @@
 [package]
 name = "floresta-watch-only"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A simple, lightweight and Electrum-First, watch-only wallet"
 authors = ["Davidson Souza <davidson.lucas.souza@outlook.com>"]

@@ -952,8 +952,7 @@ mod test {
             get_spk_hash(&transaction.output[0].script_pubkey),
         );
 
-        let cache = Arc::new(RwLock::new(cache));
-        cache
+        Arc::new(RwLock::new(cache))
     }
 
     fn get_test_address() -> (Address<NetworkUnchecked>, sha256::Hash) {
