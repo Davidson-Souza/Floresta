@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::serialize_hex;
@@ -41,6 +40,7 @@ use log::error;
 use log::info;
 use serde_json::json;
 use serde_json::Value;
+use tokio::sync::RwLock;
 
 use super::res::BlockJson;
 use super::res::Error;

@@ -1002,6 +1002,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tokio",
  "toml 0.5.11",
  "zstd 0.13.2",
 ]

@@ -8,7 +8,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
 use bitcoin::BlockHash;
 use floresta::chain::pruned_utreexo::BlockchainInterface;
 use floresta::chain::ChainState;
@@ -20,10 +19,11 @@ use floresta_chain::AssumeValidArg;
 use floresta_wire::node_interface::NodeMethods;
 use floresta_wire::running_node::RunningNode;
 use floresta_wire::UtreexoNodeConfig;
+use tokio::sync::RwLock;
 
 const DATA_DIR: &str = "./data";
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // Create a new chain state, which will store the accumulator and the headers chain.
     // It will be stored in the DATA_DIR directory. With this chain state, we don't keep

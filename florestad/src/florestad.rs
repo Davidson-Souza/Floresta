@@ -7,9 +7,6 @@ use std::sync::Mutex;
 #[cfg(feature = "json-rpc")]
 use std::sync::OnceLock;
 
-use tokio::sync::RwLock;
-use async_std::task;
-use async_std::task::block_on;
 pub use bitcoin::Network;
 use fern::colors::Color;
 use fern::colors::ColoredLevelConfig;
@@ -32,10 +29,13 @@ use floresta_wire::mempool::Mempool;
 use floresta_wire::node::UtreexoNode;
 use floresta_wire::UtreexoNodeConfig;
 use futures::channel::oneshot;
+use futures::executor::block_on;
 use log::debug;
 use log::error;
 use log::info;
 use log::Record;
+use tokio::sync::RwLock;
+use tokio::task;
 
 use crate::config_file::ConfigFile;
 #[cfg(feature = "json-rpc")]
@@ -158,7 +158,7 @@ impl Florestad {
     /// before flushing everything is equivalent to an unclean shutdown.
     #[allow(unused)]
     pub fn stop(&self) {
-        async_std::task::block_on(async move {
+        block_on(async move {
             *self.stop_signal.write().await = true;
             let chan = {
                 let mut guard = self.stop_notify.lock().unwrap();
