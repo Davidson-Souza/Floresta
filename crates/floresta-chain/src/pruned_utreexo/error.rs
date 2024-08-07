@@ -34,6 +34,7 @@ pub struct TransactionError {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BlockValidationErrors {
+    BadBlockVersion,
     InvalidCoinbase(String),
     UtxoAlreadySpent(Txid),
     ScriptValidationError(String),
@@ -63,6 +64,9 @@ impl Display for TransactionError {
 impl Display for BlockValidationErrors {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            BlockValidationErrors::BadBlockVersion => {
+                write!(f, "Block version is invalid")
+            }
             BlockValidationErrors::ScriptValidationError(e) => {
                 write!(f, "{}", e)
             }

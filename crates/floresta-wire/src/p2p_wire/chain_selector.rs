@@ -512,12 +512,9 @@ where
             &block.block.txdata,
             &self.chain,
         )?;
-
-        let fork_height = self.chain.get_block_height(&fork)?.unwrap_or(0);
-        let acc = self.find_accumulator_for_block(fork_height, fork).await?;
         let is_valid = self
             .chain
-            .validate_block(&block.block, proof, inputs, del_hashes, acc);
+            .validate_block(&block.block, proof, inputs, del_hashes);
 
         if is_valid.is_err() {
             self.chain.switch_chain(other_tip)?;

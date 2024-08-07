@@ -11,7 +11,7 @@
 //! This choice removes the use of costly atomic operations, but opens space for design flaws
 //! and memory unsoundness, so here are some tips about this module and how people looking for
 //! extend or use this code should proceed:
-//!   
+//!
 //!   - Shared ownership is forbidden: if you have two threads or tasks owning this, you'll have
 //!     data race. If you want to hold shared ownership for this module, you need to place a
 //!     [PartialChainState] inside an `Arc<Mutex>` yourself. Don't just Arc this and expect it to
@@ -70,6 +70,7 @@ pub(crate) struct PartialChainStateInner {
     pub(crate) consensus: Consensus,
     /// Whether we assume the signatures in this interval as valid, this is used to
     /// speed up syncing, by assuming signatures in old blocks are valid.
+    #[allow(dead_code)]
     pub(crate) assume_valid: bool,
 }
 
@@ -177,8 +178,11 @@ impl PartialChainStateInner {
         del_hashes: Vec<bitcoin::hashes::sha256::Hash>,
     ) -> Result<u32, BlockchainError> {
         let height = self.current_height + 1;
-
-        if let Err(BlockchainError::BlockValidation(e)) = self.validate_block(block, height, inputs)
+        let ancestor = self.get_ancestor(height)?;
+        let flags = self.get_validation_flags(height);
+        if let Err(BlockchainError::BlockValidation(e)) = self
+            .consensus
+            .validate_block(block, &ancestor, height, inputs, flags)
         {
             self.error = Some(e.clone());
             return Err(BlockchainError::BlockValidation(e));
@@ -203,54 +207,6 @@ impl PartialChainStateInner {
         self.update_state(height, acc);
 
         Ok(height)
-    }
-
-    /// Check whether a block is valid
-    fn validate_block(
-        &self,
-        block: &bitcoin::Block,
-        height: u32,
-        inputs: HashMap<bitcoin::OutPoint, bitcoin::TxOut>,
-    ) -> Result<(), BlockchainError> {
-        if !block.check_merkle_root() {
-            return Err(BlockchainError::BlockValidation(
-                BlockValidationErrors::BadMerkleRoot,
-            ));
-        }
-        if height >= self.chain_params().bip34_activation_height
-            && block.bip34_block_height() != Ok(height as u64)
-        {
-            return Err(BlockchainError::BlockValidation(
-                BlockValidationErrors::BadBip34,
-            ));
-        }
-        if !block.check_witness_commitment() {
-            return Err(BlockchainError::BlockValidation(
-                BlockValidationErrors::BadWitnessCommitment,
-            ));
-        }
-        let prev_block = self.get_ancestor(height)?;
-        if block.header.prev_blockhash != prev_block.block_hash() {
-            return Err(BlockchainError::BlockValidation(
-                BlockValidationErrors::BlockExtendsAnOrphanChain,
-            ));
-        }
-        // Validate block transactions
-        let subsidy = self.consensus.get_subsidy(height);
-        let verify_script = self.assume_valid;
-        #[cfg(feature = "bitcoinconsensus")]
-        let flags = self.get_validation_flags(height);
-        #[cfg(not(feature = "bitcoinconsensus"))]
-        let flags = 0;
-        Consensus::verify_block_transactions(
-            height,
-            inputs,
-            &block.txdata,
-            subsidy,
-            verify_script,
-            flags,
-        )?;
-        Ok(())
     }
 }
 
@@ -427,13 +383,24 @@ impl BlockchainInterface for PartialChainState {
 
     fn validate_block(
         &self,
-        _block: &bitcoin::Block,
+        block: &bitcoin::Block,
         _proof: rustreexo::accumulator::proof::Proof,
-        _inputs: HashMap<bitcoin::OutPoint, bitcoin::TxOut>,
+        inputs: HashMap<bitcoin::OutPoint, bitcoin::TxOut>,
         _del_hashes: Vec<bitcoin::hashes::sha256::Hash>,
-        _acc: Stump,
     ) -> Result<(), Self::Error> {
-        unimplemented!("PartialChainState::validate_block")
+        let height = self.inner().current_height;
+        let flags = self.inner().get_validation_flags(height);
+        let ancestor = match self.inner().get_block(height) {
+            Some(h) => h,
+            _ => {
+                return Err(BlockchainError::BlockValidation(
+                    BlockValidationErrors::BlockExtendsAnOrphanChain,
+                ))
+            }
+        };
+        self.inner()
+            .consensus
+            .validate_block(block, ancestor, height, inputs, flags)
     }
 
     fn get_fork_point(&self, _block: BlockHash) -> Result<BlockHash, Self::Error> {

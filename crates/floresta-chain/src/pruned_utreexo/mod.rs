@@ -94,7 +94,6 @@ pub trait BlockchainInterface {
         proof: Proof,
         inputs: HashMap<OutPoint, TxOut>,
         del_hashes: Vec<sha256::Hash>,
-        acc: Stump,
     ) -> Result<(), Self::Error>;
 
     fn get_fork_point(&self, block: BlockHash) -> Result<BlockHash, Self::Error>;
@@ -362,9 +361,8 @@ impl<T: BlockchainInterface> BlockchainInterface for Arc<T> {
         proof: Proof,
         inputs: HashMap<OutPoint, TxOut>,
         del_hashes: Vec<sha256::Hash>,
-        acc: Stump,
     ) -> Result<(), Self::Error> {
-        T::validate_block(self, block, proof, inputs, del_hashes, acc)
+        T::validate_block(self, block, proof, inputs, del_hashes)
     }
 
     fn get_fork_point(&self, block: BlockHash) -> Result<BlockHash, Self::Error> {

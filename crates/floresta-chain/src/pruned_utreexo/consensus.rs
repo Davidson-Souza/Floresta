@@ -3,7 +3,6 @@
 //! assume anything about the chainstate, so it can be used in any context.
 //! We use this to avoid code reuse among the different implementations of the chainstate.
 extern crate alloc;
-
 use core::ffi::c_uint;
 use core::ops::Mul;
 
@@ -33,6 +32,12 @@ use super::chainparams::ChainParams;
 use super::error::BlockValidationErrors;
 use super::error::BlockchainError;
 use crate::TransactionError;
+
+/// The maximum amount of wu's a block can have.
+pub const MAX_BLOCK_SIZE: u64 = 4_000_000;
+
+/// the static weight of a block header in wu.
+pub const BLOCK_HEADER_SIZE: u64 = 320;
 
 /// The value of a single coin in satoshis.
 pub const COIN_VALUE: u64 = 100_000_000;
@@ -80,7 +85,6 @@ impl Consensus {
         block_hash: BlockHash,
     ) -> sha256::Hash {
         let header_code = height << 1;
-
         let mut ser_utxo = Vec::new();
         let utxo = transaction.output.get(vout as usize).unwrap();
         utxo.consensus_encode(&mut ser_utxo).unwrap();
@@ -102,6 +106,81 @@ impl Consensus {
         sha256::Hash::from_slice(leaf_hash.as_slice())
             .expect("parent_hash: Engines shouldn't be Err")
     }
+    /// Check whether a block is valid
+    /// All validation methods is outsorced to this function
+    ///
+    /// Checks:
+    ///     - Merkle root
+    ///     - BIP34
+    ///     - Witness commitment
+    ///     - Block size (inside Transactions validation)
+    ///     - Transactions
+    ///     - prev block hash
+    pub fn validate_block(
+        &self,
+        block: &bitcoin::Block,
+        ancestor: &BlockHeader,
+        height: u32,
+        inputs: HashMap<bitcoin::OutPoint, bitcoin::TxOut>,
+        flags: c_uint,
+    ) -> Result<(), BlockchainError> {
+        if !block.check_merkle_root() {
+            return Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadMerkleRoot,
+            ));
+        }
+        if height >= self.parameters.bip34_activation_height
+            && block.bip34_block_height() != Ok(height as u64)
+        {
+            return Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadBip34,
+            ));
+        }
+        if !block.check_witness_commitment() {
+            return Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadWitnessCommitment,
+            ));
+        }
+        //Check if the block version is valid accordingly with the height
+        //and bip activation.
+        if !self.verify_block_version(height, block.header.version.to_consensus()) {
+            return Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadBlockVersion,
+            ));
+        }
+        //Here is important to check that the declared previous block hash is
+        //the same as the actual previous block hash from the chain.
+        if block.header.prev_blockhash != ancestor.block_hash() {
+            return Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BlockExtendsAnOrphanChain,
+            ));
+        }
+
+        #[cfg(not(feature = "bitcoinconsensus"))]
+        let flags = 0;
+        self.verify_block_transactions(
+            height,
+            inputs,
+            &block.txdata,
+            self.parameters.verify_script,
+            flags,
+        )?;
+        Ok(())
+    }
+    const fn verify_block_version(&self, height: u32, version: i32) -> bool {
+        return match version {
+            0 => false,
+            1 => height >= self.parameters.bip34_activation_height,
+            2 => height <= self.parameters.bip34_activation_height,
+            3 => height <= self.parameters.bip66_activation_height,
+            4 => height <= self.parameters.bip65_activation_height,
+            _ => {
+                // The case where miners are "voting"
+                true
+            }
+        };
+    }
+
     /// Verify if all transactions in a block are valid. Here we check the following:
     /// - The block must contain at least one transaction, and this transaction must be coinbase
     /// - The first transaction in the block must be coinbase
@@ -112,22 +191,22 @@ impl Consensus {
     ///     - The transaction must not have duplicate inputs
     ///     - The transaction must not spend more coins than it claims in the inputs
     ///     - The transaction must have valid scripts
-    #[allow(unused)]
     pub fn verify_block_transactions(
+        &self,
         height: u32,
         mut utxos: HashMap<OutPoint, TxOut>,
         transactions: &[Transaction],
-        subsidy: u64,
         verify_script: bool,
         flags: c_uint,
     ) -> Result<(), BlockchainError> {
         // TODO: RETURN A GENERIC WRAPPER TYPE.
+        let subsidy = self.get_subsidy(height);
         // Blocks must contain at least one transaction
         if transactions.is_empty() {
             return Err(BlockValidationErrors::EmptyBlock.into());
         }
         let mut fee = 0;
-        let mut wu: u64 = 0;
+        let mut wu: u64 = BLOCK_HEADER_SIZE;
         // Skip the coinbase tx
         for (n, transaction) in transactions.iter().enumerate() {
             // We don't need to verify the coinbase inputs, as it spends newly generated coins
@@ -137,7 +216,7 @@ impl Consensus {
                         txid: transaction.txid(),
                         error: err,
                     }
-                });
+                })?;
                 continue;
             }
             // Amount of all outputs
@@ -146,11 +225,13 @@ impl Consensus {
                 Self::get_out_value(output, &mut output_value).map_err(|err| TransactionError {
                     txid: transaction.txid(),
                     error: err,
-                });
-                Self::validate_script_size(&output.script_pubkey).map_err(|err| TransactionError {
-                    txid: transaction.txid(),
-                    error: err,
-                });
+                })?;
+                Self::validate_script_size(&output.script_pubkey).map_err(|err| {
+                    TransactionError {
+                        txid: transaction.txid(),
+                        error: err,
+                    }
+                })?;
             }
             // Amount of all inputs
             let mut in_value = 0;
@@ -160,11 +241,11 @@ impl Consensus {
                         txid: transaction.txid(),
                         error: err,
                     }
-                });
+                })?;
                 Self::validate_script_size(&input.script_sig).map_err(|err| TransactionError {
                     txid: transaction.txid(),
                     error: err,
-                });
+                })?;
             }
             // Value in should be greater or equal to value out. Otherwise, inflation.
             if output_value > in_value {
@@ -187,7 +268,7 @@ impl Consensus {
                     .map_err(|err| TransactionError {
                         txid: transaction.txid(),
                         error: BlockValidationErrors::ScriptValidationError(err.to_string()),
-                    });
+                    })?;
             };
 
             //checks vbytes validation

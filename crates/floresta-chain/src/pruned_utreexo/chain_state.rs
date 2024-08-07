@@ -91,6 +91,7 @@ pub struct ChainStateInner<PersistedState: ChainStore> {
     /// Assume valid is a Core-specific config that tells the node to not validate signatures
     /// in blocks before this one. Note that we only skip signature validation, everything else
     /// is still validated.
+    #[allow(dead_code)]
     assume_valid: Option<BlockHash>,
 }
 pub struct ChainState<PersistedState: ChainStore> {
@@ -320,7 +321,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
                         header.block_hash()
                     ))));
                 }
-                None => {
+                _ => {
                     return Err(BlockchainError::InvalidTip(format(format_args!(
                         "Block {} isn't in our storage",
                         header.block_hash()
@@ -715,6 +716,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         inner.best_block.best_block = best_block;
         inner.best_block.depth = height;
     }
+    #[allow(dead_code)]
     fn verify_script(&self, height: u32) -> bool {
         let inner = self.inner.read();
 
@@ -768,40 +770,10 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         height: u32,
         inputs: HashMap<OutPoint, TxOut>,
     ) -> Result<(), BlockchainError> {
-        if !block.check_merkle_root() {
-            return Err(BlockchainError::BlockValidation(
-                BlockValidationErrors::BadMerkleRoot,
-            ));
-        }
-        if height >= self.chain_params().bip34_activation_height
-            && block.bip34_block_height() != Ok(height as u64)
-        {
-            return Err(BlockchainError::BlockValidation(
-                BlockValidationErrors::BadBip34,
-            ));
-        }
-        if !block.check_witness_commitment() {
-            return Err(BlockchainError::BlockValidation(
-                BlockValidationErrors::BadWitnessCommitment,
-            ));
-        }
-
-        // Validate block transactions
-        let subsidy = read_lock!(self).consensus.get_subsidy(height);
-        let verify_script = self.verify_script(height);
-        #[cfg(feature = "bitcoinconsensus")]
+        let consensus = &self.inner.read().consensus;
         let flags = self.get_validation_flags(height);
-        #[cfg(not(feature = "bitcoinconsensus"))]
-        let flags = 0;
-        Consensus::verify_block_transactions(
-            height,
-            inputs,
-            &block.txdata,
-            subsidy,
-            verify_script,
-            flags,
-        )?;
-        Ok(())
+        let prev_block = self.get_block_header(&block.header.prev_blockhash)?;
+        consensus.validate_block(&block, &prev_block, height, inputs, flags)
     }
 }
 
@@ -840,7 +812,6 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
         proof: Proof,
         inputs: HashMap<OutPoint, TxOut>,
         del_hashes: Vec<sha256::Hash>,
-        acc: Stump,
     ) -> Result<(), Self::Error> {
         // verify the proof
         let del_hashes = del_hashes
@@ -848,7 +819,8 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
             .map(|hash| NodeHash::from(hash.as_byte_array()))
             .collect::<Vec<_>>();
 
-        if !acc.verify(&proof, &del_hashes)? {
+        let acc = &self.inner.read().acc;
+        if acc.verify(&proof, &del_hashes)? {
             return Err(BlockValidationErrors::InvalidProof.into());
         }
 
@@ -1326,7 +1298,7 @@ impl Encodable for BestChain {
 
         match self.rescan_index {
             Some(height) => len += height.consensus_encode(writer)?,
-            None => len += 0_u32.consensus_encode(writer)?,
+            _ => len += 0_u32.consensus_encode(writer)?,
         }
         len += self.alternative_tips.consensus_encode(writer)?;
         Ok(len)
