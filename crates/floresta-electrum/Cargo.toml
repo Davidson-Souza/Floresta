@@ -24,6 +24,7 @@ floresta-wire = { path = "../floresta-wire" }
 rustreexo = "0.3.0"
 sha2 = "^0.10.6"
 async-std = { version = "1.12.0", features = ["attributes"] }
+tokio = { version = "1.0", features = ["full"] }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
