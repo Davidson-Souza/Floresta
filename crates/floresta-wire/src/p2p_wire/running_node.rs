@@ -305,6 +305,7 @@ where
         if *kill_signal.read().await {
             self = UtreexoNode(ibd.0, self.1);
             self.shutdown().await;
+            try_and_log!(stop_signal.send(()));
             return;
         }
 

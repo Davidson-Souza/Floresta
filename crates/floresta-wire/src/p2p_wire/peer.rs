@@ -48,6 +48,7 @@ use self::peer_utils::make_pong;
 use super::mempool::Mempool;
 use super::node::NodeNotification;
 use super::node::NodeRequest;
+use crate::node::try_and_log;
 
 /// If we send a ping, and our peer takes more than PING_TIMEOUT to
 /// reply, disconnect.
@@ -92,6 +93,7 @@ pub struct P2PMessageHeader {
     length: u32,
     _checksum: u32,
 }
+
 impl Decodable for P2PMessageHeader {
     fn consensus_decode<R: std::io::Read + ?Sized>(
         reader: &mut R,
@@ -110,91 +112,46 @@ impl Decodable for P2PMessageHeader {
 }
 
 // Define the actor
-// Define the actor
 pub struct TcpStreamActor {
-    pub stream: TcpStream,
+    pub stream: ReadHalf<TcpStream>,
     pub receiver: UnboundedReceiver<TcpStreamCommand>,
     pub sender: UnboundedSender<ReaderMessage>,
     pub network: Network,
 }
 
 impl TcpStreamActor {
-    pub async fn start(mut self) {
-        let (reader, mut writer) = tokio::io::split(self.stream);
-        let mut read_future = pin!(Self::read_loop_inner(reader));
-
+    pub async fn run(mut self) -> Result<()> {
         loop {
-            futures::select! {
-                command = self.receiver.recv().fuse() => {
-                    let Some(command) = command else {
-                        return;
-                    };
-                    match command {
-                        TcpStreamCommand::Write(data) => {
-                            if let Err(e) = Self::handle_write(&mut writer, data).await {
-                                let _ = self.sender.send(ReaderMessage::Error(e));
-                                return;
-                            }
-                        }
-                        TcpStreamCommand::Shutdown => {
-                             if let Err(e) = Self::handle_shutdown(&mut writer).await {
-                                let _ = self.sender.send(ReaderMessage::Error(e));
-                            }
-                            return;
-                        }
-                    }
-                },
-                result = read_future.as_mut().fuse() => {
-                    match result {
-                        Ok(peer_message) => {
-                            match peer_message {
-                                PeerMessage::Block(block) => {
-                                    let _ = self.sender.send(ReaderMessage::Block(block));
-                                }
-                                PeerMessage::Message(message) => {
-                                    let _ = self.sender.send(ReaderMessage::Message(message));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = self.sender.send(ReaderMessage::Error(e));
-                            return;
-                        }
-                    }
-                },
+            let mut data: Vec<u8> = vec![0; 24];
+
+            // Read the header first, so learn the payload size
+            self.stream.read_exact(&mut data).await?;
+            let header: P2PMessageHeader = deserialize_partial(&data)?.0;
+
+            // Network Message too big
+            if header.length > (1024 * 1024 * 32) as u32 {
+                return Err(PeerError::MessageTooBig);
             }
+
+            data.resize(24 + header.length as usize, 0);
+
+            // Read everything else
+            self.stream.read_exact(&mut data[24..]).await?;
+
+            // Intercept block messages
+            if header._command[0..5] == [0x62, 0x6c, 0x6f, 0x63, 0x6b] {
+                let mut block_data = vec![0; header.length as usize];
+                block_data.copy_from_slice(&data[24..]);
+
+                let message: UtreexoBlock = deserialize(&block_data)?;
+                self.sender.send(ReaderMessage::Block(message));
+            }
+
+            let message: RawNetworkMessage = deserialize(&data)?;
+            self.sender.send(ReaderMessage::Message(message));
         }
     }
 
-    async fn read_loop_inner(mut stream: ReadHalf<TcpStream>) -> Result<PeerMessage> {
-        let mut data: Vec<u8> = vec![0; 24];
-
-        // Read the header first, so learn the payload size
-        stream.read_exact(&mut data).await?;
-        let header: P2PMessageHeader = deserialize_partial(&data)?.0;
-
-        // Network Message too big
-        if header.length > (1024 * 1024 * 32) as u32 {
-            return Err(PeerError::MessageTooBig);
-        }
-
-        data.resize(24 + header.length as usize, 0);
-
-        // Read everything else
-        stream.read_exact(&mut data[24..]).await?;
-
-        // Intercept block messages
-        if header._command[0..5] == [0x62, 0x6c, 0x6f, 0x63, 0x6b] {
-            let mut block_data = vec![0; header.length as usize];
-            block_data.copy_from_slice(&data[24..]);
-
-            let message: UtreexoBlock = deserialize(&block_data)?;
-            return Ok(PeerMessage::Block(message));
-        }
-
-        let message: RawNetworkMessage = deserialize(&data)?;
-        return Ok(PeerMessage::Message(message));
-    }
     async fn handle_write(writer: &mut WriteHalf<TcpStream>, data: Vec<u8>) -> Result<()> {
         writer.write_all(&data).await.map_err(PeerError::from)
     }
@@ -203,9 +160,10 @@ impl TcpStreamActor {
         writer.shutdown().await.map_err(PeerError::from)
     }
 }
+
 // Function to create a new actor and a sender
 pub fn create_tcp_stream_actor(
-    stream: TcpStream,
+    stream: ReadHalf<TcpStream>,
     network: Network,
 ) -> (
     UnboundedSender<TcpStreamCommand>,
@@ -245,7 +203,9 @@ pub struct Peer {
     wants_addrv2: bool,
     shutdown: bool,
     actor_receiver: UnboundedReceiver<ReaderMessage>, // Add the receiver for messages from TcpStreamActor
+    writer: WriteHalf<TcpStream>,
 }
+
 #[derive(Debug, Error)]
 pub enum PeerError {
     #[error("Error while sending to peer")]
@@ -314,6 +274,7 @@ impl Peer {
             .await;
         Ok(())
     }
+
     async fn peer_loop_inner(&mut self) -> Result<()> {
         // send a version
         let version = peer_utils::build_version_message();
@@ -327,6 +288,7 @@ impl Peer {
                         self.handle_node_request(request).await?;
                     }
                 },
+
                 message = self.actor_receiver.recv().fuse() => {
                     if let Some(message) = message {
                         match message {
@@ -343,9 +305,11 @@ impl Peer {
                     }
                 }
             };
+
             if self.shutdown {
                 return Ok(());
             }
+
             // If we send a ping and our peer doesn't respond in time, disconnect
             if let Some(when) = self.last_ping {
                 if when.elapsed().as_secs() > PING_TIMEOUT {
@@ -629,7 +593,7 @@ impl Peer {
         debug!("Writing {} to peer {}", msg.command(), self.id);
         let data = &mut RawNetworkMessage::new(self.network.magic(), msg);
         let data = serialize(&data);
-        self.stream.send(TcpStreamCommand::Write(data))?;
+        self.writer.write_all(&data).await?;
         Ok(())
     }
 
@@ -662,6 +626,7 @@ impl Peer {
         address_id: usize,
         feeler: bool,
         actor_receiver: UnboundedReceiver<ReaderMessage>,
+        writer: WriteHalf<TcpStream>,
     ) {
         let peer = Peer {
             address_id,
@@ -685,7 +650,9 @@ impl Peer {
             wants_addrv2: false,
             shutdown: false,
             actor_receiver, // Add the receiver for messages from TcpStreamActor
+            writer,
         };
+
         spawn(peer.read_loop());
     }
 
