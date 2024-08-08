@@ -29,6 +29,7 @@ use floresta_compact_filters::network_filters::NetworkFilters;
 use log::debug;
 use log::info;
 use log::warn;
+use tokio::net::tcp::WriteHalf;
 use tokio::net::TcpStream;
 use tokio::spawn;
 use tokio::sync::mpsc::unbounded_channel;
@@ -732,7 +733,7 @@ where
             });
 
             // Use create_peer function instead of manually creating the peer
-            Peer::create_peer(
+            Peer::<WriteHalf>::create_peer(
                 stream_sender,
                 peer_id_count,
                 mempool,
@@ -782,7 +783,7 @@ where
         let (reader, writer) = tokio::io::split(stream);
         let (stream_sender, actor_receiver, _actor) = create_tcp_stream_actor(reader, network);
 
-        Peer::create_peer(
+        Peer::<WriteHalf>::create_peer(
             stream_sender,
             peer_id_count,
             mempool,
