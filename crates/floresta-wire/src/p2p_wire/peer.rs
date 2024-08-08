@@ -31,7 +31,9 @@ use log::debug;
 use log::error;
 use log::warn;
 use thiserror::Error;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::ReadHalf;
 use tokio::io::WriteHalf;
@@ -112,14 +114,14 @@ impl Decodable for P2PMessageHeader {
 }
 
 // Define the actor
-pub struct TcpStreamActor {
-    pub stream: ReadHalf<TcpStream>,
+pub struct TcpStreamActor<T: AsyncRead + Unpin> {
+    pub stream: T,
     pub receiver: UnboundedReceiver<TcpStreamCommand>,
     pub sender: UnboundedSender<ReaderMessage>,
     pub network: Network,
 }
 
-impl TcpStreamActor {
+impl<T: AsyncRead + Unpin> TcpStreamActor<T> {
     pub async fn run(mut self) -> Result<()> {
         loop {
             let mut data: Vec<u8> = vec![0; 24];
@@ -144,31 +146,23 @@ impl TcpStreamActor {
                 block_data.copy_from_slice(&data[24..]);
 
                 let message: UtreexoBlock = deserialize(&block_data)?;
-                self.sender.send(ReaderMessage::Block(message));
+                self.sender.send(ReaderMessage::Block(message))?;
             }
 
             let message: RawNetworkMessage = deserialize(&data)?;
-            self.sender.send(ReaderMessage::Message(message));
+            self.sender.send(ReaderMessage::Message(message))?;
         }
-    }
-
-    async fn handle_write(writer: &mut WriteHalf<TcpStream>, data: Vec<u8>) -> Result<()> {
-        writer.write_all(&data).await.map_err(PeerError::from)
-    }
-
-    async fn handle_shutdown(writer: &mut WriteHalf<TcpStream>) -> Result<()> {
-        writer.shutdown().await.map_err(PeerError::from)
     }
 }
 
 // Function to create a new actor and a sender
 pub fn create_tcp_stream_actor(
-    stream: ReadHalf<TcpStream>,
+    stream: impl AsyncRead + Unpin,
     network: Network,
 ) -> (
     UnboundedSender<TcpStreamCommand>,
     UnboundedReceiver<ReaderMessage>,
-    TcpStreamActor,
+    TcpStreamActor<impl AsyncRead + Unpin>,
 ) {
     let (sender, receiver) = unbounded_channel();
     let (actor_sender, actor_receiver) = unbounded_channel();
@@ -181,7 +175,7 @@ pub fn create_tcp_stream_actor(
     (sender, actor_receiver, actor)
 }
 
-pub struct Peer {
+pub struct Peer<T: AsyncWrite + Unpin> {
     stream: UnboundedSender<TcpStreamCommand>,
     mempool: Arc<RwLock<Mempool>>,
     network: Network,
@@ -203,7 +197,7 @@ pub struct Peer {
     wants_addrv2: bool,
     shutdown: bool,
     actor_receiver: UnboundedReceiver<ReaderMessage>, // Add the receiver for messages from TcpStreamActor
-    writer: WriteHalf<TcpStream>,
+    writer: T,
 }
 
 #[derive(Debug, Error)]
@@ -224,12 +218,20 @@ pub enum PeerError {
     TooManyMessages,
     #[error("Peer timed a ping out")]
     Timeout,
+    #[error("channel error")]
+    Channel,
 }
 
 pub enum ReaderMessage {
     Block(UtreexoBlock),
     Message(RawNetworkMessage),
     Error(PeerError),
+}
+
+impl From<tokio::sync::mpsc::error::SendError<ReaderMessage>> for PeerError {
+    fn from(_: tokio::sync::mpsc::error::SendError<ReaderMessage>) -> Self {
+        PeerError::Channel
+    }
 }
 
 impl From<UtreexoBlock> for ReaderMessage {
@@ -250,7 +252,7 @@ impl From<tokio::sync::mpsc::error::SendError<TcpStreamCommand>> for PeerError {
     }
 }
 
-impl Debug for Peer {
+impl<T: AsyncWrite + Unpin> Debug for Peer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.id)?;
         // write!(f, "{:?}", self.stream.peer_addr())?;
@@ -260,7 +262,7 @@ impl Debug for Peer {
 
 type Result<T> = std::result::Result<T, PeerError>;
 
-impl Peer {
+impl <T: AsyncWrite + Unpin> Peer<T> {
     pub async fn read_loop(mut self) -> Result<()> {
         let err = self.peer_loop_inner().await;
         // force the stream to shutdown to prevent leaking resources
@@ -588,7 +590,8 @@ impl Peer {
         Ok(())
     }
 }
-impl Peer {
+
+impl<T: AsyncWrite + Unpin> Peer<T> {
     pub async fn write(&mut self, msg: NetworkMessage) -> Result<()> {
         debug!("Writing {} to peer {}", msg.command(), self.id);
         let data = &mut RawNetworkMessage::new(self.network.magic(), msg);
