@@ -19,12 +19,13 @@
 
 mod cli;
 
+use std::time::Duration;
+
 use clap::Parser;
 use cli::Cli;
 use florestad::Config;
 use florestad::Florestad;
 use futures::executor::block_on;
-use std::time::Duration;
 use tokio::time::sleep;
 
 #[tokio::main]

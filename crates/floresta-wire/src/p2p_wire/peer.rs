@@ -1,18 +1,11 @@
 use std::fmt::Debug;
-use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
-
-use futures::select;
 use std::future::Future;
 use std::pin::pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::spawn;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::RwLock;
-use tokio::time::timeout;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
+use std::time::Instant;
 
 use bitcoin::bip158;
 use bitcoin::block::Header as BlockHeader;
@@ -32,11 +25,24 @@ use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::Transaction;
 use floresta_chain::UtreexoBlock;
+use futures::select;
 use futures::FutureExt;
 use log::debug;
 use log::error;
 use log::warn;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::ReadHalf;
+use tokio::io::WriteHalf;
+use tokio::net::TcpStream;
+use tokio::net::ToSocketAddrs;
+use tokio::spawn;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::RwLock;
+use tokio::time::timeout;
 
 use self::peer_utils::make_pong;
 use super::mempool::Mempool;

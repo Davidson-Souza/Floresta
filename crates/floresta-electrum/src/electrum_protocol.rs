@@ -27,9 +27,14 @@ use log::info;
 use log::trace;
 use serde_json::json;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
 
 use crate::get_arg;
@@ -110,8 +115,9 @@ pub struct Client {
 impl Client {
     /// Send a message to the client, should be a serialized JSON
     pub async fn write(&self, data: &[u8]) -> Result<(), std::io::Error> {
-        self.sender.send(SenderMessage::Write(data.to_vec()));
-        self.sender
+        let _ = self.sender.send(SenderMessage::Write(data.to_vec()));
+        let _ = self
+            .sender
             .send(SenderMessage::Write("\n".to_string().as_bytes().to_vec()));
 
         Ok(())
@@ -942,13 +948,6 @@ mod test {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use async_std::future;
-    use async_std::io::ReadExt;
-    use async_std::io::WriteExt;
-    use async_std::net::TcpStream;
-    use async_std::sync::RwLock;
-    use async_std::task::block_on;
-    use async_std::task::{self};
     use bitcoin::address::NetworkUnchecked;
     use bitcoin::block::Header as BlockHeader;
     use bitcoin::consensus::deserialize;
@@ -969,9 +968,16 @@ mod test {
     use floresta_wire::node::UtreexoNode;
     use floresta_wire::running_node::RunningNode;
     use floresta_wire::UtreexoNodeConfig;
+    use futures::executor::block_on;
     use serde_json::json;
     use serde_json::Number;
     use serde_json::Value;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use tokio::task::{self};
+    use tokio::time::timeout;
 
     use super::client_accept_loop;
     use super::ElectrumServer;
@@ -1042,7 +1048,7 @@ mod test {
         let mut response = vec![0u8; 100000000];
         let timeout_duration = Duration::from_secs(10);
 
-        let read_result = future::timeout(timeout_duration, stream.read(&mut response)).await;
+        let read_result = timeout(timeout_duration, stream.read(&mut response)).await;
         match read_result {
             Ok(Ok(0)) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -1182,7 +1188,7 @@ mod test {
     }
 
     /// SENDING MULTIPLE REQUESTS TO THE SERVER AT THE SAME TIME
-    #[async_std::test]
+    #[tokio::test]
     async fn test_blockchain_headers() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1218,7 +1224,7 @@ mod test {
         assert!(send_request(batch_req, port).await.is_ok());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_server_banner() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1230,7 +1236,7 @@ mod test {
         assert!(send_request(request, port).await.is_ok())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_estimate_fee() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1259,7 +1265,7 @@ mod test {
         assert_eq!(batch_response[1]["result"], 0.00001);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_scripthash_subscribe() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1292,7 +1298,7 @@ mod test {
             .unwrap());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_scripthash_txs() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1333,7 +1339,7 @@ mod test {
         )
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_transactions() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1384,7 +1390,7 @@ mod test {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_server_info() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
