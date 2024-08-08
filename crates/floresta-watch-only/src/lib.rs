@@ -544,7 +544,7 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
             .expect("Database not working");
 
         if let Entry::Vacant(e) = self.address_map.entry(hash) {
-            let script = transaction.output[index as usize].script_pubkey.clone();
+            let script = transaction.output[index].script_pubkey.clone();
             // This means `cache_transaction` have been called with an address we don't
             // follow. This may be useful for caching new addresses without re-scanning.
             // We can track this address from now onwards, but the past history is only
@@ -750,7 +750,7 @@ mod test {
 
         // [is_cached], [push_descriptor]
         let desc = "wsh(sortedmulti(1,[54ff5a12/48h/1h/0h/2h]tpubDDw6pwZA3hYxcSN32q7a5ynsKmWr4BbkBNHydHPKkM4BZwUfiK7tQ26h7USm8kA1E2FvCy7f7Er7QXKF8RNptATywydARtzgrxuPDwyYv4x/<0;1>/*,[bcf969c0/48h/1h/0h/2h]tpubDEFdgZdCPgQBTNtGj4h6AehK79Jm4LH54JrYBJjAtHMLEAth7LuY87awx9ZMiCURFzFWhxToRJK6xp39aqeJWrG5nuW3eBnXeMJcvDeDxfp/<0;1>/*))#fuw35j0q";
-        cache.push_descriptor(&desc.to_string()).unwrap();
+        cache.push_descriptor(desc).unwrap();
         assert!(cache.is_cached(&desc.to_string()).unwrap());
 
         // [derive_addresses]

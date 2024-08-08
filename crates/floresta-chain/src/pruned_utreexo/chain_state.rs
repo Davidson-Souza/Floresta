@@ -527,15 +527,15 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             AssumeValidArg::UserInput(hash) => Some(hash),
             AssumeValidArg::Hardcoded => match network {
                 Network::Bitcoin => {
-                    get_hash("00000000000000000009c97098b5295f7e5f183ac811fb5d1534040adb93cabd")
+                    get_hash("00000000000000000000569f4d863c27e667cbee8acc8da195e7e5551658e6e9")
                         .into()
                 }
                 Network::Testnet => {
-                    get_hash("0000000000000004877fa2d36316398528de4f347df2f8a96f76613a298ce060")
+                    get_hash("000000000000001142ad197bff16a1393290fca09e4ca904dd89e7ae98a90fcd")
                         .into()
                 }
                 Network::Signet => {
-                    get_hash("0000004f401bac79fe6cb3a10ef367b071e0fb51a1c9f4b3e8484e4dd03e1863")
+                    get_hash("0000003ed17b9c93954daab00d73ccbd0092074c4ebfc751c7458d58b827dfea")
                         .into()
                 }
                 Network::Regtest => {

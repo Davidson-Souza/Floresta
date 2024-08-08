@@ -1,6 +1,6 @@
 [package]
 name = "floresta-compact-filters"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Davidson Sousa <davidson.lucas.souza@outlook.com>"]
 edition = "2018"
 homepage = "https://github.com/davidson-souza/floresta"

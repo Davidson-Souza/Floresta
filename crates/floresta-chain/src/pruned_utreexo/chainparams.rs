@@ -101,26 +101,33 @@ impl ChainParams {
         match network {
             Network::Bitcoin => AssumeUtreexoValue {
                 block_hash: BlockHash::from_str(
-                    "00000000000000000002447c802760582b80022f937d754aece888ec9e96f212",
+                    "00000000000000000000569f4d863c27e667cbee8acc8da195e7e5551658e6e9",
                 )
                 .unwrap(),
-                height: 849070,
+                height: 855571,
                 roots: [
-                    "d9eb4f63c9c302154cfde1d7c36f20674877653883f7d857550351ed3558545c",
-                    "7519893244433168ef4dc3a21e3221b87fa5b3802f4a745be33baa9defa7ac6b",
-                    "59be29510b035212adcffc970f71a889e81db2298ab3bff4d0e3e1b56caa8976",
-                    "3e4833c382dbfa4fd5e496b37ac6769036bba655534249a9d7d5a2a221718a39",
-                    "4569761976542d95af3c765b6fc7e149b71659e5f89ad1cc13a7b00bbd7e9d8d",
-                    "33fbd5f96c50327d309722970378bea7474b171097ba40bc98b360871a1f38c2",
-                    "d2955774ac37daa1e16a2fd9d419906acf6bdf6ffd6f171a9cf72935175cec6f",
-                    "ccac02fac6922f5082e893b83c0898636be24f47dd6c00f502425c9dedab2c25",
-                    "e418ad2e3b516c54a873cd89aec3bbf88513e16192f817b150f168a939f3ad3c",
-                    "1931c7dbc568c4fe92cceab72e870da307df88c8f6e7a01bf6dbfdac4dd88073",
+                    "4dcc014cc23611dda2dcf0f34a3e62e7d302146df4b0b01ac701d440358c19d6",
+                    "988e0a883e4ad0c5559432f4747395115112755ec1138dcdd62e2f5741c31c2c",
+                    "49ecba683e12823d44f2ad190120d3028386d8bb7860a3eea62a250a1f293c60",
+                    "7c02e55ae35f12501134f0b81a351abb6c5e7a2529641d0c537a7534a560c770",
+                    "59cb07c73d71164ce1a4f953cfd01ef0e3269080e29d34022d4251523cb1e8ac",
+                    "ff96c9983b6765092403f8089fe5d0cdd6a94c58e4dcd14e77570c8b10c17628",
+                    "47ed934529b2ea03a7382febcf0c05e0bfc5884cc1235c2ad42624a56234b9a6",
+                    "d5c9373ed35de281d426888bd656f04a36623197a33706932ab82014d67f26ae",
+                    "05de50991df991f0b78d9166d06ce3c61cb29e07dc7c53ba75d75df6455e6967",
+                    "ebfdaf53b7240e9cd25d7c63b35d462763253f9282cc97d8d0c92ea9ade6aa02",
+                    "c349b6850f75346224cf7cf1e0a69e194306c59489017cd4f4a045c001f1fefc",
+                    "7edfd925905e88fd14c47edaaf09606cf0ae19f3b898239a2feb607d175d9a90",
+                    "442dadd38fd16949d2ef03d799aa6b61ad8c0b7c611aaa5e218bc6360c4f41ce",
+                    "2a57b73e540c7a72cb44fdc4ab7fcc3f0f148be7885667f07fce345430f08a15",
+                    "66dc66000a8baaacacef280783a0245b4d33bd7eba5f1f14b939bd3a54e135cb",
+                    "67ba89afe6bce9bafbf0b88013e4446c861e6c746e291c3921e0b65c93671ba3",
+                    "972ea2c7472c22e4eab49e9c2db5757a048b271b6251883ce89ccfeaa38b47ab",
                 ]
                 .into_iter()
                 .map(|x| NodeHash::from_str(x).unwrap())
                 .collect(),
-                leaves: 2554606658,
+                leaves: 2587882501,
             },
             Network::Testnet => AssumeUtreexoValue {
                 block_hash: genesis_block(network.into()).block_hash(),
