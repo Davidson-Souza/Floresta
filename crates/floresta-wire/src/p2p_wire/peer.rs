@@ -1,9 +1,5 @@
 use std::fmt::Debug;
-use std::future::Future;
-use std::pin::pin;
 use std::sync::Arc;
-use std::task::Context;
-use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -25,7 +21,6 @@ use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::Transaction;
 use floresta_chain::UtreexoBlock;
-use futures::select;
 use futures::FutureExt;
 use log::debug;
 use log::error;
@@ -35,22 +30,18 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tokio::io::ReadHalf;
 use tokio::io::WriteHalf;
 use tokio::net::TcpStream;
-use tokio::net::ToSocketAddrs;
 use tokio::spawn;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
-use tokio::time::timeout;
 
 use self::peer_utils::make_pong;
 use super::mempool::Mempool;
 use super::node::NodeNotification;
 use super::node::NodeRequest;
-use crate::node::try_and_log;
 
 /// If we send a ping, and our peer takes more than PING_TIMEOUT to
 /// reply, disconnect.
@@ -67,27 +58,6 @@ enum State {
     SentVerack,
     Connected,
 }
-// Define the messages
-pub enum TcpStreamCommand {
-    Write(Vec<u8>),
-    Shutdown,
-    // Add other commands here
-}
-
-// p2p message header struct
-// Define a newtype wrapper
-// struct UnpinFuture<F>(F);
-
-// // Implement Future for UnpinFuture
-// impl<F: Future> Future for UnpinFuture<F> {
-//     type Output = F::Output;
-
-//     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-//         // Safety: We're not moving the future, just polling it
-//         unsafe { self.map_unchecked_mut(|s| &mut s.0).poll(cx) }
-//     }
-// }
-// impl<F> Unpin for UnpinFuture<F> {}
 
 pub struct P2PMessageHeader {
     magic: Magic,
@@ -116,7 +86,6 @@ impl Decodable for P2PMessageHeader {
 // Define the actor
 pub struct TcpStreamActor<T: AsyncRead + Unpin> {
     pub stream: T,
-    pub receiver: UnboundedReceiver<TcpStreamCommand>,
     pub sender: UnboundedSender<ReaderMessage>,
     pub network: Network,
 }
@@ -160,23 +129,19 @@ pub fn create_tcp_stream_actor(
     stream: impl AsyncRead + Unpin,
     network: Network,
 ) -> (
-    UnboundedSender<TcpStreamCommand>,
     UnboundedReceiver<ReaderMessage>,
     TcpStreamActor<impl AsyncRead + Unpin>,
 ) {
-    let (sender, receiver) = unbounded_channel();
     let (actor_sender, actor_receiver) = unbounded_channel();
     let actor = TcpStreamActor {
         stream,
-        receiver,
         sender: actor_sender,
         network,
     };
-    (sender, actor_receiver, actor)
+    (actor_receiver, actor)
 }
 
 pub struct Peer<T: AsyncWrite + Unpin> {
-    stream: UnboundedSender<TcpStreamCommand>,
     mempool: Arc<RwLock<Mempool>>,
     network: Network,
     blocks_only: bool,
@@ -246,12 +211,6 @@ impl From<RawNetworkMessage> for ReaderMessage {
     }
 }
 
-impl From<tokio::sync::mpsc::error::SendError<TcpStreamCommand>> for PeerError {
-    fn from(_: tokio::sync::mpsc::error::SendError<TcpStreamCommand>) -> Self {
-        PeerError::Send
-    }
-}
-
 impl<T: AsyncWrite + Unpin> Debug for Peer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.id)?;
@@ -262,12 +221,17 @@ impl<T: AsyncWrite + Unpin> Debug for Peer<T> {
 
 type Result<T> = std::result::Result<T, PeerError>;
 
-impl <T: AsyncWrite + Unpin> Peer<T> {
+impl<T: AsyncWrite + Unpin> Peer<T> {
     pub async fn read_loop(mut self) -> Result<()> {
         let err = self.peer_loop_inner().await;
         // force the stream to shutdown to prevent leaking resources
 
-        let _ = self.stream.send(TcpStreamCommand::Shutdown);
+        if let Err(shutdown_err) = self.writer.shutdown().await {
+            debug!(
+                "Failed to shutdown writer for Peer {}: {shutdown_err:?}",
+                self.id
+            );
+        }
         if let Err(err) = err {
             debug!("Peer {} connection loop closed: {err:?}", self.id);
         }
@@ -398,7 +362,7 @@ impl <T: AsyncWrite + Unpin> Peer<T> {
             }
             NodeRequest::Shutdown => {
                 self.shutdown = true;
-                let _ = self.stream.send(TcpStreamCommand::Shutdown);
+                self.writer.shutdown().await?;
             }
             NodeRequest::GetAddresses => {
                 self.write(NetworkMessage::GetAddr).await?;
@@ -620,7 +584,6 @@ impl<T: AsyncWrite + Unpin> Peer<T> {
     }
 
     pub async fn create_peer(
-        stream_sender: UnboundedSender<TcpStreamCommand>,
         id: u32,
         mempool: Arc<RwLock<Mempool>>,
         network: Network,
@@ -642,7 +605,6 @@ impl<T: AsyncWrite + Unpin> Peer<T> {
             network,
             node_tx,
             services: ServiceFlags::NONE,
-            stream: stream_sender,
             messages: 0,
             start_time: Instant::now(),
             user_agent: "".into(),

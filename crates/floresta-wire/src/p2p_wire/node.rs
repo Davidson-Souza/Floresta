@@ -726,15 +726,13 @@ where
             stream.set_nodelay(true).unwrap();
             let (reader, writer) = tokio::io::split(stream);
 
-            // Assuming create_tcp_stream_actor returns (Sender, Actor)
-            let (stream_sender, actor_receiver, actor) = create_tcp_stream_actor(reader, network);
+            let (actor_receiver, actor) = create_tcp_stream_actor(reader, network);
             tokio::spawn(async move {
-                actor.run().await;
+                let _ = actor.run().await;
             });
 
             // Use create_peer function instead of manually creating the peer
             Peer::<WriteHalf>::create_peer(
-                stream_sender,
                 peer_id_count,
                 mempool,
                 network,
@@ -781,10 +779,12 @@ where
         let proxy = TcpStream::connect(proxy).await?;
         let stream = Socks5StreamBuilder::connect(proxy, addr, address.get_port()).await?;
         let (reader, writer) = tokio::io::split(stream);
-        let (stream_sender, actor_receiver, _actor) = create_tcp_stream_actor(reader, network);
+        let (actor_receiver, actor) = create_tcp_stream_actor(reader, network);
+        tokio::spawn(async move {
+            let _ = actor.run().await;
+        });
 
         Peer::<WriteHalf>::create_peer(
-            stream_sender,
             peer_id_count,
             mempool,
             network,
