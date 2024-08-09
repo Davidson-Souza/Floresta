@@ -25,8 +25,10 @@ use clap::Parser;
 use cli::Cli;
 use florestad::Config;
 use florestad::Florestad;
+use futures::executor::block_on;
+use tokio::time::sleep;
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     let params = Cli::parse();
 
@@ -57,7 +59,7 @@ async fn main() {
     let _stop_signal = stop_signal.clone();
 
     ctrlc::set_handler(move || {
-        async_std::task::block_on(async {
+        block_on(async {
             *(stop_signal.write().await) = true;
         })
     })
@@ -68,6 +70,6 @@ async fn main() {
             florestad.wait_shutdown().await;
             break;
         }
-        async_std::task::sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(5)).await;
     }
 }

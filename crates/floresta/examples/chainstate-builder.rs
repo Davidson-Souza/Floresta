@@ -17,7 +17,7 @@ use rustreexo::accumulator::stump::Stump;
 
 const DATA_DIR: &str = "./data";
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // Create a new chain state, which will store the accumulator and the headers chain.
     // It will be stored in the DATA_DIR directory. With this chain state, we don't keep

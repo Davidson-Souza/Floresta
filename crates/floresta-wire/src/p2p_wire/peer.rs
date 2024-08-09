@@ -3,43 +3,45 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use async_std::channel::unbounded;
-use async_std::channel::Receiver;
-use async_std::channel::Sender;
-use async_std::io::BufReader;
-use async_std::net::TcpStream;
-use async_std::net::ToSocketAddrs;
-use async_std::sync::RwLock;
-use async_std::task::spawn;
 use bitcoin::bip158;
 use bitcoin::block::Header as BlockHeader;
+use bitcoin::consensus::deserialize;
+use bitcoin::consensus::deserialize_partial;
 use bitcoin::consensus::serialize;
+use bitcoin::consensus::Decodable;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::AddrV2Message;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message::RawNetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
+use bitcoin::p2p::Magic;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::Transaction;
 use floresta_chain::UtreexoBlock;
-use futures::AsyncRead;
-use futures::AsyncWrite;
-use futures::AsyncWriteExt;
 use futures::FutureExt;
 use log::debug;
 use log::error;
 use log::warn;
 use thiserror::Error;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
+use tokio::io::WriteHalf;
+use tokio::net::TcpStream;
+use tokio::spawn;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::RwLock;
 
 use self::peer_utils::make_pong;
 use super::mempool::Mempool;
 use super::node::NodeNotification;
 use super::node::NodeRequest;
-use super::stream_reader::ReaderMessage;
-use super::stream_reader::StreamReader;
 
 /// If we send a ping, and our peer takes more than PING_TIMEOUT to
 /// reply, disconnect.
@@ -56,23 +58,90 @@ enum State {
     SentVerack,
     Connected,
 }
-/// A trait defining how the transport we use should behave. Transport is anything
-/// that allows to read/write from/into. Like a TcpStream or a Socks5 proxy
-pub trait Transport:
-    AsyncRead + AsyncWrite + Unpin + Clone + Sync + Send + AsyncWriteExt + 'static
-{
-    /// Asks the stream to shutdown, the final part of the disconnection process
-    fn shutdown(&mut self) -> Result<()>;
+
+pub struct P2PMessageHeader {
+    magic: Magic,
+    _command: [u8; 12],
+    length: u32,
+    _checksum: u32,
 }
 
-impl Transport for TcpStream {
-    fn shutdown(&mut self) -> Result<()> {
-        Ok(TcpStream::shutdown(self, std::net::Shutdown::Both)?)
+impl Decodable for P2PMessageHeader {
+    fn consensus_decode<R: std::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> std::result::Result<Self, bitcoin::consensus::encode::Error> {
+        let magic = Magic::consensus_decode(reader)?;
+        let _command = <[u8; 12]>::consensus_decode(reader)?;
+        let length = u32::consensus_decode(reader)?;
+        let _checksum = u32::consensus_decode(reader)?;
+        Ok(Self {
+            _checksum,
+            _command,
+            length,
+            magic,
+        })
     }
 }
 
-pub struct Peer<T: Transport> {
-    stream: T,
+// Define the actor
+pub struct TcpStreamActor<T: AsyncRead + Unpin> {
+    pub stream: T,
+    pub sender: UnboundedSender<ReaderMessage>,
+    pub network: Network,
+}
+
+impl<T: AsyncRead + Unpin> TcpStreamActor<T> {
+    pub async fn run(mut self) -> Result<()> {
+        loop {
+            let mut data: Vec<u8> = vec![0; 24];
+
+            // Read the header first, so learn the payload size
+            self.stream.read_exact(&mut data).await?;
+            let header: P2PMessageHeader = deserialize_partial(&data)?.0;
+
+            // Network Message too big
+            if header.length > (1024 * 1024 * 32) as u32 {
+                return Err(PeerError::MessageTooBig);
+            }
+
+            data.resize(24 + header.length as usize, 0);
+
+            // Read everything else
+            self.stream.read_exact(&mut data[24..]).await?;
+
+            // Intercept block messages
+            if header._command[0..5] == [0x62, 0x6c, 0x6f, 0x63, 0x6b] {
+                let mut block_data = vec![0; header.length as usize];
+                block_data.copy_from_slice(&data[24..]);
+
+                let message: UtreexoBlock = deserialize(&block_data)?;
+                self.sender.send(ReaderMessage::Block(message))?;
+            }
+
+            let message: RawNetworkMessage = deserialize(&data)?;
+            self.sender.send(ReaderMessage::Message(message))?;
+        }
+    }
+}
+
+// Function to create a new actor and a sender
+pub fn create_tcp_stream_actor(
+    stream: impl AsyncRead + Unpin,
+    network: Network,
+) -> (
+    UnboundedReceiver<ReaderMessage>,
+    TcpStreamActor<impl AsyncRead + Unpin>,
+) {
+    let (actor_sender, actor_receiver) = unbounded_channel();
+    let actor = TcpStreamActor {
+        stream,
+        sender: actor_sender,
+        network,
+    };
+    (actor_receiver, actor)
+}
+
+pub struct Peer<T: AsyncWrite + Unpin> {
     mempool: Arc<RwLock<Mempool>>,
     network: Network,
     blocks_only: bool,
@@ -84,15 +153,18 @@ pub struct Peer<T: Transport> {
     current_best_block: i32,
     last_ping: Option<Instant>,
     id: u32,
-    node_tx: Sender<NodeNotification>,
+    node_tx: UnboundedSender<NodeNotification>,
     state: State,
     send_headers: bool,
-    node_requests: Receiver<NodeRequest>,
+    node_requests: UnboundedReceiver<NodeRequest>,
     address_id: usize,
     feeler: bool,
     wants_addrv2: bool,
     shutdown: bool,
+    actor_receiver: UnboundedReceiver<ReaderMessage>, // Add the receiver for messages from TcpStreamActor
+    writer: T,
 }
+
 #[derive(Debug, Error)]
 pub enum PeerError {
     #[error("Error while sending to peer")]
@@ -111,22 +183,55 @@ pub enum PeerError {
     TooManyMessages,
     #[error("Peer timed a ping out")]
     Timeout,
+    #[error("channel error")]
+    Channel,
 }
-impl Debug for Peer<TcpStream> {
+
+pub enum ReaderMessage {
+    Block(UtreexoBlock),
+    Message(RawNetworkMessage),
+    Error(PeerError),
+}
+
+impl From<tokio::sync::mpsc::error::SendError<ReaderMessage>> for PeerError {
+    fn from(_: tokio::sync::mpsc::error::SendError<ReaderMessage>) -> Self {
+        PeerError::Channel
+    }
+}
+
+impl From<UtreexoBlock> for ReaderMessage {
+    fn from(block: UtreexoBlock) -> Self {
+        ReaderMessage::Block(block)
+    }
+}
+
+impl From<RawNetworkMessage> for ReaderMessage {
+    fn from(header: RawNetworkMessage) -> Self {
+        ReaderMessage::Message(header)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> Debug for Peer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.id)?;
-        write!(f, "{:?}", self.stream.peer_addr())?;
+        // write!(f, "{:?}", self.stream.peer_addr())?;
         Ok(())
     }
 }
 
 type Result<T> = std::result::Result<T, PeerError>;
 
-impl<T: Transport> Peer<T> {
+impl<T: AsyncWrite + Unpin> Peer<T> {
     pub async fn read_loop(mut self) -> Result<()> {
         let err = self.peer_loop_inner().await;
         // force the stream to shutdown to prevent leaking resources
-        let _ = self.stream.shutdown();
+
+        if let Err(shutdown_err) = self.writer.shutdown().await {
+            debug!(
+                "Failed to shutdown writer for Peer {}: {shutdown_err:?}",
+                self.id
+            );
+        }
         if let Err(err) = err {
             debug!("Peer {} connection loop closed: {err:?}", self.id);
         }
@@ -135,39 +240,42 @@ impl<T: Transport> Peer<T> {
             .await;
         Ok(())
     }
+
     async fn peer_loop_inner(&mut self) -> Result<()> {
         // send a version
         let version = peer_utils::build_version_message();
         self.write(version).await?;
         self.state = State::SentVersion(Instant::now());
-        let read_stream = BufReader::new(self.stream.clone());
-        let (tx, rx) = unbounded();
-        let magic = self.network.magic();
-        let stream: StreamReader<_> = StreamReader::new(read_stream, magic, tx);
-        spawn(stream.read_loop());
+
         loop {
             futures::select! {
                 request = self.node_requests.recv().fuse() => {
-                    if let Ok(request) = request {
+                    if let Some(request) = request {
                         self.handle_node_request(request).await?;
                     }
-                }
-                peer_request = async_std::future::timeout(Duration::from_secs(10), rx.recv()).fuse() => {
-                    if let Ok(Ok(peer_request)) = peer_request {
-                        match peer_request? {
-                            ReaderMessage::Message(message) => {
-                                self.handle_peer_message(message).await?;
+                },
+
+                message = self.actor_receiver.recv().fuse() => {
+                    if let Some(message) = message {
+                        match message {
+                            ReaderMessage::Message(msg) => {
+                                self.handle_peer_message(msg).await?;
                             }
                             ReaderMessage::Block(block) => {
                                 self.send_to_node(PeerMessages::Block(block)).await;
+                            }
+                            ReaderMessage::Error(e) => {
+                                return Err(e);
                             }
                         }
                     }
                 }
             };
+
             if self.shutdown {
                 return Ok(());
             }
+
             // If we send a ping and our peer doesn't respond in time, disconnect
             if let Some(when) = self.last_ping {
                 if when.elapsed().as_secs() > PING_TIMEOUT {
@@ -209,6 +317,7 @@ impl<T: Transport> Peer<T> {
             }
         }
     }
+
     pub async fn handle_node_request(&mut self, request: NodeRequest) -> Result<()> {
         assert_eq!(self.state, State::Connected);
         debug!("Handling node request: {:?}", request);
@@ -253,7 +362,7 @@ impl<T: Transport> Peer<T> {
             }
             NodeRequest::Shutdown => {
                 self.shutdown = true;
-                let _ = self.stream.shutdown();
+                self.writer.shutdown().await?;
             }
             NodeRequest::GetAddresses => {
                 self.write(NetworkMessage::GetAddr).await?;
@@ -445,14 +554,16 @@ impl<T: Transport> Peer<T> {
         Ok(())
     }
 }
-impl<T: Transport> Peer<T> {
+
+impl<T: AsyncWrite + Unpin> Peer<T> {
     pub async fn write(&mut self, msg: NetworkMessage) -> Result<()> {
         debug!("Writing {} to peer {}", msg.command(), self.id);
         let data = &mut RawNetworkMessage::new(self.network.magic(), msg);
         let data = serialize(&data);
-        self.stream.write_all(data.as_slice()).await?;
+        self.writer.write_all(&data).await?;
         Ok(())
     }
+
     pub async fn handle_get_data(&mut self, inv: Inventory) -> Result<()> {
         match inv {
             Inventory::WitnessTransaction(txid) => {
@@ -471,16 +582,17 @@ impl<T: Transport> Peer<T> {
         }
         Ok(())
     }
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_peer_from_transport(
-        stream: T,
+
+    pub async fn create_peer(
         id: u32,
         mempool: Arc<RwLock<Mempool>>,
         network: Network,
-        node_tx: Sender<NodeNotification>,
-        node_requests: Receiver<NodeRequest>,
+        node_tx: UnboundedSender<NodeNotification>,
+        node_requests: UnboundedReceiver<NodeRequest>,
         address_id: usize,
         feeler: bool,
+        actor_receiver: UnboundedReceiver<ReaderMessage>,
+        writer: WriteHalf<TcpStream>,
     ) {
         let peer = Peer {
             address_id,
@@ -493,7 +605,6 @@ impl<T: Transport> Peer<T> {
             network,
             node_tx,
             services: ServiceFlags::NONE,
-            stream,
             messages: 0,
             start_time: Instant::now(),
             user_agent: "".into(),
@@ -503,57 +614,13 @@ impl<T: Transport> Peer<T> {
             feeler,
             wants_addrv2: false,
             shutdown: false,
+            actor_receiver, // Add the receiver for messages from TcpStreamActor
+            writer,
         };
+
         spawn(peer.read_loop());
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_outbound_connection<A: ToSocketAddrs + Debug>(
-        id: u32,
-        address: A,
-        mempool: Arc<RwLock<Mempool>>,
-        network: Network,
-        node_tx: Sender<NodeNotification>,
-        node_requests: Receiver<NodeRequest>,
-        address_id: usize,
-        feeler: bool,
-    ) {
-        let stream =
-            async_std::future::timeout(Duration::from_secs(10), TcpStream::connect(address)).await;
-        let Ok(Ok(stream)) = stream else {
-            let _ = node_tx
-                .send(NodeNotification::FromPeer(
-                    id,
-                    PeerMessages::Disconnected(id as usize),
-                ))
-                .await;
-            return;
-        };
-        stream.set_nodelay(true).unwrap();
-        let peer = Peer {
-            address_id,
-            blocks_only: false,
-            current_best_block: -1,
-            id,
-            mempool,
-            last_ping: None,
-            last_message: Instant::now(),
-            network,
-            node_tx,
-            services: ServiceFlags::NONE,
-            stream,
-            messages: 0,
-            start_time: Instant::now(),
-            user_agent: "".into(),
-            state: State::None,
-            send_headers: false,
-            node_requests,
-            feeler,
-            wants_addrv2: false,
-            shutdown: false,
-        };
-        spawn(peer.read_loop());
-    }
     async fn handle_ping(&mut self, nonce: u64) -> Result<()> {
         let pong = make_pong(nonce);
         self.write(pong).await
@@ -573,7 +640,7 @@ impl<T: Transport> Peer<T> {
     }
     async fn send_to_node(&self, message: PeerMessages) {
         let message = NodeNotification::FromPeer(self.id, message);
-        let _ = self.node_tx.send(message).await;
+        let _ = self.node_tx.send(message);
     }
 }
 pub(super) mod peer_utils {
@@ -678,4 +745,9 @@ pub enum PeerMessages {
     Transaction(Transaction),
     UtreexoState(Vec<u8>),
     BlockFilter((BlockHash, floresta_compact_filters::BlockFilter)),
+}
+
+pub enum PeerMessage {
+    Block(UtreexoBlock),
+    Message(RawNetworkMessage),
 }

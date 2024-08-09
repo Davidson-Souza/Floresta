@@ -24,6 +24,7 @@ pub use p2p_wire::node;
 pub use p2p_wire::node_context;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::node_interface;
+pub use p2p_wire::peer;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::running_node;
 pub use p2p_wire::UtreexoNodeConfig;

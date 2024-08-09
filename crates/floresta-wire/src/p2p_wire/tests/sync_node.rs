@@ -5,8 +5,6 @@ mod tests_utils {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use async_std::future;
-    use async_std::sync::RwLock;
     use bitcoin::block::Header;
     use bitcoin::BlockHash;
     use floresta_chain::pruned_utreexo::UpdatableChainstate;
@@ -14,6 +12,8 @@ mod tests_utils {
     use floresta_chain::ChainState;
     use floresta_chain::KvChainStore;
     use floresta_chain::UtreexoBlock;
+    use tokio::sync::RwLock;
+    use tokio::time::timeout;
 
     use crate::mempool::Mempool;
     use crate::node::UtreexoNode;
@@ -55,7 +55,7 @@ mod tests_utils {
         );
 
         for (i, peer) in peers.into_iter().enumerate() {
-            let (sender, receiver) = async_std::channel::bounded(10);
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
             let peer = create_peer(
                 peer.0,
                 peer.1,
@@ -74,11 +74,11 @@ mod tests_utils {
 
         let kill_signal = Arc::new(RwLock::new(false));
         // FIXME: This doesn't look very safe, but we need to coerce a &mut reference of the node
-        //        to live for the static lifetime, or it can't be spawn-ed by async-std::task
+        //        to live for the static lifetime, or it can't be spawn-ed by tokio::task
         let _node: &'static mut UtreexoNode<SyncNode, Arc<ChainState<KvChainStore>>> =
             unsafe { std::mem::transmute(&mut **node) };
 
-        future::timeout(Duration::from_secs(10), _node.run(kill_signal, |_| {}))
+        timeout(Duration::from_secs(10), _node.run(kill_signal, |_| {}))
             .await
             .unwrap();
 
@@ -96,7 +96,7 @@ mod tests {
     use crate::p2p_wire::tests::sync_node::tests_utils::setup_node;
     use crate::p2p_wire::tests::utils::get_essentials;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_sync_valid_blocks() {
         let (headers, blocks, _, _, _) = get_essentials();
         let chain = setup_node(
@@ -111,7 +111,7 @@ mod tests {
         assert_eq!(chain.is_in_idb(), false);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_sync_invalid_block() {
         // 7th BLOCK IS SET AS INVALID. WHILE CONNECTING THE BLOCKS, 7th BLOCK WILL BE INVALIDATED.
         // HENCE THE CHAIN WILL HAVE A HEIGHT OF 6.
@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(chain.is_in_idb(), false);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_sync_block_without_udata() {
         // THIS SIMUATION WILL TEST 2 THINGS:
         //

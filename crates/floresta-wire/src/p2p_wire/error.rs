@@ -11,7 +11,7 @@ pub enum WireError {
     #[error("Blockchain error")]
     Blockchain(BlockchainError),
     #[error("Error while writing into a channel")]
-    ChannelSend(async_std::channel::SendError<NodeRequest>),
+    ChannelSend(tokio::sync::mpsc::error::SendError<NodeRequest>),
     #[error("Peer error")]
     PeerError(PeerError),
     #[error("Coinbase didn't mature")]
@@ -23,7 +23,7 @@ pub enum WireError {
     #[error("Our peer is misbehaving")]
     PeerMisbehaving,
     #[error("Error while reading from a channel")]
-    ChannelRecv(#[from] async_std::channel::RecvError),
+    ChannelRecv(#[from] tokio::sync::mpsc::error::RecvError),
     #[error("Generic io error")]
     Io(std::io::Error),
     #[error("We don't have any utreexo peers")]

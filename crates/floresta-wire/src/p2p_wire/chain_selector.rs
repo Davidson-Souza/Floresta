@@ -49,8 +49,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use async_std::future::timeout;
-use async_std::sync::RwLock;
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 use bitcoin::p2p::ServiceFlags;
@@ -62,6 +60,8 @@ use log::info;
 use log::warn;
 use rustreexo::accumulator::node_hash::NodeHash;
 use rustreexo::accumulator::stump::Stump;
+use tokio::sync::RwLock;
+use tokio::time::timeout;
 
 use super::error::WireError;
 use super::peer::PeerMessages;
@@ -217,7 +217,7 @@ where
         let mut peer1_version = None;
         let mut peer2_version = None;
         for _ in 0..2 {
-            if let Ok(Ok(NodeNotification::FromPeer(peer, PeerMessages::UtreexoState(state)))) =
+            if let Ok(Some(NodeNotification::FromPeer(peer, PeerMessages::UtreexoState(state)))) =
                 timeout(Duration::from_secs(60), self.node_rx.recv()).await
             {
                 if peer == peer1 {
@@ -510,7 +510,7 @@ where
 
         let timeout = Instant::now() + Duration::from_secs(60);
         let block = loop {
-            let Ok(NodeNotification::FromPeer(_, PeerMessages::Block(block))) =
+            let Some(NodeNotification::FromPeer(_, PeerMessages::Block(block))) =
                 self.node_rx.recv().await
             else {
                 if Instant::now() > timeout {
@@ -729,7 +729,7 @@ where
                 break;
             }
 
-            if let Ok(Ok(message)) = timeout(Duration::from_secs(60), self.node_rx.recv()).await {
+            if let Ok(Some(message)) = timeout(Duration::from_secs(60), self.node_rx.recv()).await {
                 match message {
                     NodeNotification::FromPeer(peer, message) => {
                         if let PeerMessages::UtreexoState(state) = message {
@@ -770,10 +770,10 @@ where
 
     async fn handle_notification(
         &mut self,
-        notification: Result<NodeNotification, async_std::channel::RecvError>,
+        notification: Option<NodeNotification>,
     ) -> Result<(), WireError> {
-        match notification? {
-            NodeNotification::FromPeer(peer, message) => match message {
+        match notification {
+            Some(NodeNotification::FromPeer(peer, message)) => match message {
                 PeerMessages::Headers(headers) => {
                     self.inflight.remove(&InflightRequests::Headers);
                     return self.handle_headers(peer, headers).await;
@@ -798,6 +798,8 @@ where
 
                 _ => {}
             },
+
+            None => {}
         }
         Ok(())
     }

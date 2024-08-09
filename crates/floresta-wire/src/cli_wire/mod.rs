@@ -279,7 +279,7 @@ impl UtreexodBackend {
         }
         self.chainstate.toggle_ibd(false);
         loop {
-            async_std::task::sleep(Duration::from_secs(1)).await;
+            std::thread::sleep(Duration::from_secs(1)).await;
             if self.is_shutting_down() {
                 info!("Shuting blockchain down");
                 try_and_log!(self.chainstate.flush());

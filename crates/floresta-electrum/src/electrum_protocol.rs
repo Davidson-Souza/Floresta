@@ -2,14 +2,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use async_std::channel::unbounded;
-use async_std::channel::Receiver;
-use async_std::channel::Sender;
-use async_std::io::BufReader;
-use async_std::net::TcpListener;
-use async_std::net::TcpStream;
-use async_std::prelude::*;
-use async_std::sync::RwLock;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::hex::FromHex;
@@ -34,6 +26,15 @@ use log::info;
 use log::trace;
 use serde_json::json;
 use serde_json::Value;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::RwLock;
 
 use crate::get_arg;
 use crate::json_rpc_res;
@@ -42,29 +43,104 @@ use crate::request::Request;
 /// Type alias for u32 representing a ClientId
 type ClientId = u32;
 
+pub enum SenderMessage {
+    Write(Vec<u8>),
+    Shutdown,
+}
+
+struct TcpActor {
+    stream: TcpStream,
+    receiver: UnboundedReceiver<SenderMessage>,
+    message_transmitter: UnboundedSender<Message>,
+    client_id: ClientId,
+}
+
+impl TcpActor {
+    async fn run(&mut self) {
+        let (reader, mut writer) = tokio::io::split(&mut self.stream);
+        let mut lines = BufReader::new(reader).lines();
+
+        loop {
+            tokio::select! {
+                Some(message) = self.receiver.recv() => {
+                    match message {
+                        SenderMessage::Write(data) => {
+                            if let Err(e) = writer.write_all(&data).await {
+                                error!("Error writing to client: {:?}", e);
+                                break;
+                            }
+                        }
+                        SenderMessage::Shutdown => {
+                            break;
+                        }
+                    }
+                }
+                result = lines.next_line() => {
+                    match result {
+                        Ok(Some(line)) => {
+                            self.message_transmitter
+                                .send(Message::Message((self.client_id, line)))
+                                .expect("Main loop is broken");
+                        }
+                        Ok(None) => {
+                            info!("Client closed connection: {}", self.client_id);
+                            self.message_transmitter
+                                .send(Message::Disconnect(self.client_id))
+                                .expect("Main loop is broken");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Error reading from client: {:?}", e);
+                            self.message_transmitter
+                                .send(Message::Disconnect(self.client_id))
+                                .expect("Main loop is broken");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A client connected to the server
 #[derive(Debug, Clone)]
 pub struct Client {
     client_id: ClientId,
     _addresses: HashSet<ScriptBuf>,
-    stream: Arc<TcpStream>,
+    sender: UnboundedSender<SenderMessage>,
 }
 
 impl Client {
     /// Send a message to the client, should be a serialized JSON
     pub async fn write(&self, data: &[u8]) -> Result<(), std::io::Error> {
-        let mut stream = self.stream.as_ref();
-        let _ = stream.write(data).await;
-        let _ = stream.write('\n'.to_string().as_bytes()).await;
+        let _ = self.sender.send(SenderMessage::Write(data.to_vec()));
+        let _ = self
+            .sender
+            .send(SenderMessage::Write("\n".to_string().as_bytes().to_vec()));
 
         Ok(())
     }
     /// Create a new client from a stream
-    pub fn new(client_id: ClientId, stream: Arc<TcpStream>) -> Self {
+    pub fn new(
+        client_id: ClientId,
+        stream: TcpStream,
+        message_transmitter: UnboundedSender<Message>,
+    ) -> Self {
+        let (sender, receiver) = unbounded_channel();
+        let mut actor = TcpActor {
+            stream,
+            receiver,
+            message_transmitter,
+            client_id,
+        };
+        tokio::spawn(async move {
+            actor.run().await;
+        });
         Client {
             client_id,
             _addresses: HashSet::new(),
-            stream,
+            sender,
         }
     }
 }
@@ -91,10 +167,10 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
     /// using a unique id.
     pub clients: HashMap<ClientId, Arc<Client>>,
     /// The message_receiver receive messages and handles them.
-    pub message_receiver: Receiver<Message>,
+    pub message_receiver: UnboundedReceiver<Message>,
     /// The message_transmitter is used to send requests from clients or notifications
     /// like new or dropped clients
-    pub message_transmitter: Sender<Message>,
+    pub message_transmitter: UnboundedSender<Message>,
     /// The client_addresses is used to keep track of the addresses of each client.
     /// We keep the script_hash and which client has it, so we can notify the
     /// clients when a new transaction is received.
@@ -123,7 +199,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         node_interface: Arc<NodeInterface>,
     ) -> Result<ElectrumServer<Blockchain>, Box<dyn std::error::Error>> {
         let listener = Arc::new(TcpListener::bind(address).await?);
-        let (tx, rx) = unbounded();
+        let (tx, rx) = unbounded_channel();
         let unconfirmed = address_cache.read().await.find_unconfirmed().unwrap();
         for tx in unconfirmed {
             chain.broadcast(&tx).expect("Invalid chain");
@@ -469,15 +545,14 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             for (block, height) in blocks.recv() {
                 self.handle_block(block, height).await;
             }
-
             // handles client requests
-            while let Ok(request) = async_std::future::timeout(
+            while let Ok(request) = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
                 self.message_receiver.recv(),
             )
             .await
             {
-                if let Ok(message) = request {
+                if let Some(message) = request {
                     self.handle_message(message).await?;
                 }
             }
@@ -753,46 +828,46 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
 }
 
 /// Each client gets one loop to deal with their requests
-async fn client_broker_loop(
-    client: Arc<Client>,
-    message_transmitter: Sender<Message>,
-) -> Result<(), std::io::Error> {
-    let mut _stream = &*client.stream;
-    let mut lines = BufReader::new(_stream).lines();
+// async fn client_broker_loop(
+//     client: Arc<Client>,
+//     message_transmitter: UnboundedSender<Message>,
+// ) -> Result<(), std::io::Error> {
+//     let mut _stream = &*client.stream;
+//     let mut lines = BufReader::new(_stream).lines();
 
-    while let Some(Ok(line)) = lines.next().await {
-        message_transmitter
-            .send(Message::Message((client.client_id, line)))
-            .await
-            .expect("Main loop is broken");
-    }
+//     while let Some(Ok(line)) = lines.next().await {
+//         message_transmitter
+//             .send(Message::Message((client.client_id, line)))
+//             .expect("Main loop is broken");
+//     }
 
-    info!("Lost client with ID: {}", client.client_id);
+//     info!("Lost client with ID: {}", client.client_id);
 
-    message_transmitter
-        .send(Message::Disconnect(client.client_id))
-        .await
-        .expect("Main loop is broken");
+//     message_transmitter
+//         .send(Message::Disconnect(client.client_id))
+//         .expect("Main loop is broken");
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 /// Listens to new TCP connections in a loop
-pub async fn client_accept_loop(listener: Arc<TcpListener>, message_transmitter: Sender<Message>) {
+pub async fn client_accept_loop(
+    listener: Arc<TcpListener>,
+    message_transmitter: UnboundedSender<Message>,
+) {
     let mut id_count = 0;
     loop {
         if let Ok((stream, _addr)) = listener.accept().await {
             info!("New client connection");
-            let stream = Arc::new(stream);
-            let client = Arc::new(Client::new(id_count, stream));
-            async_std::task::spawn(client_broker_loop(
-                client.clone(),
-                message_transmitter.clone(),
-            ));
+            // let stream = Arc::new(stream);
+            let client = Arc::new(Client::new(id_count, stream, message_transmitter.clone()));
+            // tokio::task::spawn(client_broker_loop(
+            //     client.clone(),
+            //     message_transmitter.clone(),
+            // ));
 
             message_transmitter
                 .send(Message::NewClient((client.client_id, client)))
-                .await
                 .expect("Main loop is broken");
             id_count += 1;
         }
@@ -872,13 +947,6 @@ mod test {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use async_std::future;
-    use async_std::io::ReadExt;
-    use async_std::io::WriteExt;
-    use async_std::net::TcpStream;
-    use async_std::sync::RwLock;
-    use async_std::task::block_on;
-    use async_std::task::{self};
     use bitcoin::address::NetworkUnchecked;
     use bitcoin::block::Header as BlockHeader;
     use bitcoin::consensus::deserialize;
@@ -899,9 +967,15 @@ mod test {
     use floresta_wire::node::UtreexoNode;
     use floresta_wire::running_node::RunningNode;
     use floresta_wire::UtreexoNodeConfig;
+    use futures::executor::block_on;
     use serde_json::json;
     use serde_json::Number;
     use serde_json::Value;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use tokio::task::{self};
+    use tokio::time::timeout;
 
     use super::client_accept_loop;
     use super::ElectrumServer;
@@ -934,7 +1008,7 @@ mod test {
 
         headers
     }
-    fn get_test_cache() -> Arc<RwLock<AddressCache<KvDatabase>>> {
+    fn get_test_cache() -> Arc<tokio::sync::RwLock<AddressCache<KvDatabase>>> {
         let test_id: u32 = rand::random();
         let cache = KvDatabase::new(format!("./data/{test_id}.floresta")).unwrap();
         let mut cache = AddressCache::new(cache);
@@ -952,7 +1026,7 @@ mod test {
             get_spk_hash(&transaction.output[0].script_pubkey),
         );
 
-        let cache = Arc::new(RwLock::new(cache));
+        let cache = Arc::new(tokio::sync::RwLock::new(cache));
         cache
     }
 
@@ -972,7 +1046,7 @@ mod test {
         let mut response = vec![0u8; 100000000];
         let timeout_duration = Duration::from_secs(10);
 
-        let read_result = future::timeout(timeout_duration, stream.read(&mut response)).await;
+        let read_result = timeout(timeout_duration, stream.read(&mut response)).await;
         match read_result {
             Ok(Ok(0)) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -1025,7 +1099,7 @@ mod test {
             UtreexoNode::new(
                 u_config,
                 chain.clone(),
-                Arc::new(async_std::sync::RwLock::new(Mempool::new())),
+                Arc::new(tokio::sync::RwLock::new(Mempool::new())),
                 None,
             );
 
@@ -1112,7 +1186,7 @@ mod test {
     }
 
     /// SENDING MULTIPLE REQUESTS TO THE SERVER AT THE SAME TIME
-    #[async_std::test]
+    #[tokio::test]
     async fn test_blockchain_headers() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1148,7 +1222,7 @@ mod test {
         assert!(send_request(batch_req, port).await.is_ok());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_server_banner() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1160,7 +1234,7 @@ mod test {
         assert!(send_request(request, port).await.is_ok())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_estimate_fee() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1189,7 +1263,7 @@ mod test {
         assert_eq!(batch_response[1]["result"], 0.00001);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_scripthash_subscribe() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1222,7 +1296,7 @@ mod test {
             .unwrap());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_scripthash_txs() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1263,7 +1337,7 @@ mod test {
         )
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_transactions() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;
@@ -1314,7 +1388,7 @@ mod test {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_server_info() {
         let port = rand::random::<u16>() % 1000 + 18443;
         start_electrum(port).await;

@@ -6,9 +6,6 @@ use std::io::Read;
 use std::str::FromStr;
 use std::time::Instant;
 
-use async_std::channel::Receiver;
-use async_std::channel::Sender;
-use async_std::task;
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::Decodable;
@@ -21,6 +18,9 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::task;
 use zstd;
 
 use crate::node::LocalPeerView;
@@ -42,23 +42,23 @@ struct Block {
     block: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TestPeer {
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, UtreexoBlock>,
     filters: HashMap<BlockHash, Vec<u8>>,
-    node_tx: Sender<NodeNotification>,
-    node_rx: Receiver<NodeRequest>,
+    node_tx: UnboundedSender<NodeNotification>,
+    node_rx: UnboundedReceiver<NodeRequest>,
     peer_id: u32,
 }
 
 impl TestPeer {
     pub fn new(
-        node_tx: Sender<NodeNotification>,
+        node_tx: UnboundedSender<NodeNotification>,
         headers: Vec<Header>,
         blocks: HashMap<BlockHash, UtreexoBlock>,
         filters: HashMap<BlockHash, Vec<u8>>,
-        node_rx: Receiver<NodeRequest>,
+        node_rx: UnboundedReceiver<NodeRequest>,
         peer_id: u32,
     ) -> Self {
         TestPeer {
@@ -71,7 +71,7 @@ impl TestPeer {
         }
     }
 
-    pub async fn run(self) {
+    pub async fn run(&mut self) {
         let version = Version {
             user_agent: "node_test".to_string(),
             protocol_version: 0,
@@ -91,7 +91,6 @@ impl TestPeer {
                 self.peer_id,
                 PeerMessages::Ready(version),
             ))
-            .await
             .unwrap();
 
         loop {
@@ -106,7 +105,6 @@ impl TestPeer {
                                 self.peer_id,
                                 PeerMessages::Block(block),
                             ))
-                            .await
                             .unwrap();
                     }
                 }
@@ -122,7 +120,6 @@ impl TestPeer {
                 self.peer_id,
                 PeerMessages::Disconnected(self.peer_id as usize),
             ))
-            .await
             .unwrap();
     }
 }
@@ -131,13 +128,15 @@ pub fn create_peer(
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, UtreexoBlock>,
     filters: HashMap<BlockHash, Vec<u8>>,
-    node_sender: Sender<NodeNotification>,
-    sender: Sender<NodeRequest>,
-    node_rcv: Receiver<NodeRequest>,
+    node_sender: UnboundedSender<NodeNotification>,
+    sender: UnboundedSender<NodeRequest>,
+    node_rcv: UnboundedReceiver<NodeRequest>,
     peer_id: u32,
 ) -> LocalPeerView {
-    let peer = TestPeer::new(node_sender, headers, blocks, filters, node_rcv, peer_id);
-    task::spawn(peer.run());
+    let mut peer = TestPeer::new(node_sender, headers, blocks, filters, node_rcv, peer_id);
+    task::spawn(async move {
+        peer.run().await;
+    });
 
     LocalPeerView {
         address: "127.0.0.1".parse().unwrap(),
