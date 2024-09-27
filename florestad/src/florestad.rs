@@ -1,8 +1,5 @@
 use core::panic;
 use std::fmt::Arguments;
-use std::fs::File;
-use std::io;
-use std::io::BufReader;
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
@@ -40,11 +37,24 @@ use log::Record;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task;
-use tokio_rustls::rustls::internal::pemfile::certs;
-use tokio_rustls::rustls::internal::pemfile::pkcs8_private_keys;
-use tokio_rustls::rustls::NoClientAuth;
-use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::TlsAcceptor;
+
+#[cfg(feature = "electrum-tls")]
+mod tls {
+    pub use std::fs::File;
+    pub use std::io;
+    pub use std::io::BufReader;
+
+    pub use tokio_rustls::rustls::pki_types::CertificateDer;
+    pub use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+    pub use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
+    pub use tokio_rustls::rustls::server::NoClientAuth;
+    pub use tokio_rustls::rustls::server::ParsedCertificate;
+    pub use tokio_rustls::rustls::ServerConfig;
+    pub use tokio_rustls::TlsAcceptor;
+}
+
+#[cfg(feature = "electrum-tls")]
+use tls::*;
 
 use crate::config_file::ConfigFile;
 #[cfg(feature = "json-rpc")]
@@ -413,6 +423,7 @@ impl Florestad {
             .clone()
             .unwrap_or("0.0.0.0:50001".into());
 
+        #[cfg(feature = "electrum-tls")]
         let ssl_electrum_address = self
             .config
             .ssl_electrum_address
@@ -420,8 +431,10 @@ impl Florestad {
             .unwrap_or("0.0.0.0:50002".into());
 
         // Load TLS configuration if needed
+
+        #[cfg(feature = "electrum-tls")]
         let tls_config = if !self.config.no_ssl {
-            match self.create_tls_config(&data_dir) {
+            match self.create_tls_config(data_dir) {
                 Ok(config) => Some(config),
                 Err(_) => {
                     error!("Failed to load SSL certificates, ignoring SSL");
@@ -432,6 +445,7 @@ impl Florestad {
             None
         };
 
+        #[cfg(feature = "electrum-tls")]
         let tls_acceptor = tls_config.map(TlsAcceptor::from);
 
         let electrum_server = block_on(ElectrumServer::new(
@@ -447,13 +461,17 @@ impl Florestad {
         // Non-TLS Electrum accept loop
         let non_tls_listener =
             Arc::new(block_on(TcpListener::bind(electrum_address.clone())).unwrap());
+        
         task::spawn(client_accept_loop(
             non_tls_listener,
             electrum_server.message_transmitter.clone(),
+            #[cfg(feature = "electrum-tls")]
             None,
         ));
 
         // TLS Electrum accept loop
+
+        #[cfg(feature = "electrum-tls")]
         if let Some(tls_acceptor) = tls_acceptor {
             let tls_listener =
                 Arc::new(block_on(TcpListener::bind(ssl_electrum_address.clone())).unwrap());
@@ -468,6 +486,7 @@ impl Florestad {
         task::spawn(electrum_server.main_loop());
         info!("Server running on: {}", electrum_address);
 
+        #[cfg(feature = "electrum-tls")]
         if !self.config.no_ssl {
             info!("TLS server running on: 0.0.0.0:50002");
         }
@@ -665,24 +684,33 @@ impl Florestad {
         result
     }
 
-    fn create_tls_config(&self, data_dir: &String) -> io::Result<Arc<ServerConfig>> {
+    #[cfg(feature = "electrum-tls")]
+    fn create_tls_config(&self, data_dir: String) -> io::Result<Arc<ServerConfig>> {
         let cert_path = self
             .config
             .ssl_cert_path
             .clone()
-            .unwrap_or_else(|| (data_dir.clone() + "ssl/cert.pem"));
+            .unwrap_or_else(|| format!("{data_dir}/ssl/cert.pem"));
+
         let key_path = self
             .config
             .ssl_cert_path
             .clone()
-            .unwrap_or_else(|| (data_dir.clone() + "ssl/key.pem"));
+            .unwrap_or_else(|| format!("{data_dir}/ssl/key.pem"));
 
-        let cert_file = File::open(cert_path)?;
-        let key_file = File::open(key_path)?;
-        let cert_chain = certs(&mut BufReader::new(cert_file)).unwrap();
-        let mut keys = pkcs8_private_keys(&mut BufReader::new(key_file)).unwrap();
-        let mut config = ServerConfig::new(Arc::new(NoClientAuth));
-        config.set_single_cert(cert_chain, keys.remove(0)).unwrap();
+        let cert_file = std::fs::read(cert_path)?;
+        let key_file = std::fs::read(key_path)?;
+
+        let cert = CertificateDer::try_from(cert_file).unwrap();
+        let cert_chain = vec![cert];
+
+        let key = PrivatePkcs8KeyDer::try_from(key_file).unwrap();
+        let key_der = PrivateKeyDer::Pkcs8(key);
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key_der)
+            .expect("Could not create TLS config");
+
         Ok(Arc::new(config))
     }
 }

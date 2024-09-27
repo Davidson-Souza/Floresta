@@ -35,6 +35,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+#[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
 use crate::get_arg;
@@ -785,6 +786,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
     }
 }
 
+#[cfg(feature = "tls")]
 /// Listens to new TCP connections in a loop
 pub async fn client_accept_loop(
     listener: Arc<TcpListener>,
@@ -820,6 +822,26 @@ pub async fn client_accept_loop(
                     .expect("Main loop is broken");
                 id_count += 1;
             }
+        }
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+/// Listens to new TCP connections in a loop
+pub async fn client_accept_loop(
+    listener: Arc<TcpListener>,
+    message_transmitter: UnboundedSender<Message>,
+) {
+    let mut id_count = 0;
+    loop {
+        if let Ok((stream, _addr)) = listener.accept().await {
+            info!("New client connection");
+            let message_transmitter = message_transmitter.clone();
+            let client = Arc::new(Client::new(id_count, stream, message_transmitter.clone()));
+            message_transmitter
+                .send(Message::NewClient((client.client_id, client)))
+                .expect("Main loop is broken");
+            id_count += 1;
         }
     }
 }

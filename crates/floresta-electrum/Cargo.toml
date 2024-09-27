@@ -20,11 +20,10 @@ floresta-chain = { path = "../floresta-chain" }
 floresta-watch-only = { path = "../floresta-watch-only" }
 floresta-compact-filters = { path = "../floresta-compact-filters" }
 floresta-wire = { path = "../floresta-wire" }
-
 rustreexo = "0.3.0"
 sha2 = "^0.10.6"
 tokio = { version = "1.0", features = ["full"] }
-tokio-rustls = "0.22"
+tokio-rustls = { version = "0.26", optional = true }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -35,6 +34,10 @@ toml = "0.5.10"
 bitcoin = { version = "0.31", features = ["serde", "std", "bitcoinconsensus"] }
 thiserror = "1.0"
 core2 = { version = "0.4.0", default-features = false }
+
+[features]
+default = ["tls"]
+tls = ["tokio-rustls"]
 
 [dev-dependencies]
 rand = "0.8.5"

@@ -29,7 +29,7 @@ floresta-wire = { path = "../floresta-wire", version = "0.2.0" }
 floresta-watch-only = { path = "../floresta-watch-only", features = [
     "memory-database",
 ], optional = true, version = "0.2.0" }
-floresta-electrum = { path = "../floresta-electrum", optional = true, version = "0.2.0" }
+floresta-electrum = { path = "../floresta-electrum", optional = true, version = "0.2.0", default-features = false }
 
 [dev-dependencies]
 rustreexo = "0.3.0"
@@ -50,11 +50,12 @@ floresta = { version = "0.2.0", path = "../floresta", features = [
 futures = "0.3.30"
 
 [features]
-default = ["bitcoinconsensus", "electrum-server", "watch-only-wallet"]
+default = ["bitcoinconsensus", "watch-only-wallet"]
 bitcoinconsensus = ["floresta-chain/bitcoinconsensus"]
 memory-database = ["floresta-watch-only/memory-database"]
 electrum-server = ["floresta-electrum"]
 watch-only-wallet = ["floresta-watch-only"]
+electrum-tls = ["floresta-electrum", "floresta-electrum/tls"]
 
 [lib]
 crate-type = ["cdylib", "rlib", "staticlib"]
