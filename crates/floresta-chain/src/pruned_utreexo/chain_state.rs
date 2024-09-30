@@ -28,6 +28,7 @@ use bitcoin::Transaction;
 use bitcoin::TxOut;
 use bitcoin::Work;
 use floresta_common::Channel;
+use log::debug;
 use log::info;
 use log::trace;
 use log::warn;
@@ -39,7 +40,6 @@ use spin::RwLock;
 use super::chain_state_builder::ChainStateBuilder;
 use super::chainparams::ChainParams;
 use super::chainstore::DiskBlockHeader;
-use super::chainstore::KvChainStore;
 use super::consensus::Consensus;
 use super::error::BlockValidationErrors;
 use super::error::BlockchainError;
@@ -558,10 +558,10 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         }
     }
     pub fn load_chain_state(
-        chainstore: KvChainStore,
+        chainstore: PersistedState,
         network: Network,
         assume_valid: AssumeValidArg,
-    ) -> Result<ChainState<KvChainStore>, BlockchainError> {
+    ) -> Result<ChainState<PersistedState>, BlockchainError> {
         let acc = Self::load_acc(&chainstore);
 
         let best_chain = chainstore.load_height()?;
@@ -755,6 +755,10 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
 impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedState> {
     type Error = BlockchainError;
+
+    fn acc(&self) -> Stump {
+        read_lock!(self).acc.to_owned()
+    }
 
     fn get_fork_point(&self, block: BlockHash) -> Result<BlockHash, Self::Error> {
         let fork_point = self.find_fork_point(&self.get_block_header(&block)?)?;
@@ -1084,7 +1088,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
     }
 
     fn accept_header(&self, header: BlockHeader) -> Result<(), BlockchainError> {
-        trace!("Accepting header {header:?}");
+        debug!("Accepting header {header:?}");
         let disk_header = self.get_disk_block_header(&header.block_hash());
 
         match disk_header {
@@ -1110,7 +1114,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         // Update our current tip
         if header.prev_blockhash == best_block.1 {
             let height = best_block.0 + 1;
-            trace!("Header builds on top of our best chain");
+            debug!("Header builds on top of our best chain");
 
             let mut inner = write_lock!(self);
             inner.best_block.new_block(block_hash, height);
@@ -1206,23 +1210,24 @@ macro_rules! write_lock {
     };
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Internal representation of the chain we are in
 pub struct BestChain {
     /// Hash of the last block in the chain we believe has more work on
-    best_block: BlockHash,
+    pub best_block: BlockHash,
     /// How many blocks are pilled on this chain?
-    depth: u32,
+    pub depth: u32,
     /// We actually validated blocks up to this point
-    validation_index: BlockHash,
+    pub validation_index: BlockHash,
     /// Blockchains are not fast-forward only, they might have "forks", sometimes it's useful
     /// to keep track of them, in case they become the best one. This keeps track of some
     /// tips we know about, but are not the best one. We don't keep tips that are too deep
     /// or has too little work if compared to our best one
-    alternative_tips: Vec<BlockHash>,
+    pub alternative_tips: Vec<BlockHash>,
     /// Saves the height occupied by the assume valid block
-    assume_valid_index: u32,
+    pub assume_valid_index: u32,
 }
+
 impl BestChain {
     fn new_block(&mut self, block_hash: BlockHash, height: u32) {
         self.best_block = block_hash;

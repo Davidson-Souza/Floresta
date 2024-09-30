@@ -21,7 +21,6 @@ pub use floresta_chain::AssumeUtreexoValue;
 use floresta_chain::AssumeValidArg;
 use floresta_chain::BlockchainError;
 use floresta_chain::ChainState;
-use floresta_chain::KvChainStore;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 use floresta_compact_filters::network_filters::NetworkFilters;
 use floresta_electrum::electrum_protocol::client_accept_loop;
@@ -594,18 +593,24 @@ impl Florestad {
         data_dir: String,
         network: Network,
         assume_valid: Option<bitcoin::BlockHash>,
-    ) -> ChainState<KvChainStore<'static>> {
-        let db = KvChainStore::new(data_dir.to_string()).expect("Could not read db");
+    ) -> ChainState<FlatChainStore> {
         let assume_valid =
             assume_valid.map_or(AssumeValidArg::Hardcoded, AssumeValidArg::UserInput);
+        let config = FlatChainStoreConfig {
+            _file_permission: 0666,
+            path: data_dir + "/chaindata",
+            headers_file_map_size: 1_000_000_000,
+            index_mmap_size: 1_000_000_000,
+            _cache_size: 1,
+        };
 
-        match ChainState::<KvChainStore>::load_chain_state(db, network.into(), assume_valid) {
+        let db = FlatChainStore::new(config.clone()).expect("failure while creating chainstate");
+        match ChainState::<FlatChainStore>::load_chain_state(db, network.into(), assume_valid) {
             Ok(chainstate) => chainstate,
             Err(err) => match err {
                 BlockchainError::ChainNotInitialized => {
-                    let db = KvChainStore::new(data_dir.to_string()).expect("Could not read db");
-
-                    ChainState::<KvChainStore>::new(db, network.into(), assume_valid)
+                    let db = FlatChainStore::new(config).unwrap();
+                    ChainState::<FlatChainStore>::new(db, network.into(), assume_valid)
                 }
                 _ => unreachable!(),
             },

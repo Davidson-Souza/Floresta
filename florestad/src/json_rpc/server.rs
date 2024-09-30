@@ -19,8 +19,6 @@ use bitcoin::TxOut;
 use bitcoin::Txid;
 use floresta_chain::pruned_utreexo::BlockchainInterface;
 use floresta_chain::pruned_utreexo::UpdatableChainstate;
-use floresta_chain::ChainState;
-use floresta_chain::KvChainStore;
 use floresta_common::parse_descriptors;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 use floresta_compact_filters::network_filters::NetworkFilters;
@@ -86,16 +84,26 @@ pub trait Rpc {
     fn add_node(&self, node: String) -> Result<bool>;
 }
 
-pub struct RpcImpl {
+pub struct RpcImpl<Chain: BlockchainInterface + UpdatableChainstate + Clone + Send + Sync + 'static>
+{
     block_filter_storage: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
     network: Network,
-    chain: Arc<ChainState<KvChainStore<'static>>>,
+    chain: Chain,
     wallet: Arc<AddressCache<KvDatabase>>,
     node: Arc<NodeInterface>,
     kill_signal: Arc<RwLock<bool>>,
 }
 
-impl Rpc for RpcImpl {
+impl<
+        Chain: BlockchainInterface
+            + UpdatableChainstate
+            + UpdatableChainstate
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    > Rpc for RpcImpl<Chain>
+{
     fn get_tx_out(&self, txid: Txid, outpoint: u32) -> Result<Value> {
         let utxo = self.wallet.get_utxo(&OutPoint {
             txid,
@@ -490,10 +498,12 @@ impl Rpc for RpcImpl {
     }
 }
 
-impl RpcImpl {
+impl<Chain: BlockchainInterface + UpdatableChainstate + Send + Sync + Clone + 'static>
+    RpcImpl<Chain>
+{
     fn rescan_with_block_filters(
         addresses: &[ScriptBuf],
-        chain: Arc<ChainState<KvChainStore<'static>>>,
+        chain: Chain,
         wallet: Arc<AddressCache<KvDatabase>>,
         cfilters: Arc<NetworkFilters<FlatFiltersStore>>,
         node: Arc<NodeInterface>,
@@ -635,7 +645,7 @@ impl RpcImpl {
 
     #[allow(clippy::too_many_arguments)]
     pub fn create(
-        chain: Arc<ChainState<KvChainStore<'static>>>,
+        chain: Chain,
         wallet: Arc<AddressCache<KvDatabase>>,
         node: Arc<NodeInterface>,
         kill_signal: Arc<RwLock<bool>>,

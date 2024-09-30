@@ -6,6 +6,7 @@ pub mod chainparams;
 pub mod chainstore;
 pub mod consensus;
 pub mod error;
+pub mod flat_chain_store;
 pub mod partial_chain;
 pub mod udata;
 
@@ -94,6 +95,7 @@ pub trait BlockchainInterface {
     ) -> Result<(), Self::Error>;
 
     fn get_fork_point(&self, block: BlockHash) -> Result<BlockHash, Self::Error>;
+    fn acc(&self) -> Stump;
 }
 /// [UpdatableChainstate] is a contract that a is expected from a chainstate
 /// implementation, that wishes to be updated. Using those methods, a backend like the p2p-node,
@@ -261,6 +263,10 @@ impl<T: BlockchainInterface> BlockchainInterface for Arc<T> {
 
     fn get_tx(&self, txid: &bitcoin::Txid) -> Result<Option<bitcoin::Transaction>, Self::Error> {
         T::get_tx(self, txid)
+    }
+
+    fn acc(&self) -> Stump {
+        T::acc(self)
     }
 
     fn broadcast(&self, tx: &bitcoin::Transaction) -> Result<(), Self::Error> {

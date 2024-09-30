@@ -10,7 +10,7 @@
 //! All data is stored in a `ChainStore` implementation, which is generic over the
 //! underlying database. See the ChainStore trait for more information. For a
 //! ready-to-use implementation, see the [KvChainStore] struct.
-#![cfg_attr(any(feature = "no-std", not(test)), no_std)]
+#![cfg_attr(all(feature = "no-std", not(test)), no_std)]
 
 pub mod pruned_utreexo;
 pub(crate) use floresta_common::prelude;

@@ -372,6 +372,10 @@ impl UpdatableChainstate for PartialChainState {
 impl BlockchainInterface for PartialChainState {
     type Error = BlockchainError;
 
+    fn acc(&self) -> Stump {
+        self.inner().current_acc.clone()
+    }
+
     fn get_height(&self) -> Result<u32, Self::Error> {
         Ok(self.inner().current_height)
     }

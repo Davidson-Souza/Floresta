@@ -31,6 +31,7 @@ core2 = { version = "0.4.0", default-features = false }
 hashbrown = { version = "0.14.0", optional = true }
 secp256k1 = { version = "*", features = ["alloc"], optional = true }
 floresta-common = { path = "../floresta-common", default-features = false }
+memmap2 = "0.9.5"
 
 [dev-dependencies]
 rand = "0.8.5"
