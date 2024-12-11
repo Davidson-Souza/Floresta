@@ -133,11 +133,16 @@ where
             .map(|(req, (peer, _))| (req.clone(), *peer))
             .collect::<Vec<_>>();
 
-        for (block, peer) in to_remove {
-            self.inflight.remove(&block);
+        for (request, peer) in to_remove {
+            self.inflight.remove(&request);
             try_and_log!(self.increase_banscore(peer, 1).await);
 
-            let InflightRequests::Blocks(block) = block else {
+            if let InflightRequests::Connect(_) = request {
+                try_and_log!(self.send_to_peer(peer, NodeRequest::Shutdown).await);
+                continue;
+            }
+
+            let InflightRequests::Blocks(block) = request else {
                 continue;
             };
             try_and_log!(self.request_blocks(vec![block]).await);
