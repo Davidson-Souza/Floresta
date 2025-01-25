@@ -1,0 +1,126 @@
+name: Fuzz Tests
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_FUZZ_VERSION: 0.11.4
+  APT_CONFIG: |
+    Dir::Cache "./.apt-cache";
+    Dir::Cache::archives "./.apt-cache/archives";
+    Dir::State "./.apt-state";
+    Dir::State::lists "./.apt-state/lists/";
+
+jobs:
+  fuzz:
+    name: Run Fuzzing Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install latest nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      # Calculate cache keys
+      - name: Generate cache keys
+        id: cache-keys
+        run: |
+          YEAR=$(date +%Y)
+          BIWEEK=$(( ($(date +%U) + 1) / 2 ))
+          echo "CACHE_VERSION=${YEAR}(${BIWEEK})" >> $GITHUB_ENV
+          
+          # Hash of all files that could affect the build
+          HASH=$(echo "${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.github/workflows/**') }}")
+          echo "BUILD_HASH=${HASH}" >> $GITHUB_ENV
+          
+          # Hash of apt packages we need
+          APT_PACKAGES="build-essential cmake clang"
+          echo "APT_HASH=$(echo $APT_PACKAGES | sha256sum | cut -d' ' -f1)" >> $GITHUB_ENV
+        shell: bash
+
+      # Restore Rust build cache
+      - name: Restore Rust cache
+        id: cache-rust
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.cargo/bin/cargo-fuzz
+            target/
+            fuzz/target/
+          key: ${{ runner.os }}-cargo-${{ env.CACHE_VERSION }}-${{ env.BUILD_HASH }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.CACHE_VERSION }}-
+            ${{ runner.os }}-cargo-
+
+      # Restore apt packages cache
+      - name: Restore apt cache
+        id: cache-apt
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ./.apt-cache
+            ./.apt-state
+          key: ${{ runner.os }}-apt-${{ env.APT_HASH }}
+
+      # Install system dependencies only if cache miss
+      - name: Install libfuzzer dependencies
+        if: steps.cache-apt.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./.apt-cache/archives ./.apt-state/lists
+          sudo -E apt-get update && sudo -E apt-get install -y build-essential cmake clang
+
+      # Install cargo-fuzz only if not found in cache
+      - name: Install cargo-fuzz
+        if: steps.cache-rust.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --locked --force
+
+      # Run fuzzing tests
+      - name: Run fuzzing tests
+        run: |
+          cd fuzz
+          echo "Available fuzz targets:"
+          cargo +nightly fuzz list
+          for target in $(cargo fuzz list); do
+            echo "Running fuzz target: $target"
+            cargo +nightly fuzz run $target -- -max_total_time=60
+          done
+
+      # Save Rust cache if there was no exact match
+      - name: Save Rust cache
+        if: success() && steps.cache-rust.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.cargo/bin/cargo-fuzz
+            target/
+            fuzz/target/
+          key: ${{ steps.cache-rust.outputs.cache-primary-key }}
+
+      # Save apt cache if there was no exact match
+      - name: Save apt cache
+        if: success() && steps.cache-apt.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ./.apt-cache
+            ./.apt-state
+          key: ${{ runner.os }}-apt-${{ env.APT_HASH }}
+
+      # Upload artifacts (if crashes are found)
+      - name: Upload artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
