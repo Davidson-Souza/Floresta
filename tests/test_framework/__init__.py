@@ -35,6 +35,15 @@ from test_framework.rpc.utreexo import UtreexoRPC
 from test_framework.rpc.bitcoin import REGTEST_RPC_SERVER as bitcoind_rpc_server
 from test_framework.rpc.floresta import REGTEST_RPC_SERVER as florestad_rpc_server
 from test_framework.rpc.utreexo import REGTEST_RPC_SERVER as utreexod_rpc_server
+from test_framework.primitives.transaction import (
+    TxInput,
+    TxOutput,
+    OutPoint,
+    Script,
+    Amount,
+    Transaction,
+)
+from test_framework.primitives.address import Bech32Address
 
 
 class Node:
