@@ -230,25 +230,10 @@ pub struct UData {
     pub leaves: Vec<CompactLeafData>,
 }
 
-/// A block plus some udata
-#[derive(PartialEq, Eq, Clone, Debug)]
-pub struct UtreexoBlock {
-    /// A actual block
-    pub block: Block,
-    /// The utreexo specific data
-    pub udata: Option<UData>,
-}
-
-impl Decodable for UtreexoBlock {
+impl Decodable for UData {
     fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
         reader: &mut R,
     ) -> Result<Self, consensus::encode::Error> {
-        let block = Block::consensus_decode(reader)?;
-
-        if let Err(consensus::encode::Error::Io(_remember)) = VarInt::consensus_decode(reader) {
-            return Ok(block.into());
-        };
-
         let n_positions = VarInt::consensus_decode(reader)?;
         let mut targets = vec![];
         for _ in 0..n_positions.0 {
@@ -277,13 +262,37 @@ impl Decodable for UtreexoBlock {
             });
         }
 
+        Ok(UData {
+            remember_idx: vec![],
+            proof: BatchProof { targets, hashes },
+            leaves,
+        })
+    }
+}
+
+/// A block plus some udata
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub struct UtreexoBlock {
+    /// A actual block
+    pub block: Block,
+    /// The utreexo specific data
+    pub udata: Option<UData>,
+}
+
+impl Decodable for UtreexoBlock {
+    fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> Result<Self, consensus::encode::Error> {
+        let block = Block::consensus_decode(reader)?;
+
+        if let Err(consensus::encode::Error::Io(_remember)) = VarInt::consensus_decode(reader) {
+            return Ok(block.into());
+        };
+
+        let udata = UData::consensus_decode(reader)?;
         Ok(Self {
             block,
-            udata: Some(UData {
-                remember_idx: vec![],
-                proof: BatchProof { targets, hashes },
-                leaves,
-            }),
+            udata: Some(udata),
         })
     }
 }

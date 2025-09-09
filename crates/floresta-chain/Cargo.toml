@@ -55,3 +55,8 @@ kv-chainstore = ["dep:kv"]
 name = "chain_state_bench"
 harness = false
 required-features = ["test-utils"]
+
+[[bench]]
+name = "pollard_bench"
+harness = false
+required-features = ["test-utils"]
