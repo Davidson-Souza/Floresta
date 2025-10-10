@@ -28,9 +28,6 @@ use tracing::warn;
 
 use super::error::WireError;
 use super::peer::PeerMessages;
-use crate::node::periodic_job;
-use crate::node::try_and_log;
-use crate::node::try_and_warn;
 use crate::node::ConnectionKind;
 use crate::node::InflightRequests;
 use crate::node::NodeNotification;
@@ -41,6 +38,9 @@ use crate::node_context::PeerId;
 use crate::node_interface::NodeResponse;
 use crate::node_interface::UserRequest;
 use crate::p2p_wire::chain_selector::ChainSelector;
+use crate::p2p_wire::macros::periodic_job;
+use crate::p2p_wire::macros::try_and_error;
+use crate::p2p_wire::macros::try_and_warn;
 use crate::p2p_wire::sync_node::SyncNode;
 
 #[derive(Debug, Clone)]
@@ -264,7 +264,7 @@ where
     }
 
     pub async fn run(mut self, stop_signal: tokio::sync::oneshot::Sender<()>) {
-        try_and_warn!(self.init_peers());
+        try_and_warn!("Can't init peers: ", self.init_peers());
 
         // Use this node state to Initial Block download
         let mut ibd = UtreexoNode {
@@ -272,7 +272,7 @@ where
             context: ChainSelector::default(),
         };
 
-        try_and_log!(UtreexoNode::<Chain, ChainSelector>::run(&mut ibd).await);
+        try_and_error!("Can't start ChainSelector node: ", UtreexoNode::<Chain, ChainSelector>::run(&mut ibd).await);
 
         self = UtreexoNode {
             common: ibd.common,
@@ -281,7 +281,7 @@ where
 
         if *self.kill_signal.read().await {
             self.shutdown();
-            try_and_log!(stop_signal.send(()));
+            let _ = stop_signal.send(());
             return;
         }
 
@@ -338,11 +338,11 @@ where
             while let Ok(Some(notification)) =
                 timeout(Duration::from_millis(100), self.node_rx.recv()).await
             {
-                try_and_log!(self.handle_notification(notification));
+                try_and_warn!("Failed while handling user notification: ", self.handle_notification(notification));
             }
 
             // Jobs that don't need a connected peer
-            try_and_log!(self.process_pending_blocks());
+            try_and_error!("An error occurred while processing a pending block: ", self.process_pending_blocks());
 
             // Save our peers db
             periodic_job!(
@@ -370,7 +370,7 @@ where
             );
 
             // Check if some of our peers have timed out a request
-            try_and_log!(self.check_for_timeout());
+            try_and_error!("Error while checking for timeout: ", self.check_for_timeout());
 
             // Open new feeler connection periodically
             periodic_job!(
@@ -415,8 +415,7 @@ where
                 RunningNode
             );
 
-            // tries to download filters from the network
-            try_and_log!(self.download_filters());
+            try_and_error!("Error while downloading filters: ", self.download_filters());
 
             // requests that need a utreexo peer
             if !self.has_utreexo_peers() {
@@ -425,7 +424,7 @@ where
 
             // Check if we haven't missed any block
             if self.inflight.len() < RunningNode::MAX_INFLIGHT_REQUESTS {
-                try_and_log!(self.ask_missed_block());
+                try_and_error!("Error while asking for missed bocks: ", self.ask_missed_block());
             }
         }
 

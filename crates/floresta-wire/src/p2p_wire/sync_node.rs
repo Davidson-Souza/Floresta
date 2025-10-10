@@ -19,8 +19,6 @@ use tracing::warn;
 use super::error::WireError;
 use super::node_interface::UserRequest;
 use super::peer::PeerMessages;
-use crate::node::periodic_job;
-use crate::node::try_and_log;
 use crate::node::ConnectionKind;
 use crate::node::InflightRequests;
 use crate::node::NodeNotification;
@@ -28,6 +26,10 @@ use crate::node::NodeRequest;
 use crate::node::UtreexoNode;
 use crate::node_context::NodeContext;
 use crate::node_interface::NodeResponse;
+use crate::p2p_wire::macros::periodic_job;
+use crate::p2p_wire::macros::try_and_debug;
+use crate::p2p_wire::macros::try_and_error;
+use crate::p2p_wire::macros::try_and_warn;
 
 /// [`SyncNode`] is a node that downloads and validates the blockchain.
 /// This node implements:
@@ -70,6 +72,10 @@ where
     /// TODO: Be smarter when selecting peers to send, like taking in consideration
     /// already inflight blocks and latency.
     fn get_blocks_to_download(&mut self) {
+        if self.has_utreexo_peers() == false {
+            return;
+        }
+
         let max_inflight_blocks = SyncNode::BLOCKS_PER_GETDATA * SyncNode::MAX_CONCURRENT_GETDATA;
         let inflight_blocks = self
             .inflight
@@ -110,7 +116,7 @@ where
             }
         }
 
-        try_and_log!(self.request_blocks(blocks));
+        try_and_error!("Can't request blocks", self.request_blocks(blocks));
     }
 
     fn ask_for_missed_blocks(&mut self) -> Result<(), WireError> {
@@ -184,7 +190,7 @@ where
 
         loop {
             while let Ok(Some(msg)) = timeout(Duration::from_secs(1), self.node_rx.recv()).await {
-                try_and_log!(self.handle_message(msg));
+                try_and_error!("Failure to handle notification from peer", self.handle_message(msg));
             }
 
             if *self.kill_signal.read().await {
@@ -223,27 +229,26 @@ where
                 SyncNode
             );
 
-            try_and_log!(self.check_for_timeout());
-
+            try_and_warn!("Failure checking for timeout", self.check_for_timeout());
             let assume_stale = Instant::now()
                 .duration_since(self.common.last_tip_update)
                 .as_secs()
                 > SyncNode::ASSUME_STALE;
 
             if assume_stale {
-                try_and_log!(self.create_connection(ConnectionKind::Extra));
+                try_and_warn!("Potential stable tip detected, trying new peers", self.create_connection(ConnectionKind::Extra));
                 self.last_tip_update = Instant::now();
                 continue;
             }
 
-            try_and_log!(self.process_pending_blocks());
+            try_and_error!("An error occurred while processing a pending block", self.process_pending_blocks());
             if !self.has_utreexo_peers() {
                 continue;
             }
 
             // Ask for missed blocks or proofs if they are no longer inflight or pending
-            try_and_log!(self.ask_for_missed_blocks());
-            try_and_log!(self.ask_for_missed_proofs());
+            try_and_debug!("Error while asking for missed block", self.ask_for_missed_blocks());
+            try_and_debug!("Error while asking for missed proofs", self.ask_for_missed_proofs());
 
             self.get_blocks_to_download();
         }
@@ -285,11 +290,11 @@ where
                     }
 
                     PeerMessages::Ready(version) => {
-                        try_and_log!(self.handle_peer_ready(peer, &version));
+                        try_and_warn!("Failure while initializing state for peer", self.handle_peer_ready(peer, &version));
                     }
 
                     PeerMessages::Disconnected(idx) => {
-                        try_and_log!(self.handle_disconnection(peer, idx));
+                        try_and_warn!("Failure to update a peer state after disconnection", self.handle_disconnection(peer, idx));
                     }
 
                     PeerMessages::Addr(addresses) => {

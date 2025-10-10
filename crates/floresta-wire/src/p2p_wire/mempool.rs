@@ -4,6 +4,7 @@
 //! Once our transaction is included in a block, we remove it from the mempool.
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -111,6 +112,29 @@ pub enum AcceptToMempoolError {
     /// The transaction has duplicate inputs.
     DuplicateInput,
     BlockNotFound,
+}
+
+impl Display for AcceptToMempoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcceptToMempoolError::InvalidProof => write!(f, "Invalid proof"),
+            AcceptToMempoolError::InvalidPrevout => write!(f, "Invalid prevout"),
+            AcceptToMempoolError::MemoryUsageTooHigh => write!(f, "Memory usage too high"),
+            AcceptToMempoolError::PrevoutNotFound => write!(f, "Prevout not found"),
+            AcceptToMempoolError::ConflictingTransaction => {
+                write!(f, "Conflicting transaction in mempool")
+            }
+            AcceptToMempoolError::Rustreexo(err) => {
+                write!(f, "Rustreexo error: {}", err)
+            }
+            AcceptToMempoolError::DuplicateInput => {
+                write!(f, "Transaction has duplicate inputs")
+            }
+            AcceptToMempoolError::BlockNotFound => {
+                write!(f, "Block not found for prevout")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -74,6 +74,9 @@ use super::transport::TransportProtocol;
 use super::UtreexoNodeConfig;
 use crate::block_proof::UtreexoProof;
 use crate::node_context::PeerId;
+use crate::p2p_wire::macros::try_and_debug;
+use crate::p2p_wire::macros::try_and_error;
+use crate::p2p_wire::macros::try_and_warn;
 
 /// How long before we consider using alternative ways to find addresses,
 /// such as hard-coded peers
@@ -489,7 +492,7 @@ where
         }
 
         let peers = peers.into_iter().flatten().collect();
-        try_and_log!(responder.send(NodeResponse::GetPeerInfo(peers)));
+        try_and_debug!("Can't send answer for getpeerinfo request", responder.send(NodeResponse::GetPeerInfo(peers)));
     }
 
     // Helper function to resolve an IpAddr to AddrV2
@@ -642,8 +645,7 @@ where
             }
             UserRequest::Ping => {
                 self.broadcast_to_peers(NodeRequest::Ping);
-                try_and_log!(responder.send(NodeResponse::Ping(true)));
-
+                try_and_debug!("Can't ping peer", responder.send(NodeResponse::Ping(true)));
                 return;
             }
             UserRequest::Block(block_hash) => NodeRequest::GetBlock(vec![block_hash]),
@@ -949,7 +951,7 @@ where
                     | BlockValidationErrors::BIP94TimeWarp
                     | BlockValidationErrors::UnspendableUTXO
                     | BlockValidationErrors::CoinbaseNotMatured => {
-                        try_and_log!(self.chain.invalidate_block(block.block_hash()));
+                        try_and_error!("Can't invalidate block", self.chain.invalidate_block(block.block_hash()));
                     }
                     BlockValidationErrors::InvalidProof => {}
                     BlockValidationErrors::BlockExtendsAnOrphanChain
@@ -1631,12 +1633,12 @@ where
 
     pub(crate) fn shutdown(&mut self) {
         info!("Shutting down node...");
-        try_and_warn!(self.save_utreexo_peers());
+        try_and_warn!("Couldn't save anchor utreexo peers", self.save_utreexo_peers());
         for peer in self.peer_ids.iter() {
-            try_and_log!(self.send_to_peer(*peer, NodeRequest::Shutdown));
+            try_and_debug!("Can't ask peer to stop", self.send_to_peer(*peer, NodeRequest::Shutdown));
         }
-        try_and_log!(self.save_peers());
-        try_and_log!(self.chain.flush());
+        try_and_debug!("Can't save peers to disk", self.save_peers());
+        try_and_debug!("Failure to flush our chain", self.chain.flush());
     }
 
     pub(crate) async fn handle_broadcast(&self) -> Result<(), WireError> {
@@ -1668,7 +1670,7 @@ where
                                 .collect::<Vec<_>>();
 
                             let targets = proof.targets.clone();
-                            try_and_log!(mempool.accept_to_mempool(
+                            try_and_error!("Can't accept transaction to mempool", mempool.accept_to_mempool(
                                 transaction,
                                 proof,
                                 &leaves,
@@ -1751,7 +1753,7 @@ where
         self.last_dns_seed_call = Instant::now();
 
         info!("We've been running for a while and we don't have any peers, asking for DNS peers");
-        try_and_log!(self.get_peers_from_dns());
+        try_and_debug!("Can't get peers from DNS seeds", self.get_peers_from_dns());
     }
 
     /// If we don't have any peers, we use the hardcoded addresses.
@@ -2130,45 +2132,6 @@ where
         Ok(())
     }
 }
-
-/// Run a task and log any errors that might occur.
-macro_rules! try_and_log {
-    ($what:expr) => {
-        if let Err(error) = $what {
-            tracing::error!("{}: {} - {:?}", line!(), file!(), error);
-        }
-    };
-}
-
-/// Run a task and warn any errors that might occur.
-///
-/// `try_and_log!` variant for tasks that can fail safely.
-macro_rules! try_and_warn {
-    ($what:expr) => {
-        if let Err(warning) = $what {
-            tracing::warn!("{}", warning);
-        }
-    };
-}
-
-macro_rules! periodic_job {
-    ($what:expr, $timer:expr, $interval:ident, $context:ty) => {
-        if $timer.elapsed() > Duration::from_secs(<$context>::$interval) {
-            try_and_log!($what);
-            $timer = Instant::now();
-        }
-    };
-    ($what:expr, $timer:expr, $interval:ident, $context:ty, $no_log:literal) => {
-        if $timer.elapsed() > Duration::from_secs(<$context>::$interval) {
-            $what;
-            $timer = Instant::now();
-        }
-    };
-}
-
-pub(crate) use periodic_job;
-pub(crate) use try_and_log;
-pub(crate) use try_and_warn;
 
 #[cfg(test)]
 mod tests {

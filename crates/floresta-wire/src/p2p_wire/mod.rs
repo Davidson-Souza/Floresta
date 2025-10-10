@@ -109,3 +109,4 @@ pub mod sync_node;
 #[doc(hidden)]
 pub mod tests;
 pub mod transport;
+mod macros;

@@ -75,8 +75,6 @@ use super::node_interface::UserRequest;
 use super::peer::PeerMessages;
 use crate::address_man::AddressState;
 use crate::block_proof::Bitmap;
-use crate::node::periodic_job;
-use crate::node::try_and_log;
 use crate::node::InflightBlock;
 use crate::node::InflightRequests;
 use crate::node::NodeNotification;
@@ -85,6 +83,9 @@ use crate::node::UtreexoNode;
 use crate::node_context::NodeContext;
 use crate::node_context::PeerId;
 use crate::node_interface::NodeResponse;
+use crate::p2p_wire::macros::periodic_job;
+use crate::p2p_wire::macros::try_and_error;
+use crate::p2p_wire::macros::try_and_warn;
 
 #[derive(Debug, Default, Clone)]
 /// A p2p driver that attempts to connect with multiple peers, ask which chain are them following
@@ -784,7 +785,7 @@ where
                     }
 
                     Some(NodeNotification::FromPeer(peer, notification)) => {
-                        try_and_log!(self.handle_peer_notification(notification, peer).await);
+                        try_and_warn!("Failure to process notification from peer", self.handle_peer_notification(notification, peer).await);
                     }
 
                     Some(NodeNotification::DnsSeedAddresses(addresses)) => {
@@ -829,7 +830,7 @@ where
             if self.context.state == ChainSelectorState::CreatingConnections {
                 // If we have enough peers, try to download headers
                 if !self.peer_ids.is_empty() {
-                    try_and_log!(self.request_headers(self.chain.get_best_block()?.1));
+                    try_and_error!("Failure sending get headers", self.request_headers(self.chain.get_best_block()?.1));
                     self.context.state = ChainSelectorState::DownloadingHeaders;
                 }
             }
@@ -837,12 +838,11 @@ where
             // We downloaded all headers in the most-pow chain, and all our peers agree
             // this is the most-pow chain, we're done!
             if self.context.state == ChainSelectorState::Done {
-                try_and_log!(self.chain.flush());
+                try_and_warn!("Failure flushing chain", self.chain.flush());
                 break;
             }
 
-            try_and_log!(self.check_for_timeout());
-
+            try_and_warn!("Failure checking for timeout", self.check_for_timeout());
             if *self.kill_signal.read().await {
                 self.shutdown();
                 break;
