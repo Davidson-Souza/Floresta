@@ -429,19 +429,30 @@ where
             return Ok(());
         };
 
-        if self.inflight.contains_key(&InflightRequests::GetFilterHeaders) {
+        if self
+            .inflight
+            .contains_key(&InflightRequests::GetFilterHeaders)
+        {
             return Ok(());
         }
 
         let filter_height = block_filters.get_height().unwrap_or(0);
-        let checkpoint = self.config.assume_utreexo.as_ref().map(|assume_utreexo_value| assume_utreexo_value.height).unwrap_or(0);
+        let checkpoint = self
+            .config
+            .assume_utreexo
+            .as_ref()
+            .map(|assume_utreexo_value| assume_utreexo_value.height)
+            .unwrap_or(0);
         // We only download stuff up to our checkpoint, after that we will download
         // those blocks and build the filters ourselves
         if filter_height >= self.chain.get_height()? || filter_height > checkpoint {
             return Ok(());
         }
 
-        debug!("Requesting filter headers from height {}", filter_height + 1);
+        debug!(
+            "Requesting filter headers from height {}",
+            filter_height + 1
+        );
 
         let best_block_hash = self.chain.get_best_block()?.1;
         let peer = self.send_to_random_peer(

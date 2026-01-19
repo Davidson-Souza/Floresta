@@ -276,11 +276,17 @@ impl FlatFilterStore {
             .expect("Unable to open filter headers file");
 
         let len = file.metadata().map(|m| m.len()).unwrap_or(0) as u32;
-        let file_copy = file.try_clone().expect("Unable to clone filter headers file handle");
+        let file_copy = file
+            .try_clone()
+            .expect("Unable to clone filter headers file handle");
         let writer = BufWriter::new(file);
         let reader = BufReader::new(file_copy);
 
-        Self { reader, writer, len }
+        Self {
+            reader,
+            writer,
+            len,
+        }
     }
 
     fn update_descriptor(

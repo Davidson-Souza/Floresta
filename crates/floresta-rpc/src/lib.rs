@@ -10,11 +10,11 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-#[cfg(feature = "with-jsonrpc")]
-pub mod jsonrpc_client;
-
 pub mod rpc;
 pub mod rpc_types;
+
+#[cfg(not(feature = "async"))]
+pub mod jsonrpc_client;
 
 // Those tests doesn't work on windowns
 // TODO (Davidson): work on windows?

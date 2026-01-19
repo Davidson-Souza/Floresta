@@ -29,6 +29,8 @@ floresta-common = { workspace = true }
 floresta-electrum = { workspace = true }
 floresta-watch-only = { workspace = true }
 floresta-wire = { workspace = true }
+floresta-rpc = { workspace = true, features = ["async"] }
+
 metrics = { workspace = true,  optional = true }
 
 [dev-dependencies]

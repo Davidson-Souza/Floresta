@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::slice;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use axum::http::Method;
 use axum::routing::post;
 use axum::Json;
 use axum::Router;
+use bitcoin::Transaction;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::hex::FromHex;
@@ -23,6 +25,7 @@ use bitcoin::TxOut;
 use bitcoin::Txid;
 use floresta_chain::ThreadSafeChain;
 use floresta_common::parse_descriptors;
+use floresta_rpc::rpc::RawTransactionRpcs;
 use floresta_watch_only::kv_database::KvDatabase;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::CachedTransaction;
@@ -75,6 +78,19 @@ pub struct RpcImpl<Blockchain: RpcChain> {
     pub(super) inflight: Arc<RwLock<HashMap<Value, InflightRpc>>>,
     pub(super) log_path: String,
     pub(super) start_time: Instant,
+}
+
+impl<Chain: RpcChain + 'static> RawTransactionRpcs for RpcImpl<Chain> {
+    #[maybe_async::to_async]
+    async fn send_raw_transaction(&self, tx:String) -> std::result::Result<Txid, ()> {
+        let bytes = Vec::from_hex(&tx).map_err(|_| ())?;
+        let transaction = deserialize::<Transaction>(&bytes)
+            .map_err(|_| ())?;
+
+        self.chain.broadcast(&transaction).map_err(|_| ())?;
+
+        Ok(transaction.compute_txid())
+    }
 }
 
 type Result<T> = std::result::Result<T, JsonRpcError>;
@@ -192,7 +208,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 }
 
-async fn handle_json_rpc_request(
+/*async fn handle_json_rpc_request(
     req: RpcRequest,
     state: Arc<RpcImpl<impl RpcChain>>,
 ) -> Result<serde_json::Value> {
@@ -418,7 +434,7 @@ async fn handle_json_rpc_request(
             Err(error)
         }
     }
-}
+}*/
 
 fn get_http_error_code(err: &JsonRpcError) -> u16 {
     match err {

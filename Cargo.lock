@@ -1082,6 +1082,7 @@ dependencies = [
  "floresta-common",
  "floresta-compact-filters",
  "floresta-electrum",
+ "floresta-rpc",
  "floresta-watch-only",
  "floresta-wire",
  "libc",
@@ -1108,6 +1109,7 @@ dependencies = [
  "clap",
  "corepc-types",
  "jsonrpc",
+ "maybe_async",
  "rand 0.8.5",
  "rcgen",
  "serde",
@@ -1859,6 +1861,16 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "maybe_async"
+version = "0.1.0"
+source = "git+https://github.com/Davidson-Souza/maybe-async2.git?branch=master#84c6c3afcf377e1b5a21387a71a43bd27453fdfb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "memchr"
