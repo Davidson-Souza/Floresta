@@ -89,6 +89,7 @@ impl Default for UtreexoNodeConfig {
 
 pub mod address_man;
 pub mod block_proof;
+pub mod coinscache;
 pub mod error;
 pub mod node;
 pub mod node_context;

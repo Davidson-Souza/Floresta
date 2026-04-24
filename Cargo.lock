@@ -1215,6 +1215,7 @@ dependencies = [
  "floresta-compact-filters",
  "floresta-mempool",
  "hintsfile",
+ "lru",
  "metrics",
  "rand",
  "rustls",

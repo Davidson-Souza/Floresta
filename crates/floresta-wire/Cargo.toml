@@ -27,6 +27,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 ureq = { version = "3.1", features = ["socks-proxy", "json", "rustls-no-provider"], default-features = false }
+lru = { version = "0.16" }
 
 # Local dependencies
 floresta-chain = { workspace = true, features = ["flat-chainstore"] }

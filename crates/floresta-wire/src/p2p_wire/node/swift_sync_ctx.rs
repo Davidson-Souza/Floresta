@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
+use std::process::exit;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -12,8 +13,12 @@ use std::time::Instant;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::Amount;
+use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Network;
+use bitcoin::OutPoint;
+use bitcoin::Transaction;
+use bitcoin::TxOut;
 use floresta_chain::pruned_utreexo::consensus::Consensus;
 use floresta_chain::swift_sync_agg::SipHashKeys;
 use floresta_chain::swift_sync_agg::SwiftSyncAgg;
@@ -43,6 +48,7 @@ use crate::node::WorkerResult;
 use crate::node_context::LoopControl;
 use crate::node_context::NodeContext;
 use crate::node_context::PeerId;
+use crate::p2p_wire::coinscache::CoinsCache;
 use crate::p2p_wire::error::WireError;
 use crate::p2p_wire::peer::PeerMessages;
 
@@ -72,6 +78,8 @@ pub struct SwiftSync {
     /// We abort when either the hints are found to be invalid or the current chain is invalid (we
     /// may find an invalid block or, at the end, a violation of the maximum supply limit).
     abort_height: Option<u32>,
+
+    coins_cache: CoinsCache,
 }
 
 impl NodeContext for SwiftSync {
@@ -400,6 +408,59 @@ where
         self.chain.toggle_ibd(false);
     }
 
+    fn process_spends(&mut self, tx: &Transaction) -> Vec<TxOut> {
+        if tx.is_coinbase() {
+            return vec![];
+        }
+
+        tx.input
+            .iter()
+            .filter_map(|input| self.context.coins_cache.spend(&input.previous_output))
+            .collect()
+    }
+
+    fn process_block_cache(&mut self, block: &Block) {
+        let inputs: usize = block
+            .txdata
+            .iter()
+            .map(|tx| {
+                if tx.is_coinbase() {
+                    return 0;
+                }
+
+                tx.input.iter().count()
+            }).sum();
+
+        let hits = block
+            .txdata
+            .iter()
+            .map(|tx| {
+                let txid = tx.compute_txid();
+                tx.output.iter().enumerate().for_each(|(vout, out)| {
+                    let outpoint = OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    };
+
+                    self.context.coins_cache.create(outpoint, out.clone())
+                });
+
+                self.process_spends(tx)
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        /*if hits.len() != inputs {
+            println!(
+                "block {} stats: hits = {} total = {} cache_size={}",
+                block.block_hash(),
+                hits.len(),
+                inputs,
+                self.context.coins_cache.size(),
+            );
+        }*/
+    }
+
     /// Process a message from a peer and handle it accordingly between the variants of [`PeerMessages`].
     async fn handle_message(
         &mut self,
@@ -443,6 +504,8 @@ where
                         let Some(block) = self.check_is_user_block_and_reply(block)? else {
                             return Ok(());
                         };
+
+                        self.process_block_cache(&block);
 
                         let inflight_block = InflightBlock {
                             peer,
