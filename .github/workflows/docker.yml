@@ -3,20 +3,155 @@
 name: Docker Publish
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: ["master"]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (tag, branch, or commit SHA)"
+        required: true
+        type: string
+      tag:
+        description: "Docker image tag (e.g. v0.10.0)"
+        required: true
+        type: string
+
+env:
+  IMAGE_NAME: floresta
+  # Per-arch temp tags are unique per run so concurrent master/tag pushes
+  # never race on the same temporary tag before cleanup.
+  TEMP_TAG: sha-${{ github.sha }}-${{ github.run_id }}
+  DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE || format('docker.io/{0}', github.repository) }}
+  IMAGE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || format('sha-{0}', github.sha) }}
 
 permissions: {}
 
 jobs:
   build:
+    name: Build and verify
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
     steps:
       - name: Checkout Repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Normalize image refs
+        run: echo "GHCR_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        id: build
+        with:
+          context: .
+          file: contrib/docker/Dockerfile
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.DOCKERHUB_IMAGE }}:${{ env.IMAGE_TAG }}
+            ${{ env.GHCR_IMAGE }}:${{ env.IMAGE_TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=${{ github.event.repository.description }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+          cache-from: type=gha,scope=build-docker-amd64
+          cache-to: type=gha,scope=build-docker-amd64,mode=max
+          load: true
+
+      - name: Verify binaries
+        run: |
+          docker run --rm --entrypoint /bin/sh ${IMAGE_NAME}:${IMAGE_TAG} -c \
+            'test -f /usr/local/bin/florestad && test -f /usr/local/bin/floresta-cli && echo "Binaries OK" && sha256sum /usr/local/bin/florestad /usr/local/bin/floresta-cli'
+
+      - name: Run CLI
+        run: |
+          docker run --rm --entrypoint floresta-cli ${IMAGE_NAME}:${IMAGE_TAG} --help | head -n 1
+
+  multi-arch-build:
+    name: Build ${{ matrix.platform }}
+    needs: [build]
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+            qemu: false
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+            qemu: false
+          - platform: linux/arm/v7
+            runner: ubuntu-24.04-arm
+            arch: armv7
+            qemu: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Normalize image refs
+        run: echo "GHCR_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: contrib/docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.GHCR_IMAGE }}:${{ env.TEMP_TAG }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=${{ github.event.repository.description }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+          cache-from: type=gha,scope=build-docker-${{ matrix.arch }}
+          cache-to: type=gha,scope=build-docker-${{ matrix.arch }},mode=max
+          provenance: false
+          push: true
+
+  merge:
+    name: Merge multi-arch manifest
+    needs: [multi-arch-build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Normalize image refs
+        run: echo "GHCR_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -24,13 +159,55 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          context: .
-          file: contrib/docker/Dockerfile
-          push: true
-          tags: dlsz/floresta:latest
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine tags
+        id: tags
+        run: .github/workflows/docker/determine-tags.sh
+        env:
+          IMAGE_SHA: ${{ env.IMAGE_TAG }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: Create and push multi-arch manifests
+        run: .github/workflows/docker/create-manifests.sh
+        env:
+          TAGS_GHCR: ${{ steps.tags.outputs.tags_ghcr }}
+          TAGS_DH: ${{ steps.tags.outputs.tags_dh }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
+          IMAGE_SHA: ${{ env.IMAGE_TAG }}
+          TEMP_TAG: ${{ env.TEMP_TAG }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          CLEANUP_TEMP_TAGS: ${{ vars.CLEANUP_TEMP_TAGS || 'true' }}
+
+      - name: Cleanup temp tags
+        if: success() || failure()
+        run: .github/workflows/docker/cleanup-temp-tags.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          IMAGE_SHA: ${{ env.IMAGE_TAG }}
+          TEMP_TAG: ${{ env.TEMP_TAG }}
+          CLEANUP_TEMP_TAGS: ${{ vars.CLEANUP_TEMP_TAGS || 'true' }}
+
+      - name: Verify manifest
+        run: |
+          GHCR="${GHCR_IMAGE}"
+          SHA="${IMAGE_TAG}"
+          echo "Checking platforms in $GHCR:$SHA"
+          docker buildx imagetools inspect "$GHCR:$SHA" --raw | grep -o '"architecture":"[^"]*"' | sort -u
