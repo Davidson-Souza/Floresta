@@ -296,6 +296,11 @@ pub struct Florestad {
     #[cfg(feature = "json-rpc")]
     /// A handle to our json-rpc server
     json_rpc: OnceLock<tokio::task::JoinHandle<()>>,
+
+    #[cfg(feature = "json-rpc")]
+    /// The cookie file this run wrote, so shutdown only deletes our own.
+    /// Empty when we never wrote one.
+    cookie_path: OnceLock<PathBuf>,
 }
 
 impl Florestad {
@@ -320,6 +325,13 @@ impl Florestad {
     }
 
     pub async fn wait_shutdown(&self) {
+        // Removed before awaiting the node: the cookie is already invalid once
+        // we are stopping, and callers time this future out.
+        #[cfg(feature = "json-rpc")]
+        if let Some(cookie_path) = self.cookie_path.get() {
+            try_and_log!(json_rpc::auth::delete_cookie(cookie_path));
+        }
+
         let chan = {
             let mut guard = self.stop_notify.lock().unwrap();
             std::mem::take(&mut *guard)
@@ -496,6 +508,12 @@ impl Florestad {
         // JSON-RPC
         #[cfg(feature = "json-rpc")]
         if !self.config.disable_rpc {
+            let cookie_path = datadir.join(json_rpc::auth::COOKIE_FILE_NAME);
+            json_rpc::auth::generate_cookie(&cookie_path)?;
+            info!("RPC cookie file written to {}", cookie_path.display());
+            // Recorded after a successful write, so shutdown deletes only ours.
+            let _ = self.cookie_path.set(cookie_path);
+
             let server = tokio::spawn(json_rpc::server::RpcImpl::create(
                 blockchain_state.clone(),
                 wallet.clone(),
@@ -935,6 +953,8 @@ impl From<Config> for Florestad {
             stop_notify: Arc::new(Mutex::new(None)),
             #[cfg(feature = "json-rpc")]
             json_rpc: OnceLock::new(),
+            #[cfg(feature = "json-rpc")]
+            cookie_path: OnceLock::new(),
         }
     }
 }

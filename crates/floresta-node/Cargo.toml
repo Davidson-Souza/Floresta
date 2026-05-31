@@ -13,6 +13,7 @@ axum = { workspace = true, optional = true }
 bitcoin = { workspace = true }
 dns-lookup = { workspace = true }
 miniscript = { workspace = true, features = ["std"] }
+rand = { workspace = true, optional = true }
 rcgen = { workspace = true }
 rustreexo = { workspace = true }
 serde = { workspace = true }
@@ -49,7 +50,7 @@ libc = { version = "=0.2.186" }
 [features]
 compact-filters = ["dep:floresta-compact-filters"]
 zmq-server = ["dep:zmq"]
-json-rpc = ["dep:axum", "dep:tower-http", "compact-filters", "dep:floresta-rpc"]
+json-rpc = ["dep:axum", "dep:rand", "dep:tower-http", "compact-filters", "dep:floresta-rpc"]
 default = ["json-rpc"]
 metrics = ["dep:floresta-metrics", "floresta-wire/metrics", "floresta-chain/metrics"]
 

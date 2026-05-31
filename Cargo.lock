@@ -1153,6 +1153,7 @@ dependencies = [
  "libc",
  "miniscript",
  "pretty_assertions",
+ "rand 0.10.2",
  "rcgen",
  "rustreexo",
  "serde",
