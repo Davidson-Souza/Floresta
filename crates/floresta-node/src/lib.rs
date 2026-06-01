@@ -20,3 +20,5 @@ pub use florestad::AssumeUtreexoValue;
 pub use florestad::AssumeValidArg;
 pub use florestad::Config;
 pub use florestad::Florestad;
+#[cfg(feature = "json-rpc")]
+pub use json_rpc::auth::basic;

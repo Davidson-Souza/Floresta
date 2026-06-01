@@ -1103,6 +1103,7 @@ dependencies = [
  "bitcoin",
  "floresta-chain",
  "floresta-mempool",
+ "floresta-node",
  "floresta-wire",
  "libfuzzer-sys",
  "tempfile",
@@ -1138,6 +1139,7 @@ name = "floresta-node"
 version = "0.9.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bitcoin",
  "dns-lookup",
  "floresta-chain",
