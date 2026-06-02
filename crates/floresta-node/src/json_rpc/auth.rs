@@ -14,8 +14,12 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use axum::body::Body;
 use axum::extract::Request;
+use axum::extract::State;
+use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
+use axum::http::header::WWW_AUTHENTICATE;
 use axum::middleware::Next;
 use axum::response::Response;
 use bitcoin::hex::DisplayHex;
@@ -23,17 +27,15 @@ use bitcoin::hex::DisplayHex;
 /// Username literal used for cookie auth (Core convention).
 pub(crate) const COOKIE_USER: &str = "__cookie__";
 
-/// Default cookie file name; placed under the net-specific datadir.
-pub(crate) const COOKIE_FILE_NAME: &str = ".cookie";
-
 /// Token length in raw random bytes; hex-encoded to 64 ASCII chars.
 const COOKIE_TOKEN_BYTES: usize = 32;
 
-/// Generate a fresh cookie and write it to `path`, overwriting any existing one.
+/// Generate a fresh cookie, write it to `path`, and return the
+/// `__cookie__:<hex>` line for in-process validation.
 ///
 /// Goes via `<path>.tmp`, unlinked first then opened with `create_new` so mode
 /// `0600` always applies and a planted symlink is refused, then renamed.
-pub(crate) fn generate_cookie(path: &Path) -> io::Result<()> {
+pub(crate) fn generate_cookie(path: &Path) -> io::Result<String> {
     let token: [u8; COOKIE_TOKEN_BYTES] = rand::random();
     let auth = format!("{COOKIE_USER}:{}", token.to_lower_hex_string());
 
@@ -60,7 +62,7 @@ pub(crate) fn generate_cookie(path: &Path) -> io::Result<()> {
 
     fs::rename(&tmp, path)?;
 
-    Ok(())
+    Ok(auth)
 }
 
 /// `Authorization: Basic` header parsing.
@@ -160,21 +162,81 @@ pub mod basic {
     }
 }
 
-/// Axum middleware that parses `Authorization: Basic` and logs the username at
-/// debug level. Nothing is rejected yet; invalid headers pass through.
-pub(crate) async fn auth_middleware(req: Request, next: Next) -> Response {
-    if let Some(header) = req.headers().get(AUTHORIZATION) {
-        match header.to_str() {
-            Ok(value) => match basic::Credentials::parse(value) {
-                Ok(claimed) => {
-                    tracing::debug!("rpc auth header parsed for user {}", claimed.user)
-                }
-                Err(e) => tracing::debug!("rpc auth header parse failed: {e}"),
-            },
-            Err(_) => tracing::debug!("rpc auth header is not valid ascii"),
+/// Axum middleware gating each request on the configured [`Auth`]. Anything
+/// but a match returns 401 with `WWW-Authenticate` per RFC 7235.
+pub(crate) async fn auth_middleware(
+    State(creds): State<std::sync::Arc<Auth>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(header) = req.headers().get(AUTHORIZATION) else {
+        tracing::debug!("rpc auth header missing; rejecting");
+        return unauthorized();
+    };
+    let value = match header.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::debug!("rpc auth header is not valid ascii; rejecting");
+            return unauthorized();
+        }
+    };
+    let claimed = match basic::Credentials::parse(value) {
+        Ok(creds) => creds,
+        Err(e) => {
+            tracing::debug!("rpc auth header parse failed: {e}; rejecting");
+            return unauthorized();
+        }
+    };
+    if !creds.matches(&claimed.user, &claimed.pass) {
+        let user = &claimed.user;
+        tracing::debug!("rpc auth credentials mismatched for user {user}; rejecting");
+        return unauthorized();
+    }
+    tracing::debug!("rpc auth ok for user {}", claimed.user);
+    next.run(req).await
+}
+
+fn unauthorized() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(WWW_AUTHENTICATE, r#"Basic realm="jsonrpc""#)
+        .body(Body::empty())
+        .expect("static 401 response is always well-formed")
+}
+
+/// Configured RPC credentials for this process. The middleware compares each
+/// inbound `Authorization: Basic` request against the stored value via
+/// [`Auth::matches`].
+pub(crate) enum Auth {
+    /// Cookie auth. Stores the full `__cookie__:<hex>` line as written to
+    /// disk by [`generate_cookie`].
+    Cookie(String),
+}
+
+impl Auth {
+    /// True if the supplied basic-auth `user`/`pass` pair authenticates
+    /// against the configured credentials. All comparisons are constant-time.
+    pub(crate) fn matches(&self, user: &str, pass: &str) -> bool {
+        match self {
+            Self::Cookie(expected) => {
+                constant_time_eq(format!("{user}:{pass}").as_bytes(), expected.as_bytes())
+            }
         }
     }
-    next.run(req).await
+}
+
+/// Constant-time byte slice comparison. Returns `false` immediately on length
+/// mismatch (lengths of both comparands are public), then XORs every byte into
+/// an accumulator before returning.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 /// Remove the cookie file at `path`. Treats `NotFound` as success so shutdown
@@ -212,14 +274,13 @@ mod tests {
     #[test]
     fn generate_cookie_writes_expected_format() {
         let path = tmp_cookie_path("format");
-        generate_cookie(&path).expect("cookie write should succeed in test");
+        let auth = generate_cookie(&path).expect("cookie write should succeed in test");
 
-        let written = fs::read_to_string(&path).expect("test wrote this cookie file above");
         assert!(
-            written.starts_with("__cookie__:"),
-            "cookie file missing prefix: {written}"
+            auth.starts_with("__cookie__:"),
+            "auth string missing prefix: {auth}"
         );
-        let token = written
+        let token = auth
             .strip_prefix("__cookie__:")
             .expect("generated cookie always begins with __cookie__:");
         // Hex is ASCII, so `len()` in bytes equals the character count.
@@ -235,6 +296,12 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "token should be lowercase hex: {token}",
+        );
+
+        let written = fs::read_to_string(&path).expect("test wrote this cookie file above");
+        assert_eq!(
+            written, auth,
+            "file content should match returned auth string"
         );
 
         fs::remove_file(&path).ok();
@@ -255,10 +322,8 @@ mod tests {
     fn generate_cookie_produces_distinct_tokens() {
         let path1 = tmp_cookie_path("distinct1");
         let path2 = tmp_cookie_path("distinct2");
-        generate_cookie(&path1).expect("cookie write should succeed in test");
-        generate_cookie(&path2).expect("cookie write should succeed in test");
-        let auth1 = fs::read_to_string(&path1).expect("test wrote path1 above");
-        let auth2 = fs::read_to_string(&path2).expect("test wrote path2 above");
+        let auth1 = generate_cookie(&path1).expect("cookie write should succeed in test");
+        let auth2 = generate_cookie(&path2).expect("cookie write should succeed in test");
         assert_ne!(
             auth1, auth2,
             "two consecutive calls produced identical tokens"
@@ -272,12 +337,11 @@ mod tests {
     fn generate_cookie_overwrites_existing_file() {
         let path = tmp_cookie_path("overwrite");
         fs::write(&path, "stale-content").expect("test temp path should be writable");
-        generate_cookie(&path).expect("cookie write should succeed in test");
+        let auth = generate_cookie(&path).expect("cookie write should succeed in test");
         let written = fs::read_to_string(&path).expect("test wrote this cookie file above");
-        assert_ne!(written, "stale-content", "stale content was not replaced");
-        assert!(
-            written.starts_with("__cookie__:"),
-            "replacement is not a cookie line: {written}"
+        assert_eq!(
+            written, auth,
+            "file content should match returned auth string"
         );
 
         fs::remove_file(&path).ok();
@@ -476,6 +540,41 @@ mod tests {
             basic::Credentials::parse(&oversized),
             Err(basic::HeaderError::PayloadTooLarge),
         );
+    }
+
+    #[test]
+    fn constant_time_eq_returns_true_for_equal_bytes() {
+        assert!(constant_time_eq(b"abcdef", b"abcdef"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_returns_false_for_different_bytes() {
+        assert!(!constant_time_eq(b"abcdef", b"abcdeg"));
+        assert!(!constant_time_eq(b"abcdef", b"xbcdef"));
+    }
+
+    #[test]
+    fn constant_time_eq_returns_false_for_length_mismatch() {
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
+
+    #[test]
+    fn cookie_credentials_match_their_own_user_and_pass() {
+        let path = tmp_cookie_path("creds_cookie");
+        let auth = generate_cookie(&path).expect("cookie write should succeed in test");
+        let creds = Auth::Cookie(auth.clone());
+
+        let (user, pass) = auth
+            .split_once(':')
+            .expect("generated auth string always contains a ':' separator");
+        assert!(creds.matches(user, pass));
+        assert!(!creds.matches(user, "wrong"));
+        assert!(!creds.matches("wronguser", pass));
+
+        fs::remove_file(&path).ok();
     }
 
     #[cfg(unix)]

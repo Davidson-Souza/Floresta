@@ -8,6 +8,7 @@ for different types of nodes in the test framework. It encapsulates the behavior
 including their daemon processes, RPC interfaces, and configurations.
 """
 
+import os
 from enum import Enum
 from typing import List, Tuple, Optional
 
@@ -200,6 +201,20 @@ class Node:
         self.daemon.set_rpc_config(value)
         self.rpc.set_config(value)
 
+    def _load_floresta_cookie_credentials(self):
+        """
+        Read the cookie file florestad wrote at startup and populate the RPC
+        client's basic-auth credentials. No-op for other node variants.
+        """
+        if self._variant != NodeType.FLORESTAD:
+            return
+        cookie_path = os.path.join(self.daemon.data_dir, "regtest", ".cookie")
+        with open(cookie_path, "r", encoding="utf-8") as fh:
+            contents = fh.read()
+        user, password = contents.split(":", 1)
+        self.rpc.config.user = user
+        self.rpc.config.password = password
+
     def set_extra_args(self, value: List[str]):
         """Setter for `extra_args` property"""
         if self.static_values:
@@ -285,6 +300,7 @@ class Node:
 
         self.daemon.start()
         self.rpc.wait_on_socket(opened=True)
+        self._load_floresta_cookie_credentials()
 
         # An open port is not readiness: the daemon only answers RPC calls once
         # it is done loading, so poll it until it does.

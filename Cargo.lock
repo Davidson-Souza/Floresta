@@ -1185,6 +1185,7 @@ dependencies = [
  "bitcoin",
  "clap",
  "corepc-types",
+ "dirs",
  "floresta-proc-macro",
  "jsonrpc",
  "rand 0.10.2",
