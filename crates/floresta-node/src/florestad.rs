@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(feature = "json-rpc")]
 use std::sync::OnceLock;
 
 use bitcoin::Address;
@@ -170,6 +169,14 @@ pub struct Config {
     /// The address our json-rpc should listen to
     pub json_rpc_address: Option<String>,
 
+    /// Username for `-rpcuser`/`-rpcpassword` auth.
+    #[cfg(feature = "json-rpc")]
+    pub rpc_user: Option<String>,
+
+    /// Password for `-rpcuser`/`-rpcpassword` auth; setting it disables cookie auth.
+    #[cfg(feature = "json-rpc")]
+    pub rpc_password: Option<String>,
+
     /// Whether we should write logs to `stdout`.
     pub log_to_stdout: bool,
 
@@ -259,6 +266,10 @@ impl Config {
             connect: Vec::new(),
             #[cfg(feature = "json-rpc")]
             json_rpc_address: None,
+            #[cfg(feature = "json-rpc")]
+            rpc_user: None,
+            #[cfg(feature = "json-rpc")]
+            rpc_password: None,
             log_to_stdout: false,
             log_file: None,
             assume_utreexo: false,
@@ -301,6 +312,10 @@ pub struct Florestad {
     /// The cookie file this run wrote, so shutdown only deletes our own.
     /// Empty when we never wrote one.
     cookie_path: OnceLock<PathBuf>,
+
+    /// Parsed config file, read once. Several getters consult it, and each
+    /// read would otherwise re-parse and re-warn about a missing file.
+    config_file: OnceLock<ConfigFile>,
 }
 
 impl Florestad {
@@ -508,13 +523,38 @@ impl Florestad {
         // JSON-RPC
         #[cfg(feature = "json-rpc")]
         if !self.config.disable_rpc {
-            // Shared with floresta-cli so both resolve identically.
-            let cookie_path = floresta_rpc::resolve_cookie_path(datadir, None);
-            let cookie = json_rpc::auth::generate_cookie(&cookie_path)?;
-            info!("RPC cookie file written to {}", cookie_path.display());
-            // Recorded after a successful write, so shutdown deletes only ours.
-            let _ = self.cookie_path.set(cookie_path);
-            let credentials = Arc::new(json_rpc::auth::Auth::Cookie(cookie));
+            let credentials = if let Some(pass) = self.get_rpc_password() {
+                let user = self.get_rpc_user().unwrap_or_default();
+                // The Basic header parse is ASCII-only, so these would 401
+                // every request while looking configured.
+                if !user.is_ascii() {
+                    return Err(FlorestadError::NonAsciiCredential("--rpc-user"));
+                }
+                if !pass.is_ascii() {
+                    return Err(FlorestadError::NonAsciiCredential("--rpc-password"));
+                }
+                // The header splits on the first `:`, so a colon here never matches.
+                if user.contains(':') {
+                    return Err(FlorestadError::ColonInRpcUser(user));
+                }
+                info!("RPC password auth configured for user '{user}'");
+                Arc::new(json_rpc::auth::Auth::Hashed(vec![
+                    json_rpc::auth::RpcAuth::from_password(&user, &pass),
+                ]))
+            } else {
+                if self.get_rpc_user().is_some() {
+                    warn!(
+                        "--rpc-user is set but --rpc-password is not; falling back to cookie auth"
+                    );
+                }
+                // Shared with floresta-cli so both resolve identically.
+                let cookie_path = floresta_rpc::resolve_cookie_path(datadir, None);
+                let cookie = json_rpc::auth::generate_cookie(&cookie_path)?;
+                info!("RPC cookie file written to {}", cookie_path.display());
+                // Recorded after a successful write, so shutdown deletes only ours.
+                let _ = self.cookie_path.set(cookie_path);
+                Arc::new(json_rpc::auth::Auth::Cookie(cookie))
+            };
 
             let server = tokio::spawn(json_rpc::server::RpcImpl::create(
                 blockchain_state.clone(),
@@ -718,36 +758,39 @@ impl Florestad {
     }
 
     /// Load config from disk; prefer explicit `config_file`, otherwise use `{data_dir}/config.toml`.
-    /// Returns default if it cannot load it
-    fn get_config_file(&self) -> ConfigFile {
-        let datadir = &self.config.datadir;
-        let config_file = self.config.config_file.as_ref();
+    /// Returns default if it cannot load it. Parsed once, so a missing or
+    /// malformed file warns a single time no matter how many getters consult it.
+    fn get_config_file(&self) -> &ConfigFile {
+        self.config_file.get_or_init(|| {
+            let datadir = &self.config.datadir;
+            let config_file = self.config.config_file.as_ref();
 
-        let path = match config_file {
-            Some(path) => path.clone(),
-            None => datadir.join("config.toml"),
-        };
+            let path = match config_file {
+                Some(path) => path.clone(),
+                None => datadir.join("config.toml"),
+            };
 
-        let data = ConfigFile::from_file(&path);
+            let data = ConfigFile::from_file(&path);
 
-        if let Ok(data) = data {
-            data
-        } else {
-            match data.unwrap_err() {
-                FlorestadError::TomlParsing(e) => {
-                    warn!("Could not parse config file, ignoring it");
-                    debug!("{e}");
-                    ConfigFile::default()
+            if let Ok(data) = data {
+                data
+            } else {
+                match data.unwrap_err() {
+                    FlorestadError::TomlParsing(e) => {
+                        warn!("Could not parse config file, ignoring it");
+                        debug!("{e}");
+                        ConfigFile::default()
+                    }
+                    FlorestadError::Io(e) => {
+                        warn!("Could not read config file, ignoring it");
+                        debug!("{e}");
+                        ConfigFile::default()
+                    }
+                    // Shouldn't be any other error
+                    _ => unreachable!(),
                 }
-                FlorestadError::Io(e) => {
-                    warn!("Could not read config file, ignoring it");
-                    debug!("{e}");
-                    ConfigFile::default()
-                }
-                // Shouldn't be any other error
-                _ => unreachable!(),
             }
-        }
+        })
     }
 
     fn get_key_from_env() -> Option<String> {
@@ -814,6 +857,30 @@ impl Florestad {
 
         info!("Wallet setup completed!");
         Ok(wallet)
+    }
+
+    /// Get the configured RPC user; CLI/struct value wins over the config file.
+    /// Empty strings are treated as unset (Bitcoin Core parity).
+    #[cfg(feature = "json-rpc")]
+    fn get_rpc_user(&self) -> Option<String> {
+        self.config
+            .rpc_user
+            .clone()
+            .or_else(|| self.get_config_file().rpc.user.clone())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Get the configured RPC password; CLI/struct value wins over the config file.
+    /// Empty strings are treated as unset (Bitcoin Core parity: an empty
+    /// `-rpcpassword` falls through to cookie auth instead of guarding the
+    /// server with `<user>:`).
+    #[cfg(feature = "json-rpc")]
+    fn get_rpc_password(&self) -> Option<String> {
+        self.config
+            .rpc_password
+            .clone()
+            .or_else(|| self.get_config_file().rpc.password.clone())
+            .filter(|s| !s.is_empty())
     }
 
     /// Get the wallet descriptors from the config file
@@ -958,6 +1025,7 @@ impl From<Config> for Florestad {
             json_rpc: OnceLock::new(),
             #[cfg(feature = "json-rpc")]
             cookie_path: OnceLock::new(),
+            config_file: OnceLock::new(),
         }
     }
 }

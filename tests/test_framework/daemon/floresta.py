@@ -37,11 +37,17 @@ class FlorestaDaemon(BaseDaemon):
     def get_cmd_rpc(self, config: ConfigRPC) -> List[str]:
         """
         Return the RPC configuration flags for the node.
+
+        Credentials are emitted only when set so tests can opt out (e.g. to
+        exercise cookie auth in `tests/florestad/rpc_auth.py`).
         """
         address = f"{config.host}:{config.port}"
-        return [
-            f"--rpc-address={address}",
-        ]
+        flags = [f"--rpc-address={address}"]
+        if config.user is not None:
+            flags.append(f"--rpc-user={config.user}")
+        if config.password is not None:
+            flags.append(f"--rpc-password={config.password}")
+        return flags
 
     def get_cmd_p2p(self, config: ConfigP2P) -> List[str]:
         """

@@ -22,6 +22,11 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::header::WWW_AUTHENTICATE;
 use axum::middleware::Next;
 use axum::response::Response;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::HashEngine;
+use bitcoin::hashes::Hmac;
+use bitcoin::hashes::HmacEngine;
+use bitcoin::hashes::sha256;
 use bitcoin::hex::DisplayHex;
 
 /// Username literal used for cookie auth (Core convention).
@@ -208,20 +213,52 @@ fn unauthorized() -> Response {
 /// inbound `Authorization: Basic` request against the stored value via
 /// [`Auth::matches`].
 pub(crate) enum Auth {
-    /// Cookie auth. Stores the full `__cookie__:<hex>` line as written to
-    /// disk by [`generate_cookie`].
+    /// Full `__cookie__:<hex>` line as written to disk.
     Cookie(String),
+
+    /// Configured users with salted HMAC-SHA256 password hashes.
+    Hashed(Vec<RpcAuth>),
 }
 
 impl Auth {
-    /// True if the supplied basic-auth `user`/`pass` pair authenticates
-    /// against the configured credentials. All comparisons are constant-time.
+    /// True if the basic-auth `user`/`pass` pair authenticates. Constant-time.
     pub(crate) fn matches(&self, user: &str, pass: &str) -> bool {
         match self {
             Self::Cookie(expected) => {
                 constant_time_eq(format!("{user}:{pass}").as_bytes(), expected.as_bytes())
             }
+            Self::Hashed(entries) => entries.iter().any(|a| a.verify(user, pass)),
         }
+    }
+}
+
+/// One salted-hash credential entry: `(user, salt_hex, hash_hex)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RpcAuth {
+    pub user: String,
+    pub salt_hex: String,
+    pub hash_hex: String,
+}
+
+impl RpcAuth {
+    /// Roll a fresh salt and HMAC the password.
+    pub(crate) fn from_password(user: &str, pass: &str) -> Self {
+        let salt_hex = generate_salt_hex();
+        let hash_hex = hmac_password(&salt_hex, pass);
+        Self {
+            user: user.to_string(),
+            salt_hex,
+            hash_hex,
+        }
+    }
+
+    /// Constant-time check: user matches and HMAC(pass) equals the stored hash.
+    pub(crate) fn verify(&self, user: &str, pass: &str) -> bool {
+        if !constant_time_eq(user.as_bytes(), self.user.as_bytes()) {
+            return false;
+        }
+        let computed = hmac_password(&self.salt_hex, pass);
+        constant_time_eq(computed.as_bytes(), self.hash_hex.as_bytes())
     }
 }
 
@@ -237,6 +274,23 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         acc |= x ^ y;
     }
     acc == 0
+}
+
+/// Generate a fresh 16-byte salt, lowercase-hex-encoded (32 ASCII chars).
+fn generate_salt_hex() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.to_lower_hex_string()
+}
+
+/// HMAC-SHA256 with `salt_hex.as_bytes()` as the key (NOT decoded bytes; this
+/// is the interop hinge with Bitcoin Core's `rpcauth.py`) and `pass` as the
+/// message; returns the 32-byte digest as 64 lowercase hex chars.
+fn hmac_password(salt_hex: &str, pass: &str) -> String {
+    let mut engine = HmacEngine::<sha256::Hash>::new(salt_hex.as_bytes());
+    engine.input(pass.as_bytes());
+    Hmac::<sha256::Hash>::from_engine(engine)
+        .to_byte_array()
+        .to_lower_hex_string()
 }
 
 /// Remove the cookie file at `path`. Treats `NotFound` as success so shutdown
@@ -575,6 +629,56 @@ mod tests {
         assert!(!creds.matches("wronguser", pass));
 
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn hashed_credentials_match_any_configured_entry() {
+        let creds = Auth::Hashed(vec![
+            RpcAuth::from_password("alice", "hunter2"),
+            RpcAuth::from_password("bob", "letmein"),
+        ]);
+        assert!(creds.matches("alice", "hunter2"));
+        assert!(creds.matches("bob", "letmein"));
+        assert!(!creds.matches("alice", "hunter3"));
+        assert!(!creds.matches("bob", "hunter2"));
+        assert!(!creds.matches("eve", "hunter2"));
+    }
+
+    #[test]
+    fn rpcauth_from_password_round_trips_with_verify() {
+        let auth = RpcAuth::from_password("alice", "hunter2");
+        assert_eq!(auth.user, "alice");
+        assert_eq!(
+            auth.salt_hex.len(),
+            32,
+            "salt should be 16 bytes hex-encoded"
+        );
+        assert_eq!(
+            auth.hash_hex.len(),
+            64,
+            "hash should be 32 bytes hex-encoded"
+        );
+        assert!(auth.verify("alice", "hunter2"));
+        assert!(!auth.verify("alice", "wrong"));
+        assert!(!auth.verify("bob", "hunter2"));
+    }
+
+    #[test]
+    fn rpcauth_from_password_uses_fresh_salt_per_call() {
+        let a = RpcAuth::from_password("alice", "hunter2");
+        let b = RpcAuth::from_password("alice", "hunter2");
+        assert_ne!(a.salt_hex, b.salt_hex);
+        assert_ne!(a.hash_hex, b.hash_hex);
+    }
+
+    #[test]
+    fn hmac_password_matches_rpcauth_py_vector() {
+        // Generated with `python3 share/rpcauth/rpcauth.py alice` from
+        // bitcoin/bitcoin master. Pins the salt-hex-as-ASCII-bytes interop hinge.
+        let salt_hex = "cf2c6b493e4690de904306d1a82ef1cc";
+        let pass = "Ys-WMXs6znL6q2BH9yjh77k9keytl4JpCshiapNCMyg";
+        let expected = "9e0770d953ba59dcd5cf447615717764936d48b01d4428d251628f0156088901";
+        assert_eq!(hmac_password(salt_hex, pass), expected);
     }
 
     #[cfg(unix)]

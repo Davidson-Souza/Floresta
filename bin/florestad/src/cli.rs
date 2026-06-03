@@ -116,6 +116,14 @@ pub struct Cli {
     /// The address where our json-rpc server should listen to, in the format `<address>[:<port>]`
     pub rpc_address: Option<String>,
 
+    #[arg(long, value_name = "USER")]
+    /// Username for `-rpcuser`/`-rpcpassword` auth.
+    pub rpc_user: Option<String>,
+
+    #[arg(long, value_name = "PASS")]
+    /// Password for `-rpcuser`/`-rpcpassword` auth; setting it disables cookie auth.
+    pub rpc_password: Option<String>,
+
     #[arg(long, value_name = "HEIGHT")]
     /// Download block filters starting at this height. Negative numbers are relative to the current tip.
     pub filters_start_height: Option<i32>,

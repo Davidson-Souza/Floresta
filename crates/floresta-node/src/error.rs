@@ -113,6 +113,12 @@ pub enum FlorestadError {
 
     /// Load a flat chain store error.
     CouldNotLoadFlatChainStore(BlockchainError),
+
+    /// A configured RPC credential is not ASCII. Names the offending field.
+    NonAsciiCredential(&'static str),
+
+    /// A configured RPC username contains `:`, the header's own separator.
+    ColonInRpcUser(String),
 }
 
 impl Display for FlorestadError {
@@ -212,6 +218,19 @@ impl Display for FlorestadError {
             }
             Self::CouldNotLoadFlatChainStore(err) => {
                 write!(f, "Failure while loading flat chainstore: {err:?}")
+            }
+            Self::NonAsciiCredential(field) => {
+                write!(
+                    f,
+                    "{field} must be ASCII; non-ASCII credentials can never authenticate"
+                )
+            }
+            Self::ColonInRpcUser(user) => {
+                write!(
+                    f,
+                    "--rpc-user '{user}' must not contain ':'; it separates user from password \
+                     in the Authorization header, so this can never authenticate"
+                )
             }
         }
     }
