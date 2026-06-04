@@ -87,6 +87,8 @@ fn main() {
         rpc_user: params.rpc_user,
         #[cfg(feature = "json-rpc")]
         rpc_password: params.rpc_password,
+        #[cfg(feature = "json-rpc")]
+        rpc_auth: params.rpc_auth,
         generate_cert: params.generate_cert,
         wallet_descriptor: params.wallet_descriptor,
         filters_start_height: params.filters_start_height,

@@ -124,6 +124,12 @@ pub struct Cli {
     /// Password for `-rpcuser`/`-rpcpassword` auth; setting it disables cookie auth.
     pub rpc_password: Option<String>,
 
+    #[arg(long, value_name = "LINE", action = clap::ArgAction::Append)]
+    /// Pre-hashed credential entry in `<user>:<salt_hex>$<hash_hex>` format.
+    /// Generate with Bitcoin Core's `share/rpcauth/rpcauth.py`. Repeat for
+    /// multiple users.
+    pub rpc_auth: Vec<String>,
+
     #[arg(long, value_name = "HEIGHT")]
     /// Download block filters starting at this height. Negative numbers are relative to the current tip.
     pub filters_start_height: Option<i32>,

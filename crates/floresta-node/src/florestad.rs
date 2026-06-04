@@ -177,6 +177,11 @@ pub struct Config {
     #[cfg(feature = "json-rpc")]
     pub rpc_password: Option<String>,
 
+    /// `-rpcauth` lines: `<user>:<salt_hex>$<hash_hex>`. Repeated zero or more
+    /// times. Merged additively with config-file entries.
+    #[cfg(feature = "json-rpc")]
+    pub rpc_auth: Vec<String>,
+
     /// Whether we should write logs to `stdout`.
     pub log_to_stdout: bool,
 
@@ -270,6 +275,8 @@ impl Config {
             rpc_user: None,
             #[cfg(feature = "json-rpc")]
             rpc_password: None,
+            #[cfg(feature = "json-rpc")]
+            rpc_auth: Vec::new(),
             log_to_stdout: false,
             log_file: None,
             assume_utreexo: false,
@@ -523,7 +530,26 @@ impl Florestad {
         // JSON-RPC
         #[cfg(feature = "json-rpc")]
         if !self.config.disable_rpc {
-            let credentials = if let Some(pass) = self.get_rpc_password() {
+            // Parsed before the cookie is written, so a malformed entry cannot
+            // leave a credential on disk for a node that never starts.
+            let mut rpcauth: Vec<json_rpc::auth::RpcAuth> = Vec::new();
+            for line in self.get_rpc_auth() {
+                match json_rpc::auth::RpcAuth::parse(&line) {
+                    Ok(entry) => rpcauth.push(entry),
+                    Err(e) => {
+                        error!("{e}");
+                        // The variant names the defect without echoing the
+                        // line, which may hold a plaintext password.
+                        debug!("rpcauth parse failure: {e:?}");
+                        return Err(FlorestadError::InvalidRpcAuth);
+                    }
+                }
+            }
+            let rpcauth_entries = rpcauth.len();
+
+            let mut entries: Vec<json_rpc::auth::RpcAuth> = Vec::new();
+
+            if let Some(pass) = self.get_rpc_password() {
                 let user = self.get_rpc_user().unwrap_or_default();
                 // The Basic header parse is ASCII-only, so these would 401
                 // every request while looking configured.
@@ -538,9 +564,7 @@ impl Florestad {
                     return Err(FlorestadError::ColonInRpcUser(user));
                 }
                 info!("RPC password auth configured for user '{user}'");
-                Arc::new(json_rpc::auth::Auth::Hashed(vec![
-                    json_rpc::auth::RpcAuth::from_password(&user, &pass),
-                ]))
+                entries.push(json_rpc::auth::RpcAuth::from_password(&user, &pass));
             } else {
                 if self.get_rpc_user().is_some() {
                     warn!(
@@ -549,12 +573,24 @@ impl Florestad {
                 }
                 // Shared with floresta-cli so both resolve identically.
                 let cookie_path = floresta_rpc::resolve_cookie_path(datadir, None);
-                let cookie = json_rpc::auth::generate_cookie(&cookie_path)?;
+                let (cookie_user, cookie_pass) = json_rpc::auth::generate_cookie(&cookie_path)?;
                 info!("RPC cookie file written to {}", cookie_path.display());
                 // Recorded after a successful write, so shutdown deletes only ours.
                 let _ = self.cookie_path.set(cookie_path);
-                Arc::new(json_rpc::auth::Auth::Cookie(cookie))
-            };
+                entries.push(json_rpc::auth::RpcAuth::from_password(
+                    &cookie_user,
+                    &cookie_pass,
+                ));
+            }
+
+            // Appended after the cookie/password entry so first match still wins.
+            entries.extend(rpcauth);
+
+            if rpcauth_entries > 0 {
+                info!("RPC: {rpcauth_entries} rpcauth entries loaded");
+            }
+
+            let credentials = Arc::new(json_rpc::auth::Auth::new(entries));
 
             let server = tokio::spawn(json_rpc::server::RpcImpl::create(
                 blockchain_state.clone(),
@@ -881,6 +917,17 @@ impl Florestad {
             .clone()
             .or_else(|| self.get_config_file().rpc.password.clone())
             .filter(|s| !s.is_empty())
+    }
+
+    /// Get all `-rpcauth` lines; CLI vec is merged additively with config-file vec.
+    #[cfg(feature = "json-rpc")]
+    fn get_rpc_auth(&self) -> Vec<String> {
+        self.config
+            .rpc_auth
+            .iter()
+            .chain(self.get_config_file().rpc.auth.iter())
+            .cloned()
+            .collect()
     }
 
     /// Get the wallet descriptors from the config file

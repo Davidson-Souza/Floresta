@@ -114,6 +114,11 @@ pub enum FlorestadError {
     /// Load a flat chain store error.
     CouldNotLoadFlatChainStore(BlockchainError),
 
+    /// A malformed `-rpcauth` entry was provided at startup. Carries no
+    /// payload: `alice:hunter2` is an easy mix-up for `user:pass`, and the
+    /// message reaches stderr, journald and docker logs.
+    InvalidRpcAuth,
+
     /// A configured RPC credential is not ASCII. Names the offending field.
     NonAsciiCredential(&'static str),
 
@@ -218,6 +223,10 @@ impl Display for FlorestadError {
             }
             Self::CouldNotLoadFlatChainStore(err) => {
                 write!(f, "Failure while loading flat chainstore: {err:?}")
+            }
+            Self::InvalidRpcAuth => {
+                // Matches Bitcoin Core's wording (httprpc.cpp:300).
+                write!(f, "Invalid -rpcauth argument.")
             }
             Self::NonAsciiCredential(field) => {
                 write!(

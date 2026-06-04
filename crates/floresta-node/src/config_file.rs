@@ -19,6 +19,8 @@ pub struct Wallet {
 pub struct Rpc {
     pub user: Option<String>,
     pub password: Option<String>,
+    #[serde(default)]
+    pub auth: Vec<String>,
 }
 
 #[derive(Default, Debug, Deserialize)]
