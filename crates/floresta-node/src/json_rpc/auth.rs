@@ -13,10 +13,16 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::LazyLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::extract::Request;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -30,6 +36,8 @@ use bitcoin::hashes::Hmac;
 use bitcoin::hashes::HmacEngine;
 use bitcoin::hashes::sha256;
 use bitcoin::hex::DisplayHex;
+use tokio::sync::Semaphore;
+use tokio::sync::SemaphorePermit;
 
 /// Username literal used for cookie auth (Core convention).
 pub(crate) const COOKIE_USER: &str = "__cookie__";
@@ -171,9 +179,12 @@ pub mod basic {
 }
 
 /// Axum middleware gating each request on the configured [`Auth`]. Anything
-/// but a match returns 401 with `WWW-Authenticate` per RFC 7235.
+/// but a match returns 401 with `WWW-Authenticate` per RFC 7235; a
+/// present-but-invalid header also takes [`reject`]'s delay, an absent one not.
+/// Requests arriving with the auth queue full get 503.
 pub(crate) async fn auth_middleware(
     State(creds): State<std::sync::Arc<Auth>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
@@ -181,27 +192,89 @@ pub(crate) async fn auth_middleware(
         tracing::debug!("rpc auth header missing; rejecting");
         return unauthorized();
     };
-    let value = match header.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            tracing::debug!("rpc auth header is not valid ascii; rejecting");
-            return unauthorized();
-        }
+
+    // Held across the check, not just the delay: a correct guess returns 200
+    // without reaching `reject`, so gating only the rejection would cap how
+    // fast 401s go out and leave the guess rate unbounded.
+    let Some(permit) = acquire_auth_slot().await else {
+        tracing::debug!("rpc auth queue full; shedding with 503");
+        return service_unavailable();
     };
-    let claimed = match basic::Credentials::parse(value) {
-        Ok(creds) => creds,
-        Err(e) => {
-            tracing::debug!("rpc auth header parse failed: {e}; rejecting");
-            return unauthorized();
-        }
+
+    let Ok(value) = header.to_str() else {
+        tracing::debug!("rpc auth header is not valid ascii; rejecting");
+        return reject(permit).await;
     };
-    if !creds.matches(&claimed.user, &claimed.pass) {
-        let user = &claimed.user;
-        tracing::debug!("rpc auth credentials mismatched for user {user}; rejecting");
-        return unauthorized();
+    match basic::Credentials::parse(value) {
+        Err(e) => tracing::debug!("rpc auth header parse failed: {e}; rejecting"),
+        Ok(claimed) => {
+            if creds.matches(&claimed.user, &claimed.pass) {
+                // Freed before the request runs, so authenticated work is not
+                // capped at `AUTH_SLOTS`.
+                drop(permit);
+                tracing::debug!("rpc auth ok for user {}", claimed.user);
+                return next.run(req).await;
+            }
+            tracing::warn!("incorrect password attempt from {peer}");
+        }
     }
-    tracing::debug!("rpc auth ok for user {}", claimed.user);
-    next.run(req).await
+    reject(permit).await
+}
+
+/// Credential checks allowed at once. A failing one holds its slot across the
+/// delay, capping guesses at roughly `AUTH_SLOTS / 250 ms`. Core caps the same
+/// rate with its 16 HTTP workers, each blocked by its sleep (httprpc.cpp:128).
+const AUTH_SLOTS: usize = 16;
+
+/// Requests allowed to queue for a slot before shedding, as Core sheds past
+/// `-rpcworkqueue` (httpserver.cpp:255). Zero would make any attacker holding
+/// the slots an instant outage; unbounded would let one grow a backlog.
+const AUTH_QUEUE_DEPTH: usize = 64;
+
+static AUTH_LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(AUTH_SLOTS));
+
+/// Requests parked on [`AUTH_LIMIT`]. `Semaphore` exposes free permits but not
+/// its wait queue length.
+static AUTH_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements [`AUTH_WAITERS`] however the wait ends, cancellation included.
+struct WaiterGuard;
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        AUTH_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Take an auth slot, or `None` when [`AUTH_QUEUE_DEPTH`] are already waiting.
+async fn acquire_auth_slot() -> Option<SemaphorePermit<'static>> {
+    // Claim a place first, then undo it if we were over: `fetch_add` hands each
+    // caller a distinct prior value, so the bound stays exact. A load followed
+    // by a separate add would let several past an already-full queue.
+    if AUTH_WAITERS.fetch_add(1, Ordering::Relaxed) >= AUTH_QUEUE_DEPTH {
+        AUTH_WAITERS.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
+    // Counted as waiting only until the permit lands.
+    let _waiter = WaiterGuard;
+    AUTH_LIMIT.acquire().await.ok()
+}
+
+/// Delay before a 401, matching Core (httprpc.cpp:128).
+const REJECT_DELAY: Duration = Duration::from_millis(250);
+
+/// Applies [`REJECT_DELAY`] before the 401, for present-but-invalid headers
+/// only. The slot is released from a detached task, so a client hanging up
+/// mid-delay cannot free it: the guess was already checked, and freeing early
+/// would let an attacker who ignores the 401 run unthrottled. Core's blocked
+/// worker cannot be freed that way either.
+async fn reject(permit: SemaphorePermit<'static>) -> Response {
+    let hold = tokio::spawn(async move {
+        tokio::time::sleep(REJECT_DELAY).await;
+        drop(permit);
+    });
+    let _ = hold.await;
+    unauthorized()
 }
 
 fn unauthorized() -> Response {
@@ -210,6 +283,13 @@ fn unauthorized() -> Response {
         .header(WWW_AUTHENTICATE, r#"Basic realm="jsonrpc""#)
         .body(Body::empty())
         .expect("static 401 response is always well-formed")
+}
+
+fn service_unavailable() -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .body(Body::empty())
+        .expect("static 503 response is always well-formed")
 }
 
 /// Configured RPC credentials for this process: cookie, `-rpcuser`/`-rpcpassword`,
@@ -779,6 +859,58 @@ mod tests {
         assert_eq!(
             RpcAuth::parse("user:salt$"),
             Err(RpcAuthParseError::EmptyField)
+        );
+    }
+
+    #[tokio::test]
+    /// Both halves of the limiter, in one test because they share the process
+    /// global and would race each other as separate ones. The guess rate this
+    /// caps is covered end to end by `tests/florestad/rpc_auth.py`.
+    async fn auth_slots_shed_when_full_and_are_held_for_the_whole_attempt() {
+        // Shedding: hold every slot, fill the queue, expect a refusal.
+        let held: Vec<_> = (0..AUTH_SLOTS)
+            .map(|_| {
+                AUTH_LIMIT
+                    .try_acquire()
+                    .expect("slot is free at test start")
+            })
+            .collect();
+
+        let mut waiting = Vec::with_capacity(AUTH_QUEUE_DEPTH);
+        for _ in 0..AUTH_QUEUE_DEPTH {
+            waiting.push(tokio::spawn(acquire_auth_slot()));
+        }
+        while AUTH_WAITERS.load(Ordering::Relaxed) < AUTH_QUEUE_DEPTH {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            acquire_auth_slot().await.is_none(),
+            "a full queue should shed rather than admit another waiter"
+        );
+
+        drop(held);
+        for handle in waiting {
+            handle.await.expect("waiter should not panic");
+        }
+
+        // Holding: `AUTH_SLOTS + 1` attempts need two rounds of the delay.
+        let start = std::time::Instant::now();
+        let mut set = Vec::with_capacity(AUTH_SLOTS + 1);
+        for _ in 0..=AUTH_SLOTS {
+            set.push(tokio::spawn(async {
+                let permit = acquire_auth_slot().await.expect("queue has room");
+                reject(permit).await
+            }));
+        }
+        for handle in set {
+            handle.await.expect("reject should not panic");
+        }
+
+        assert!(
+            start.elapsed() >= Duration::from_millis(500),
+            "one extra attempt should wait for a free slot, took {:?}",
+            start.elapsed()
         );
     }
 
