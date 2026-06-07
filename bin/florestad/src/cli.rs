@@ -130,6 +130,17 @@ pub struct Cli {
     /// multiple users.
     pub rpc_auth: Vec<String>,
 
+    #[arg(long, value_name = "PATH")]
+    /// Override the path where florestad writes the RPC cookie file.
+    /// Absolute paths are used as-is; relative paths are joined against the
+    /// net-specific data directory.
+    pub rpc_cookie_file: Option<PathBuf>,
+
+    #[arg(long)]
+    /// Disable cookie auth entirely. Configured `-rpcuser`/`-rpcpassword` or
+    /// `-rpcauth` entries still work; no cookie file is written.
+    pub no_rpc_cookie_file: bool,
+
     #[arg(long, value_name = "HEIGHT")]
     /// Download block filters starting at this height. Negative numbers are relative to the current tip.
     pub filters_start_height: Option<i32>,

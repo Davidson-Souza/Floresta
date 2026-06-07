@@ -510,6 +510,23 @@ mod tests {
     }
 
     #[test]
+    fn generate_cookie_returns_user_and_token_consistent_with_file() {
+        let path = tmp_cookie_path("consistency");
+        let (user, token) = generate_cookie(&path).expect("cookie write should succeed in test");
+        let written = fs::read_to_string(&path).expect("test wrote this cookie file above");
+        assert_eq!(written, format!("{user}:{token}"));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn generate_cookie_writes_to_arbitrary_path() {
+        let path = tmp_cookie_path("custom_path");
+        generate_cookie(&path).expect("cookie write should succeed in test");
+        assert!(path.exists(), "cookie file should exist at the chosen path");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn generate_cookie_produces_distinct_tokens() {
         let path1 = tmp_cookie_path("distinct1");
         let path2 = tmp_cookie_path("distinct2");

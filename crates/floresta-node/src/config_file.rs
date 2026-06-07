@@ -21,6 +21,7 @@ pub struct Rpc {
     pub password: Option<String>,
     #[serde(default)]
     pub auth: Vec<String>,
+    pub cookie_file: Option<String>,
 }
 
 #[derive(Default, Debug, Deserialize)]
