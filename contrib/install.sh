@@ -586,7 +586,10 @@ show_done() {
     echo "    sudo systemctl start florestad.service  # this will start the service now"
     echo "    sudo systemctl status florestad.service # this check if service is running well"
     echo "    sudo systemctl enable florestad.service # this enable service on boot"
-    echo "    floresta-cli getblockchaininfo          # this assures all OK"
+    echo "    sudo -u florestad floresta-cli --network $network --data-dir $florestaDir getblockchaininfo"
+    echo ""
+    echo "The RPC cookie is owned by the 'florestad' user and readable only by it,"
+    echo "so run floresta-cli as that user, or set -rpcuser/-rpcpassword instead."
     echo ""
 }
 

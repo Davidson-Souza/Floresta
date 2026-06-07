@@ -95,7 +95,10 @@ After the installation procedure finishes, you'll see this message:
     sudo systemctl start florestad.service  # this will start the service now
     sudo systemctl status florestad.service # this check if service is running well
     sudo systemctl enable florestad.service # this enable service on boot
-    floresta-cli getblockchaininfo          # this assures all OK
+    sudo -u florestad floresta-cli --network bitcoin --data-dir /var/lib/florestad getblockchaininfo
+
+The RPC cookie is owned by the 'florestad' user and readable only by it,
+so run floresta-cli as that user, or set -rpcuser/-rpcpassword instead.
 ```
 
 This means that both `florestad` and `floresta-cli` are installed. You could check with:
