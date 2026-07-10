@@ -12,10 +12,13 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::node::PeerStatus;
+    use crate::node_interface::ChainMethods;
     use crate::node_interface::NetworkMethods;
     use crate::node_interface::NodeConfigMethods;
     use crate::p2p_wire::tests::utils::PeerData;
     use crate::p2p_wire::tests::utils::setup_node_handle_test;
+    use crate::p2p_wire::tests::utils::signet_blocks;
+    use crate::p2p_wire::tests::utils::signet_headers;
     use crate::p2p_wire::transport::TransportProtocol;
 
     #[tokio::test]
@@ -64,6 +67,30 @@ mod tests {
         assert_eq!(peer.transport_protocol, TransportProtocol::V2);
         assert!(peer.services.has(ServiceFlags::NETWORK));
         assert!(peer.services.has(service_flags::UTREEXO.into()));
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn node_handle_get_block_returns_mocked_peer_block() {
+        let datadir = format!("./tmp-db/{}.node_handle", rand::random::<u32>());
+        let headers = signet_headers();
+        let blocks = signet_blocks();
+        let expected_block = blocks.get(&headers[1].block_hash()).unwrap().clone();
+        let peer = PeerData::new(Vec::new(), blocks, HashMap::new());
+        let harness = setup_node_handle_test(vec![peer], false, Network::Signet, &datadir, 0).await;
+        harness.wait_for_peers(1).await;
+
+        let block = timeout(
+            Duration::from_secs(5),
+            harness.handle.get_block(expected_block.block_hash()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(block, expected_block);
 
         harness.shutdown().await;
     }
