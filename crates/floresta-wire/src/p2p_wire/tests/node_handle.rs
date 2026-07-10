@@ -8,10 +8,13 @@ mod tests {
     use bitcoin::Network;
     use bitcoin::p2p::ServiceFlags;
     use floresta_common::service_flags;
+    use tokio::sync::mpsc::unbounded_channel;
     use tokio::time::Duration;
     use tokio::time::timeout;
 
+    use crate::node::NodeNotification;
     use crate::node::PeerStatus;
+    use crate::node_handle::NodeHandle;
     use crate::node_interface::ChainMethods;
     use crate::node_interface::NetworkMethods;
     use crate::node_interface::NodeConfigMethods;
@@ -93,5 +96,20 @@ mod tests {
         assert_eq!(block, expected_block);
 
         harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn node_handle_returns_error_when_node_receiver_is_dropped() {
+        let (node_sender, node_receiver) = unbounded_channel::<NodeNotification>();
+        drop(node_receiver);
+
+        let handle = NodeHandle::new(node_sender);
+
+        let err = timeout(Duration::from_secs(5), handle.get_config())
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "channel closed");
     }
 }
