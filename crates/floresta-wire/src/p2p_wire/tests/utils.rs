@@ -36,6 +36,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tokio::time::timeout;
 use zstd;
 
@@ -50,6 +51,7 @@ use crate::node::PeerStatus;
 use crate::node::UtreexoNode;
 use crate::node::sync_ctx::SyncNode;
 use crate::node_handle::NodeHandle;
+use crate::node_interface::NetworkMethods;
 use crate::p2p_wire::block_proof::UtreexoProof;
 use crate::p2p_wire::peer::PeerMessages;
 use crate::p2p_wire::peer::Version;
@@ -311,6 +313,21 @@ pub struct NodeHandleTestHarness {
 }
 
 impl NodeHandleTestHarness {
+    pub async fn wait_for_peers(&self, expected: usize) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let peers = self.handle.get_peer_info().await.unwrap();
+                if peers.len() == expected {
+                    break;
+                }
+
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     pub async fn shutdown(self) {
         *self.kill_signal.write().await = true;
         self.node_sender
