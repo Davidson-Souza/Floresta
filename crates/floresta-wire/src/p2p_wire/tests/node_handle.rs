@@ -140,4 +140,24 @@ mod tests {
 
         harness.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn node_handle_block_request_stays_pending_when_peer_ignores_request() {
+        let datadir = format!("./tmp-db/{}.node_handle", rand::random::<u32>());
+        let headers = signet_headers();
+        let block_hash = headers[1].block_hash();
+        let peer = PeerData::ignoring_block_requests(Vec::new(), HashMap::new(), HashMap::new());
+        let harness = setup_node_handle_test(vec![peer], false, Network::Signet, &datadir, 0).await;
+        harness.wait_for_peers(1).await;
+
+        let request = timeout(
+            Duration::from_millis(500),
+            harness.handle.get_block(block_hash),
+        )
+        .await;
+
+        assert!(request.is_err());
+
+        harness.shutdown().await;
+    }
 }

@@ -66,6 +66,7 @@ pub struct UtreexoRoots {
 // Nightly Clippy false positive in `Constructor`-generated code:
 // https://github.com/rust-lang/rust-clippy/issues/17525
 #[allow(clippy::redundant_field_names)]
+#[allow(clippy::too_many_arguments)]
 #[derive(Debug, Constructor)]
 pub struct SimulatedPeer {
     headers: Vec<Header>,
@@ -80,6 +81,7 @@ pub struct SimulatedPeer {
 #[derive(Debug, Clone, Copy)]
 enum BlockRequestBehavior {
     Reply,
+    Ignore,
     Disconnect,
 }
 
@@ -135,6 +137,10 @@ impl SimulatedPeer {
                         .unwrap();
                 }
                 NodeRequest::GetBlock(hashes) => {
+                    if matches!(self.block_request_behavior, BlockRequestBehavior::Ignore) {
+                        continue;
+                    }
+
                     if matches!(
                         self.block_request_behavior,
                         BlockRequestBehavior::Disconnect
@@ -354,6 +360,19 @@ impl PeerData {
             blocks,
             accs,
             block_request_behavior: BlockRequestBehavior::Disconnect,
+        }
+    }
+
+    pub fn ignoring_block_requests(
+        headers: Vec<Header>,
+        blocks: HashMap<BlockHash, Block>,
+        accs: HashMap<BlockHash, Vec<u8>>,
+    ) -> Self {
+        Self {
+            headers,
+            blocks,
+            accs,
+            block_request_behavior: BlockRequestBehavior::Ignore,
         }
     }
 }
