@@ -9,12 +9,15 @@ use std::time::Instant;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Network;
+use bitcoin::Transaction;
+use bitcoin::Txid;
 use bitcoin::block::Header;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::encode;
 use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::hex::FromHex;
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::p2p::message_filter::CFHeaders;
 use derive_more::Constructor;
 use floresta_chain::AssumeValidArg;
 use floresta_chain::ChainState;
@@ -72,6 +75,8 @@ pub struct SimulatedPeer {
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, Block>,
     accs: HashMap<BlockHash, Vec<u8>>,
+    transactions: HashMap<Txid, Transaction>,
+    cfilter_headers: HashMap<BlockHash, CFHeaders>,
     block_request_behavior: BlockRequestBehavior,
     node_tx: UnboundedSender<NodeNotification>,
     node_rx: UnboundedReceiver<NodeRequest>,
@@ -173,6 +178,22 @@ impl SimulatedPeer {
                         .send(NodeNotification::FromPeer(self.peer_id, peer_msg, now))
                         .unwrap();
                 }
+                NodeRequest::MempoolTransaction(txid) => {
+                    let tx = self.transactions.get(&txid).unwrap().clone();
+
+                    let peer_msg = PeerMessages::Transaction(tx);
+                    self.node_tx
+                        .send(NodeNotification::FromPeer(self.peer_id, peer_msg, now))
+                        .unwrap();
+                }
+                NodeRequest::GetCFHeaders { stop_hash, .. } => {
+                    let cfheaders = self.cfilter_headers.get(&stop_hash).unwrap().clone();
+
+                    let peer_msg = PeerMessages::CFHeaders(cfheaders);
+                    self.node_tx
+                        .send(NodeNotification::FromPeer(self.peer_id, peer_msg, now))
+                        .unwrap();
+                }
                 _ => {}
             }
         }
@@ -192,6 +213,8 @@ fn create_peer(
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, Block>,
     accs: HashMap<BlockHash, Vec<u8>>,
+    transactions: HashMap<Txid, Transaction>,
+    cfilter_headers: HashMap<BlockHash, CFHeaders>,
     block_request_behavior: BlockRequestBehavior,
     node_sender: UnboundedSender<NodeNotification>,
     sender: UnboundedSender<NodeRequest>,
@@ -202,6 +225,8 @@ fn create_peer(
         headers,
         blocks,
         accs,
+        transactions,
+        cfilter_headers,
         block_request_behavior,
         node_sender,
         node_rcv,
@@ -333,6 +358,8 @@ pub struct PeerData {
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, Block>,
     accs: HashMap<BlockHash, Vec<u8>>,
+    transactions: HashMap<Txid, Transaction>,
+    cfilter_headers: HashMap<BlockHash, CFHeaders>,
     block_request_behavior: BlockRequestBehavior,
 }
 
@@ -346,6 +373,8 @@ impl PeerData {
             headers,
             blocks,
             accs,
+            transactions: HashMap::new(),
+            cfilter_headers: HashMap::new(),
             block_request_behavior: BlockRequestBehavior::Reply,
         }
     }
@@ -359,6 +388,8 @@ impl PeerData {
             headers,
             blocks,
             accs,
+            transactions: HashMap::new(),
+            cfilter_headers: HashMap::new(),
             block_request_behavior: BlockRequestBehavior::Disconnect,
         }
     }
@@ -372,8 +403,21 @@ impl PeerData {
             headers,
             blocks,
             accs,
+            transactions: HashMap::new(),
+            cfilter_headers: HashMap::new(),
             block_request_behavior: BlockRequestBehavior::Ignore,
         }
+    }
+
+    pub fn with_transaction(mut self, transaction: Transaction) -> Self {
+        self.transactions
+            .insert(transaction.compute_txid(), transaction);
+        self
+    }
+
+    pub fn with_cfilter_headers(mut self, cfheaders: CFHeaders) -> Self {
+        self.cfilter_headers.insert(cfheaders.stop_hash, cfheaders);
+        self
     }
 }
 
@@ -506,6 +550,8 @@ pub async fn setup_node_handle_test(
             peer.headers,
             peer.blocks,
             peer.accs,
+            peer.transactions,
+            peer.cfilter_headers,
             peer.block_request_behavior,
             node.node_tx.clone(),
             sender.clone(),
@@ -534,6 +580,8 @@ pub async fn setup_node_handle_test(
             (peer_id, Instant::now()),
         );
     }
+
+    node.peer_id_count = node.peers.len() as u32;
 
     let handle = node.get_handle();
     let node_sender = node.node_tx.clone();
@@ -588,6 +636,8 @@ pub async fn setup_node(
             peer.headers,
             peer.blocks,
             peer.accs,
+            peer.transactions,
+            peer.cfilter_headers,
             peer.block_request_behavior,
             node.node_tx.clone(),
             sender.clone(),
@@ -619,6 +669,8 @@ pub async fn setup_node(
             (peer_id, Instant::now()),
         );
     }
+
+    node.peer_id_count = node.peers.len() as u32;
 
     timeout(Duration::from_secs(100), node.run(|_| {}))
         .await

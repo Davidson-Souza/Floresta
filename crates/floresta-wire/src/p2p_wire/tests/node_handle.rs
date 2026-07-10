@@ -5,15 +5,31 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
+    use bitcoin::Amount;
+    use bitcoin::FilterHash;
+    use bitcoin::FilterHeader;
     use bitcoin::Network;
+    use bitcoin::OutPoint;
+    use bitcoin::ScriptBuf;
+    use bitcoin::Sequence;
+    use bitcoin::Transaction;
+    use bitcoin::TxIn;
+    use bitcoin::TxOut;
+    use bitcoin::Txid;
+    use bitcoin::absolute;
+    use bitcoin::hashes::Hash;
+    use bitcoin::p2p::message_filter::CFHeaders;
+    use bitcoin::transaction::Version;
     use tokio::sync::mpsc::unbounded_channel;
     use tokio::time::Duration;
     use tokio::time::timeout;
 
+    use crate::bitcoin_socket_addr::BitcoinSocketAddr;
     use crate::node::NodeNotification;
     use crate::node::PeerStatus;
     use crate::node_handle::NodeHandle;
     use crate::node_interface::ChainMethods;
+    use crate::node_interface::MempoolMethods;
     use crate::node_interface::NetworkMethods;
     use crate::node_interface::NodeConfigMethods;
     use crate::p2p_wire::tests::utils::PeerData;
@@ -21,6 +37,26 @@ mod tests {
     use crate::p2p_wire::tests::utils::signet_blocks;
     use crate::p2p_wire::tests::utils::signet_headers;
     use crate::p2p_wire::transport::TransportProtocol;
+
+    fn sample_transaction() -> Transaction {
+        Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
 
     #[tokio::test]
     async fn node_handle_get_config_returns_running_node_config() {
@@ -102,6 +138,125 @@ mod tests {
 
         assert_eq!(block, expected_block);
 
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn node_handle_get_cfilters_headers_returns_mocked_peer_headers() {
+        let datadir = format!("./tmp-db/{}.node_handle", rand::random::<u32>());
+        let stop_hash = signet_headers()[1].block_hash();
+        let cfheaders = CFHeaders {
+            filter_type: 0,
+            stop_hash,
+            previous_filter_header: FilterHeader::all_zeros(),
+            filter_hashes: vec![FilterHash::all_zeros()],
+        };
+        let peer = PeerData::new(Vec::new(), HashMap::new(), HashMap::new())
+            .with_cfilter_headers(cfheaders.clone());
+        let harness = setup_node_handle_test(vec![peer], false, Network::Signet, &datadir, 0).await;
+        harness.wait_for_peers(1).await;
+
+        let response = timeout(
+            Duration::from_secs(5),
+            harness.handle.get_cfilters_headers(1, stop_hash),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response, cfheaders);
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn node_handle_mempool_methods_use_local_mempool_and_mocked_peer() {
+        let datadir = format!("./tmp-db/{}.node_handle", rand::random::<u32>());
+        let transaction = sample_transaction();
+        let txid = transaction.compute_txid();
+        let peer = PeerData::new(Vec::new(), HashMap::new(), HashMap::new())
+            .with_transaction(transaction.clone());
+        let harness = setup_node_handle_test(vec![peer], false, Network::Signet, &datadir, 0).await;
+        harness.wait_for_peers(1).await;
+
+        let broadcast_txid = timeout(
+            Duration::from_secs(5),
+            harness.handle.broadcast_transaction(transaction.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let fetched_transaction = timeout(
+            Duration::from_secs(5),
+            harness.handle.get_mempool_transaction(txid),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(broadcast_txid, txid);
+        assert_eq!(fetched_transaction, transaction);
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn node_handle_network_methods_return_node_status_and_control_peers() {
+        let datadir = format!("./tmp-db/{}.node_handle", rand::random::<u32>());
+        let peer = PeerData::new(Vec::new(), HashMap::new(), HashMap::new());
+        let harness = setup_node_handle_test(vec![peer], false, Network::Signet, &datadir, 0).await;
+        harness.wait_for_peers(1).await;
+
+        let add_addr: BitcoinSocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let onetry_addr: BitcoinSocketAddr = "127.0.0.1:18445".parse().unwrap();
+        let connected_addr = harness.handle.get_peer_info().await.unwrap()[0]
+            .address
+            .clone();
+
+        let ping = timeout(Duration::from_secs(5), harness.handle.ping())
+            .await
+            .unwrap()
+            .unwrap();
+        let add = timeout(
+            Duration::from_secs(5),
+            harness.handle.add_peer(add_addr.clone(), false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let stats = timeout(Duration::from_secs(5), harness.handle.get_addrman_info())
+            .await
+            .unwrap()
+            .unwrap();
+        let remove = timeout(Duration::from_secs(5), harness.handle.remove_peer(add_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        let onetry = timeout(
+            Duration::from_secs(5),
+            harness.handle.onetry_peer(onetry_addr, false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let disconnect = timeout(
+            Duration::from_secs(5),
+            harness.handle.disconnect_peer(connected_addr),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(ping);
+        assert!(add);
+        assert_eq!(stats.ipv4.total(), stats.ipv4.new + stats.ipv4.tried);
+        assert!(remove);
+        assert!(onetry);
+        assert!(disconnect);
+
+        harness.wait_for_peers(0).await;
         harness.shutdown().await;
     }
 
