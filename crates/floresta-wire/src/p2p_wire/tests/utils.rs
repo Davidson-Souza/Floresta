@@ -71,9 +71,16 @@ pub struct SimulatedPeer {
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, Block>,
     accs: HashMap<BlockHash, Vec<u8>>,
+    block_request_behavior: BlockRequestBehavior,
     node_tx: UnboundedSender<NodeNotification>,
     node_rx: UnboundedReceiver<NodeRequest>,
     peer_id: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BlockRequestBehavior {
+    Reply,
+    Disconnect,
 }
 
 impl SimulatedPeer {
@@ -128,6 +135,13 @@ impl SimulatedPeer {
                         .unwrap();
                 }
                 NodeRequest::GetBlock(hashes) => {
+                    if matches!(
+                        self.block_request_behavior,
+                        BlockRequestBehavior::Disconnect
+                    ) {
+                        break;
+                    }
+
                     for hash in hashes {
                         let block = self.blocks.get(&hash).unwrap().clone();
 
@@ -167,16 +181,26 @@ impl SimulatedPeer {
     }
 }
 
-pub fn create_peer(
+#[allow(clippy::too_many_arguments)]
+fn create_peer(
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, Block>,
     accs: HashMap<BlockHash, Vec<u8>>,
+    block_request_behavior: BlockRequestBehavior,
     node_sender: UnboundedSender<NodeNotification>,
     sender: UnboundedSender<NodeRequest>,
     node_rcv: UnboundedReceiver<NodeRequest>,
     peer_id: u32,
 ) -> LocalPeerView {
-    let mut peer = SimulatedPeer::new(headers, blocks, accs, node_sender, node_rcv, peer_id);
+    let mut peer = SimulatedPeer::new(
+        headers,
+        blocks,
+        accs,
+        block_request_behavior,
+        node_sender,
+        node_rcv,
+        peer_id,
+    );
     task::spawn(async move {
         peer.run().await;
     });
@@ -297,12 +321,41 @@ pub fn mutated_block_h7() -> Block {
 // Nightly Clippy false positive in `Constructor`-generated code:
 // https://github.com/rust-lang/rust-clippy/issues/17525
 #[allow(clippy::redundant_field_names)]
-#[derive(Clone, Constructor)]
+#[derive(Clone)]
 /// The chain data that our simulated peer will have
 pub struct PeerData {
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, Block>,
     accs: HashMap<BlockHash, Vec<u8>>,
+    block_request_behavior: BlockRequestBehavior,
+}
+
+impl PeerData {
+    pub fn new(
+        headers: Vec<Header>,
+        blocks: HashMap<BlockHash, Block>,
+        accs: HashMap<BlockHash, Vec<u8>>,
+    ) -> Self {
+        Self {
+            headers,
+            blocks,
+            accs,
+            block_request_behavior: BlockRequestBehavior::Reply,
+        }
+    }
+
+    pub fn disconnecting_on_block_request(
+        headers: Vec<Header>,
+        blocks: HashMap<BlockHash, Block>,
+        accs: HashMap<BlockHash, Vec<u8>>,
+    ) -> Self {
+        Self {
+            headers,
+            blocks,
+            accs,
+            block_request_behavior: BlockRequestBehavior::Disconnect,
+        }
+    }
 }
 
 pub struct NodeHandleTestHarness {
@@ -378,7 +431,7 @@ async fn run_node_handle_test_node(
                         node.attach_proof(uproof, peer).unwrap();
                     }
                     PeerMessages::Disconnected(idx) => {
-                        node.handle_disconnection(peer, idx).unwrap();
+                        let _ = node.handle_disconnection(peer, idx);
                     }
                     _ => {}
                 }
@@ -434,6 +487,7 @@ pub async fn setup_node_handle_test(
             peer.headers,
             peer.blocks,
             peer.accs,
+            peer.block_request_behavior,
             node.node_tx.clone(),
             sender.clone(),
             receiver,
@@ -515,6 +569,7 @@ pub async fn setup_node(
             peer.headers,
             peer.blocks,
             peer.accs,
+            peer.block_request_behavior,
             node.node_tx.clone(),
             sender.clone(),
             receiver,

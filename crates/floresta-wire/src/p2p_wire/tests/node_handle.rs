@@ -6,8 +6,6 @@ mod tests {
     use std::path::PathBuf;
 
     use bitcoin::Network;
-    use bitcoin::p2p::ServiceFlags;
-    use floresta_common::service_flags;
     use tokio::sync::mpsc::unbounded_channel;
     use tokio::time::Duration;
     use tokio::time::timeout;
@@ -68,8 +66,17 @@ mod tests {
         assert_eq!(peer.user_agent, "node_test");
         assert_eq!(peer.state, PeerStatus::Ready);
         assert_eq!(peer.transport_protocol, TransportProtocol::V2);
-        assert!(peer.services.has(ServiceFlags::NETWORK));
-        assert!(peer.services.has(service_flags::UTREEXO.into()));
+        assert_eq!(
+            peer.services_names,
+            vec![
+                "NETWORK",
+                "WITNESS",
+                "COMPACT_FILTERS",
+                "UTREEXO",
+                "UTREEXO_ARCHIVE"
+            ]
+        );
+        assert_eq!(peer.services, "0000000000003049");
 
         harness.shutdown().await;
     }
@@ -111,5 +118,26 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.to_string(), "channel closed");
+    }
+
+    #[tokio::test]
+    async fn node_handle_block_request_stays_pending_when_peer_disconnects() {
+        let datadir = format!("./tmp-db/{}.node_handle", rand::random::<u32>());
+        let headers = signet_headers();
+        let block_hash = headers[1].block_hash();
+        let peer =
+            PeerData::disconnecting_on_block_request(Vec::new(), HashMap::new(), HashMap::new());
+        let harness = setup_node_handle_test(vec![peer], false, Network::Signet, &datadir, 0).await;
+        harness.wait_for_peers(1).await;
+
+        let request = timeout(
+            Duration::from_millis(500),
+            harness.handle.get_block(block_hash),
+        )
+        .await;
+
+        assert!(request.is_err());
+
+        harness.shutdown().await;
     }
 }
