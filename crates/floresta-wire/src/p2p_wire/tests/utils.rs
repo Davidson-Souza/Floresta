@@ -35,6 +35,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use zstd;
 
@@ -48,6 +49,7 @@ use crate::node::NodeRequest;
 use crate::node::PeerStatus;
 use crate::node::UtreexoNode;
 use crate::node::sync_ctx::SyncNode;
+use crate::node_handle::NodeHandle;
 use crate::p2p_wire::block_proof::UtreexoProof;
 use crate::p2p_wire::peer::PeerMessages;
 use crate::p2p_wire::peer::Version;
@@ -202,6 +204,7 @@ pub fn get_node_config(
         network,
         pow_fraud_proofs,
         datadir: datadir.as_ref().into(),
+        disable_dns_seeds: true,
         user_agent: "node_test".to_string(),
         ..Default::default()
     }
@@ -298,6 +301,160 @@ pub struct PeerData {
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, Block>,
     accs: HashMap<BlockHash, Vec<u8>>,
+}
+
+pub struct NodeHandleTestHarness {
+    pub handle: NodeHandle,
+    kill_signal: Arc<RwLock<bool>>,
+    node_sender: UnboundedSender<NodeNotification>,
+    node_task: JoinHandle<()>,
+}
+
+impl NodeHandleTestHarness {
+    pub async fn shutdown(self) {
+        *self.kill_signal.write().await = true;
+        self.node_sender
+            .send(NodeNotification::DnsSeedAddresses(Vec::new()))
+            .unwrap();
+
+        timeout(Duration::from_secs(5), self.node_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+async fn run_node_handle_test_node(
+    mut node: UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+) {
+    loop {
+        let Some(notification) = node.node_rx.recv().await else {
+            break;
+        };
+
+        if *node.kill_signal.read().await {
+            break;
+        }
+
+        match notification {
+            NodeNotification::FromUser(request, responder) => {
+                node.perform_user_request(request, responder).await;
+            }
+            NodeNotification::DnsSeedAddresses(addresses) => {
+                node.address_man.push_addresses(&addresses);
+            }
+            NodeNotification::FromPeer(peer, message, time) => {
+                node.register_message_time(&message, peer, time);
+
+                let Some(unhandled) = node.handle_peer_msg_common(message, peer).unwrap() else {
+                    continue;
+                };
+
+                match unhandled {
+                    PeerMessages::Ready(version) => {
+                        node.handle_peer_ready(peer, version).unwrap();
+                    }
+                    PeerMessages::Block(block) => {
+                        node.request_block_proof(block, peer).unwrap();
+                    }
+                    PeerMessages::UtreexoProof(uproof) => {
+                        node.attach_proof(uproof, peer).unwrap();
+                    }
+                    PeerMessages::Disconnected(idx) => {
+                        node.handle_disconnection(peer, idx).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if *node.kill_signal.read().await {
+            break;
+        }
+    }
+
+    node.shutdown();
+}
+
+pub async fn setup_node_handle_test(
+    peers: Vec<PeerData>,
+    pow_fraud_proofs: bool,
+    network: Network,
+    datadir: impl AsRef<Path>,
+    num_blocks: usize,
+) -> NodeHandleTestHarness {
+    let config = FlatChainStoreConfig::new(&datadir);
+
+    let chainstore = FlatChainStore::new(config).unwrap();
+    let mempool = Arc::new(Mutex::new(Mempool::new(1000)));
+    let chain = ChainState::open(chainstore, network, AssumeValidArg::Disabled).unwrap();
+    let chain = Arc::new(chain);
+
+    let mut headers = signet_headers();
+    headers.remove(0);
+    headers.truncate(num_blocks);
+    for header in headers {
+        chain.accept_header(header).unwrap();
+    }
+
+    let config = get_node_config(&datadir, network, pow_fraud_proofs);
+    let kill_signal = Arc::new(RwLock::new(false));
+    let mut node = UtreexoNode::<Arc<ChainState<FlatChainStore>>, SyncNode>::new(
+        config,
+        chain.clone(),
+        mempool,
+        None,
+        kill_signal.clone(),
+        AddressMan::new(None, &[]),
+    )
+    .unwrap();
+
+    for (i, peer) in peers.into_iter().enumerate() {
+        let (sender, receiver) = unbounded_channel();
+        let peer_id = i as u32;
+
+        let peer = create_peer(
+            peer.headers,
+            peer.blocks,
+            peer.accs,
+            node.node_tx.clone(),
+            sender.clone(),
+            receiver,
+            peer_id,
+        );
+
+        if i == 0 {
+            node.fixed_peers = vec![peer.address.clone()];
+        }
+
+        node.peers.insert(peer_id, peer);
+        for service in [
+            service_flags::UTREEXO.into(),
+            ServiceFlags::COMPACT_FILTERS,
+            ServiceFlags::NETWORK,
+        ] {
+            node.peer_by_service
+                .entry(service)
+                .or_default()
+                .push(peer_id);
+        }
+
+        node.inflight.insert(
+            InflightRequests::Connect(peer_id),
+            (peer_id, Instant::now()),
+        );
+    }
+
+    let handle = node.get_handle();
+    let node_sender = node.node_tx.clone();
+    let node_task = task::spawn(run_node_handle_test_node(node));
+
+    NodeHandleTestHarness {
+        handle,
+        kill_signal,
+        node_sender,
+        node_task,
+    }
 }
 
 pub async fn setup_node(
