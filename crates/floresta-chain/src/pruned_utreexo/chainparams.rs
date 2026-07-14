@@ -450,6 +450,40 @@ pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
     seeds
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuriedDeployment {
+    Bip34,
+    Bip65,
+    Bip66,
+    Csv,
+    Segwit,
+}
+
+impl BuriedDeployment {
+    /// Name used in the `getdeploymentinfo` RPC response.
+    pub fn to_deployment_name(self) -> &'static str {
+        match self {
+            Self::Bip34 => "bip34",
+            Self::Bip65 => "bip65",
+            Self::Bip66 => "bip66",
+            Self::Csv => "csv",
+            Self::Segwit => "segwit",
+        }
+    }
+
+    /// Script flags enabled by this deployment. Empty for deployments
+    /// that do not change script validation (BIP34 only changes coinbase structure).
+    pub fn to_script_flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Bip34 => &[],
+            Self::Bip65 => &["CHECKLOCKTIMEVERIFY"],
+            Self::Bip66 => &["DERSIG"],
+            Self::Csv => &["CHECKSEQUENCEVERIFY"],
+            Self::Segwit => &["WITNESS", "NULLDUMMY"],
+        }
+    }
+}
+
 /// Returns the buried deployment list for a network, as `(name, activation_height)` pairs.
 ///
 /// Heights are sourced from Bitcoin Core's `chainparams.cpp` at v30.2
@@ -457,52 +491,99 @@ pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
 /// <https://github.com/bitcoin/bitcoin/blob/4d7d5f6b79d4c11c47e7a828d81296918fd11d4d/src/kernel/chainparams.cpp>
 //
 // TODO: also emit BIP9 deployments (`taproot`, `testdummy`); requires the versionbits state machine.
-pub fn buried_deployments_for(network: Network) -> &'static [(&'static str, u32)] {
-    const BITCOIN_BURIED: &[(&str, u32)] = &[
-        ("bip34", 227_931),
-        ("bip66", 363_725),
-        ("bip65", 388_381),
-        ("csv", 419_328),
-        ("segwit", 481_824),
+pub fn buried_deployments_for(network: Network) -> &'static [(BuriedDeployment, u32)] {
+    const MAINNET_BURIED: &[(BuriedDeployment, u32)] = &[
+        (BuriedDeployment::Bip34, 227_931),
+        (BuriedDeployment::Bip66, 363_725),
+        (BuriedDeployment::Bip65, 388_381),
+        (BuriedDeployment::Csv, 419_328),
+        (BuriedDeployment::Segwit, 481_824),
     ];
 
-    const TESTNET_BURIED: &[(&str, u32)] = &[
-        ("bip34", 21_111),
-        ("bip66", 330_776),
-        ("bip65", 581_885),
-        ("csv", 770_112),
-        ("segwit", 834_624),
+    const TESTNET3_BURIED: &[(BuriedDeployment, u32)] = &[
+        (BuriedDeployment::Bip34, 21_111),
+        (BuriedDeployment::Bip66, 330_776),
+        (BuriedDeployment::Bip65, 581_885),
+        (BuriedDeployment::Csv, 770_112),
+        (BuriedDeployment::Segwit, 834_624),
     ];
 
-    const TESTNET4_BURIED: &[(&str, u32)] = &[
-        ("bip34", 1),
-        ("bip66", 1),
-        ("bip65", 1),
-        ("csv", 1),
-        ("segwit", 1),
+    const TESTNET4_BURIED: &[(BuriedDeployment, u32)] = &[
+        (BuriedDeployment::Bip34, 1),
+        (BuriedDeployment::Bip66, 1),
+        (BuriedDeployment::Bip65, 1),
+        (BuriedDeployment::Csv, 1),
+        (BuriedDeployment::Segwit, 1),
     ];
 
-    const SIGNET_BURIED: &[(&str, u32)] = &[
-        ("bip34", 1),
-        ("bip66", 1),
-        ("bip65", 1),
-        ("csv", 1),
-        ("segwit", 1),
+    const SIGNET_BURIED: &[(BuriedDeployment, u32)] = &[
+        (BuriedDeployment::Bip34, 1),
+        (BuriedDeployment::Bip66, 1),
+        (BuriedDeployment::Bip65, 1),
+        (BuriedDeployment::Csv, 1),
+        (BuriedDeployment::Segwit, 1),
     ];
 
-    const REGTEST_BURIED: &[(&str, u32)] = &[
-        ("bip34", 1),
-        ("bip66", 1),
-        ("bip65", 1),
-        ("csv", 1),
-        ("segwit", 0),
+    const REGTEST_BURIED: &[(BuriedDeployment, u32)] = &[
+        (BuriedDeployment::Bip34, 1),
+        (BuriedDeployment::Bip66, 1),
+        (BuriedDeployment::Bip65, 1),
+        (BuriedDeployment::Csv, 1),
+        (BuriedDeployment::Segwit, 0),
     ];
 
     match network {
-        Network::Bitcoin => BITCOIN_BURIED,
-        Network::Testnet => TESTNET_BURIED,
+        Network::Bitcoin => MAINNET_BURIED,
+        Network::Testnet => TESTNET3_BURIED,
         Network::Testnet4 => TESTNET4_BURIED,
         Network::Signet => SIGNET_BURIED,
         Network::Regtest => REGTEST_BURIED,
     }
+}
+
+fn flags_set(flags: &[&str]) -> HashSet<String> {
+    flags.iter().map(|f| (*f).to_string()).collect()
+}
+
+fn get_primary_script_flag(network: Network, hash: BlockHash) -> HashSet<String> {
+    // BIP16 didn't become active until Apr 1 2012 (on mainnet, and retroactively applied to testnet)
+    // However, only one historical block violated the P2SH rules (on both mainnet and testnet).
+    // Similarly, only one historical block violated the TAPROOT rules on mainnet.
+    // For simplicity, always leave P2SH+WITNESS+TAPROOT on except for the two violating blocks.
+    match (network, hash) {
+        (Network::Bitcoin, h)
+            if h == bhash!("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22") =>
+        {
+            HashSet::new()
+        }
+        (Network::Bitcoin, h)
+            if h == bhash!("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad") =>
+        {
+            flags_set(&["P2SH", "WITNESS"])
+        }
+        (Network::Testnet, h)
+            if h == bhash!("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105") =>
+        {
+            HashSet::new()
+        }
+        // Only mainnet and testnet3 require additional validation. The other networks do not.
+        _ => flags_set(&["P2SH", "WITNESS", "TAPROOT"]),
+    }
+}
+
+pub fn get_script_flags(network: Network, hash: BlockHash, height: u32) -> HashSet<String> {
+    let mut flags = get_primary_script_flag(network, hash);
+
+    for (deployment, activation_height) in buried_deployments_for(network) {
+        if height + 1 >= *activation_height {
+            flags.extend(
+                deployment
+                    .to_script_flags()
+                    .iter()
+                    .map(|f| (*f).to_string()),
+            );
+        }
+    }
+
+    flags
 }

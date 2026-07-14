@@ -25,6 +25,7 @@ use bitcoin::hex::DisplayHex;
 use floresta_chain::buried_deployments_for;
 use floresta_chain::extensions::HeaderExt;
 use floresta_chain::extensions::WorkExt;
+use floresta_chain::get_script_flags;
 use floresta_rpc::rpc_interfaces::BlockchainRpc;
 use floresta_rpc::rpc_types::CoinbaseTransaction;
 use floresta_rpc::rpc_types::DeploymentInfo;
@@ -533,7 +534,7 @@ impl<Blockchain: RpcChain> BlockchainRpc for RpcImpl<Blockchain> {
 
         for &(name, activation_height) in buried_deployments_for(self.network) {
             deployments.insert(
-                name.to_string(),
+                name.to_deployment_name().into(),
                 DeploymentInfo {
                     deployment_type: "buried".to_string(),
                     height: Some(activation_height),
@@ -543,10 +544,15 @@ impl<Blockchain: RpcChain> BlockchainRpc for RpcImpl<Blockchain> {
             );
         }
 
+        let script_flags = get_script_flags(self.network, target_hash, height)
+            .into_iter()
+            .collect();
+
         Ok(GetDeploymentInfo {
             hash: target_hash.to_string(),
             height,
             deployments,
+            script_flags,
         })
     }
 
