@@ -260,7 +260,9 @@ def assert_bitcoind_service_fields(peer_info):
     assert set(peer_info["servicesnames"]) == BITCOIND_TEST_FRAMEWORK_SERVICESNAMES
 
 
-def compare_fields(candidate, reference, ignore_fields=None, float_tol=1e-8):
+def compare_fields(
+    candidate, reference, ignore_fields=None, float_tol=1e-8, unordered_fields=None
+):
     """
     Recursively compare two data structures (dicts, lists, or scalars),
     ignoring specified fields.
@@ -269,12 +271,45 @@ def compare_fields(candidate, reference, ignore_fields=None, float_tol=1e-8):
         The comparison is asymmetric. `reference` defines the required fields.
         For Floresta RPC tests, use Floresta as `candidate` and the reference
         node as `reference`.
+
+        Lists are compared element-by-element in order (strict, positional),
+        since most RPC lists are semantically ordered (e.g. `tx`, `vin`,
+        `vout`). Fields whose lists have no meaningful order (e.g. sets of
+        names) can be listed in `unordered_fields`; those lists are then
+        matched one-to-one regardless of position, so duplicates, missing and
+        extra items are still detected.
     """
     if ignore_fields is None:
         ignore_fields = set()
     elif isinstance(ignore_fields, list):
         ignore_fields = set(ignore_fields)
 
+    if unordered_fields is None:
+        unordered_fields = set()
+    elif isinstance(unordered_fields, list):
+        unordered_fields = set(unordered_fields)
+
+    _compare_fields(
+        candidate,
+        reference,
+        ignore_fields=ignore_fields,
+        float_tol=float_tol,
+        unordered_fields=unordered_fields,
+        key=None,
+    )
+
+
+# pylint: disable=too-many-arguments too-many-positional-arguments
+def _compare_fields(
+    candidate, reference, ignore_fields, float_tol, unordered_fields, key
+):
+    """
+    Recursive worker for `compare_fields`.
+
+    `key` is the dict key this pair was reached through (None at the top level
+    or for elements of a list); it decides whether a list value is compared
+    unordered.
+    """
     # float tolerance
     if isinstance(candidate, float) or isinstance(reference, float):
         assert math.isclose(candidate, reference, rel_tol=0.0, abs_tol=float_tol), (
@@ -285,27 +320,61 @@ def compare_fields(candidate, reference, ignore_fields=None, float_tol=1e-8):
 
     # dict
     if isinstance(candidate, dict) and isinstance(reference, dict):
-        for key, ref_value in reference.items():
-            if key in ignore_fields:
+        for dict_key, ref_value in reference.items():
+            if dict_key in ignore_fields:
                 continue
-            assert key in candidate, f"Missing key in candidate: {key}"
-            compare_fields(
-                candidate[key],
+            assert dict_key in candidate, f"Missing key in candidate: {dict_key}"
+            _compare_fields(
+                candidate[dict_key],
                 ref_value,
                 ignore_fields=ignore_fields,
                 float_tol=float_tol,
+                unordered_fields=unordered_fields,
+                key=dict_key,
             )
-
         return
 
     # list
     if isinstance(candidate, list) and isinstance(reference, list):
         assert len(candidate) == len(
             reference
-        ), f"List length mismatch: expected {len(candidate)}, got {len(reference)}"
+        ), f"List length mismatch: expected {len(reference)}, got {len(candidate)}"
+
+        if key in unordered_fields:
+            # Order-free matching: every reference item must match exactly one
+            # candidate item, regardless of position, so duplicates, missing
+            # and extra items are all detected.
+            remaining = list(range(len(candidate)))
+            for ref_item in reference:
+                match_index = None
+                for i in remaining:
+                    try:
+                        _compare_fields(
+                            candidate[i],
+                            ref_item,
+                            ignore_fields=ignore_fields,
+                            float_tol=float_tol,
+                            unordered_fields=unordered_fields,
+                            key=None,
+                        )
+                        match_index = i
+                        break
+                    except AssertionError:
+                        continue
+                assert (
+                    match_index is not None
+                ), f"Item {ref_item!r} not found in candidate list {candidate!r}"
+                remaining.remove(match_index)
+            return
+
         for cand_item, ref_item in zip(candidate, reference):
-            compare_fields(
-                cand_item, ref_item, ignore_fields=ignore_fields, float_tol=float_tol
+            _compare_fields(
+                cand_item,
+                ref_item,
+                ignore_fields=ignore_fields,
+                float_tol=float_tol,
+                unordered_fields=unordered_fields,
+                key=None,
             )
         return
 
