@@ -17,7 +17,7 @@ for ARG in "$@"; do
     esac
 done
 
-BITCOIN_REVISION="${BITCOIN_REVISION:-30.2}"
+BITCOIN_REVISION="${BITCOIN_REVISION:-31.0}"
 # We need for the current dir to be the root dir of the project.
 FLORESTA_PROJ_DIR=$(git rev-parse --show-toplevel)
 TEMP_DIR="${FLORESTA_TEMP_DIR:-/tmp/floresta-func-tests}"

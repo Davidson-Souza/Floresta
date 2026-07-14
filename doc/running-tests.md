@@ -121,14 +121,14 @@ UTREEXO_REVISION=0.1.0 ./tests/prepare.sh && ./tests/run.sh
 ```
 
 ##### Bitcoin-core
-By default, the `prepare.sh` script will obtain a runnable `bitcoind` binary in one of three exclusive ways. The default Bitcoin Core version is `30.2`, but you can override this by setting the `BITCOIN_REVISION` environment variable. The three methods are:
+By default, the `prepare.sh` script will obtain a runnable `bitcoind` binary in one of three exclusive ways. The default Bitcoin Core version is `31.0`, but you can override this by setting the `BITCOIN_REVISION` environment variable. The three methods are:
 
 1. **Using a user-provided binary**: If the `BITCOIND_EXE` environment variable is set and points to an executable, that exact binary is used. No download or build is attempted, and any `BITCOIN_REVISION` or build-parallelism settings are ignored.
 ```bash
     BITCOIND_EXE=/path/to/bitcoind ./tests/prepare.sh
 ```
 
-2. **Downloading a prebuilt binary**: If `BITCOIND_EXE` is not set, the script will try to download a prebuilt Bitcoin Core tarball for the specified `BITCOIN_REVISION`. Prebuilt binaries are available for all platforms and operating systems supported by Bitcoin Core. The supported versions are `30.2`, `29.2`, `28.3` and `27.2`.
+2. **Downloading a prebuilt binary**: If `BITCOIND_EXE` is not set, the script will try to download a prebuilt Bitcoin Core tarball for the specified `BITCOIN_REVISION`. Prebuilt binaries are available for all platforms and operating systems supported by Bitcoin Core. The supported versions are `31.0`, `30.2`, `29.2`, `28.3` and `27.2`.
 ```bash
     BITCOIN_REVISION=28.3 ./tests/prepare.sh
 ```
