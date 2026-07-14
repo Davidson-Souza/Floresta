@@ -49,6 +49,12 @@ Return JSON object
 - `version` - (numeric) The block version.
 - `versionHex` - (string) The block version formatted in hexadecimal.
 - `merkleroot` - (string) The merkle root.
+- `coinbase_tx` - (json object) Coinbase transaction metadata
+   - `version` -  (numeric) The coinbase transaction version
+   - `locktime` - (numeric) The coinbase transaction's locktime (nLockTime)
+   - `sequence` - (numeric) The coinbase input's sequence number (nSequence)
+   - `coinbase` - (string) The coinbase input's script
+   - `witness` - (string, optional) The coinbase input's first (and only) witness stack element, if present
 - `tx` - (json array) Transaction IDs:
    - `"hex"` - (string) A transaction id (hex-encoded).
 - `time` - (numeric) The block time expressed in UNIX epoch time.
