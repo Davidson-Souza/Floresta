@@ -22,10 +22,9 @@ use bitcoin::constants::genesis_block;
 use bitcoin::hashes::Hash;
 use bitcoin::hex;
 use bitcoin::hex::DisplayHex;
-use floresta_chain::buried_deployments_for;
+use floresta_chain::extensions::ChainParamsExt;
 use floresta_chain::extensions::HeaderExt;
 use floresta_chain::extensions::WorkExt;
-use floresta_chain::get_script_flags;
 use floresta_rpc::rpc_interfaces::BlockchainRpc;
 use floresta_rpc::rpc_types::CoinbaseTransaction;
 use floresta_rpc::rpc_types::DeploymentInfo;
@@ -530,9 +529,10 @@ impl<Blockchain: RpcChain> BlockchainRpc for RpcImpl<Blockchain> {
             .map_err(|_| JsonRpcError::Chain)?
             .ok_or(JsonRpcError::BlockNotFound)?;
 
+        let chain_params = self.chain.get_chain_params();
         let mut deployments = BTreeMap::new();
 
-        for &(name, activation_height) in buried_deployments_for(self.network) {
+        for (name, activation_height) in chain_params.buried_deployments_for() {
             deployments.insert(
                 name.to_deployment_name().into(),
                 DeploymentInfo {
@@ -544,7 +544,8 @@ impl<Blockchain: RpcChain> BlockchainRpc for RpcImpl<Blockchain> {
             );
         }
 
-        let script_flags = get_script_flags(self.network, target_hash, height)
+        let script_flags = chain_params
+            .get_script_flags(target_hash, height)
             .into_iter()
             .collect();
 

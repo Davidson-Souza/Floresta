@@ -5,12 +5,8 @@
 //!
 //! It includes:
 //! - Network-specific parameters like block reward halving intervals and maturity periods
-//! - DNS seeds for peer discovery
 //! - Assumable validation states for Utreexo
 //! - Block verification flag exceptions
-//!
-//! The main struct [`ChainParams`] encapsulates all chain-specific parameters while
-//! [`DnsSeed`] handles peer discovery through DNS.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -20,13 +16,11 @@ use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
-use bitcoin::p2p::ServiceFlags;
 use bitcoin::params::Params;
 #[cfg(feature = "bitcoinkernel")]
 use bitcoinkernel::ScriptVerificationFlags;
 use floresta_common::acchashes;
 use floresta_common::bhash;
-use floresta_common::service_flags;
 use rustreexo::node_hash::BitcoinNodeHash;
 
 use crate::AssumeValidArg;
@@ -97,30 +91,6 @@ pub struct ChainParams {
 
     /// Whether we should enforce BIP-094 "Testnet 4" rules
     pub enforce_bip94: bool,
-}
-
-/// A dns seed is a authoritative DNS server that returns the IP addresses of nodes that are
-/// likely to be accepting incoming connections. This is our preferred way of finding new peers
-/// on the first startup, as peers returned by seeds are likely to be online and accepting
-/// connections. We may use this as a fallback if we don't have any peers to connect in
-/// subsequent startups.
-///
-/// Some seeds allow filtering by service flags, so we may use this to find peers that are
-/// likely to be running Utreexo, for example.
-pub struct DnsSeed {
-    /// The domain name of the seed
-    pub seed: &'static str,
-
-    /// Useful filters we can use to find relevant peers
-    pub filters: ServiceFlags,
-}
-
-/// This functionality is used to create a new DNS seed with possible filters.
-impl DnsSeed {
-    /// Create a new DNS seed
-    pub fn new(seed: &'static str, filters: ServiceFlags) -> Self {
-        Self { seed, filters }
-    }
 }
 
 /// If enabled, the node will assume that the provided Utreexo state is valid, and will
@@ -398,192 +368,4 @@ impl From<Network> for ChainParams {
             },
         }
     }
-}
-
-/// Get a list of [`DnsSeed`]s for a given [`Network`].
-///
-/// Some DNS seeds allow requesting addresses using a [`ServiceFlags`] filter.
-/// Here we define `x9`, `x49`, and `x1009` (the relevant services for this node
-/// to operate), and use them to request addresses from the DNS seeds that support it.
-pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
-    let mut seeds = Vec::new();
-
-    let none = ServiceFlags::NONE;
-    let x9 = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-    let x49 = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
-    let x1009 = ServiceFlags::NETWORK | ServiceFlags::WITNESS | service_flags::UTREEXO.into();
-    let x1000 = service_flags::UTREEXO.into();
-
-    #[rustfmt::skip]
-    match network {
-        Network::Bitcoin => {
-            seeds.push(DnsSeed::new("seed.calvinkim.info", x1009));
-            seeds.push(DnsSeed::new("seed.bitcoin.luisschwab.com", x1009));
-            seeds.push(DnsSeed::new("seed.bitcoin.sipa.be", x9));
-            seeds.push(DnsSeed::new("dnsseed.bluematt.me", x49));
-            seeds.push(DnsSeed::new("seed.bitcoinstats.com", x49));
-            seeds.push(DnsSeed::new("seed.btc.petertodd.org", x49));
-            seeds.push(DnsSeed::new("seed.bitcoin.sprovoost.nl", x49));
-            seeds.push(DnsSeed::new("dnsseed.emzy.de", x49));
-            seeds.push(DnsSeed::new("seed.bitcoin.wiz.biz", x49));
-            seeds.push(DnsSeed::new("bitcoin.seed.dlsouza.lol", x1000));
-        }
-        Network::Signet => {
-            seeds.push(DnsSeed::new("signet.seed.dlsouza.lol", x1000));
-            seeds.push(DnsSeed::new("seed.signet.bitcoin.sprovoost.nl", x49));
-            seeds.push(DnsSeed::new("signet.seed.utreexo.net", x1009));
-        }
-        Network::Testnet => {
-            seeds.push(DnsSeed::new("testnet-seed.bitcoin.jonasschnelli.ch", x49));
-            seeds.push(DnsSeed::new("testnet.seed.dlsouza.lol", x1000));
-            seeds.push(DnsSeed::new("seed.tbtc.petertodd.org", x49));
-            seeds.push(DnsSeed::new("seed.testnet.bitcoin.sprovoost.nl", x49));
-            seeds.push(DnsSeed::new("testnet-seed.bluematt.me", none));
-        }
-        Network::Testnet4 => {
-            seeds.push(DnsSeed::new("seed.testnet4.bitcoin.sprovoost.nl", none));
-            seeds.push(DnsSeed::new("seed.testnet4.wiz.biz", none));
-        }
-        Network::Regtest => {}
-    };
-
-    seeds
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuriedDeployment {
-    Bip34,
-    Bip65,
-    Bip66,
-    Csv,
-    Segwit,
-}
-
-impl BuriedDeployment {
-    /// Name used in the `getdeploymentinfo` RPC response.
-    pub fn to_deployment_name(self) -> &'static str {
-        match self {
-            Self::Bip34 => "bip34",
-            Self::Bip65 => "bip65",
-            Self::Bip66 => "bip66",
-            Self::Csv => "csv",
-            Self::Segwit => "segwit",
-        }
-    }
-
-    /// Script flags enabled by this deployment. Empty for deployments
-    /// that do not change script validation (BIP34 only changes coinbase structure).
-    pub fn to_script_flags(self) -> &'static [&'static str] {
-        match self {
-            Self::Bip34 => &[],
-            Self::Bip65 => &["CHECKLOCKTIMEVERIFY"],
-            Self::Bip66 => &["DERSIG"],
-            Self::Csv => &["CHECKSEQUENCEVERIFY"],
-            Self::Segwit => &["WITNESS", "NULLDUMMY"],
-        }
-    }
-}
-
-/// Returns the buried deployment list for a network, as `(name, activation_height)` pairs.
-///
-/// Heights are sourced from Bitcoin Core's `chainparams.cpp` at v30.2
-/// (commit `4d7d5f6b79d4c11c47e7a828d81296918fd11d4d`):
-/// <https://github.com/bitcoin/bitcoin/blob/4d7d5f6b79d4c11c47e7a828d81296918fd11d4d/src/kernel/chainparams.cpp>
-//
-// TODO: also emit BIP9 deployments (`taproot`, `testdummy`); requires the versionbits state machine.
-pub fn buried_deployments_for(network: Network) -> &'static [(BuriedDeployment, u32)] {
-    const MAINNET_BURIED: &[(BuriedDeployment, u32)] = &[
-        (BuriedDeployment::Bip34, 227_931),
-        (BuriedDeployment::Bip66, 363_725),
-        (BuriedDeployment::Bip65, 388_381),
-        (BuriedDeployment::Csv, 419_328),
-        (BuriedDeployment::Segwit, 481_824),
-    ];
-
-    const TESTNET3_BURIED: &[(BuriedDeployment, u32)] = &[
-        (BuriedDeployment::Bip34, 21_111),
-        (BuriedDeployment::Bip66, 330_776),
-        (BuriedDeployment::Bip65, 581_885),
-        (BuriedDeployment::Csv, 770_112),
-        (BuriedDeployment::Segwit, 834_624),
-    ];
-
-    const TESTNET4_BURIED: &[(BuriedDeployment, u32)] = &[
-        (BuriedDeployment::Bip34, 1),
-        (BuriedDeployment::Bip66, 1),
-        (BuriedDeployment::Bip65, 1),
-        (BuriedDeployment::Csv, 1),
-        (BuriedDeployment::Segwit, 1),
-    ];
-
-    const SIGNET_BURIED: &[(BuriedDeployment, u32)] = &[
-        (BuriedDeployment::Bip34, 1),
-        (BuriedDeployment::Bip66, 1),
-        (BuriedDeployment::Bip65, 1),
-        (BuriedDeployment::Csv, 1),
-        (BuriedDeployment::Segwit, 1),
-    ];
-
-    const REGTEST_BURIED: &[(BuriedDeployment, u32)] = &[
-        (BuriedDeployment::Bip34, 1),
-        (BuriedDeployment::Bip66, 1),
-        (BuriedDeployment::Bip65, 1),
-        (BuriedDeployment::Csv, 1),
-        (BuriedDeployment::Segwit, 0),
-    ];
-
-    match network {
-        Network::Bitcoin => MAINNET_BURIED,
-        Network::Testnet => TESTNET3_BURIED,
-        Network::Testnet4 => TESTNET4_BURIED,
-        Network::Signet => SIGNET_BURIED,
-        Network::Regtest => REGTEST_BURIED,
-    }
-}
-
-fn flags_set(flags: &[&str]) -> HashSet<String> {
-    flags.iter().map(|f| (*f).to_string()).collect()
-}
-
-fn get_primary_script_flag(network: Network, hash: BlockHash) -> HashSet<String> {
-    // BIP16 didn't become active until Apr 1 2012 (on mainnet, and retroactively applied to testnet)
-    // However, only one historical block violated the P2SH rules (on both mainnet and testnet).
-    // Similarly, only one historical block violated the TAPROOT rules on mainnet.
-    // For simplicity, always leave P2SH+WITNESS+TAPROOT on except for the two violating blocks.
-    match (network, hash) {
-        (Network::Bitcoin, h)
-            if h == bhash!("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22") =>
-        {
-            HashSet::new()
-        }
-        (Network::Bitcoin, h)
-            if h == bhash!("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad") =>
-        {
-            flags_set(&["P2SH", "WITNESS"])
-        }
-        (Network::Testnet, h)
-            if h == bhash!("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105") =>
-        {
-            HashSet::new()
-        }
-        // Only mainnet and testnet3 require additional validation. The other networks do not.
-        _ => flags_set(&["P2SH", "WITNESS", "TAPROOT"]),
-    }
-}
-
-pub fn get_script_flags(network: Network, hash: BlockHash, height: u32) -> HashSet<String> {
-    let mut flags = get_primary_script_flag(network, hash);
-
-    for (deployment, activation_height) in buried_deployments_for(network) {
-        if height + 1 >= *activation_height {
-            flags.extend(
-                deployment
-                    .to_script_flags()
-                    .iter()
-                    .map(|f| (*f).to_string()),
-            );
-        }
-    }
-
-    flags
 }

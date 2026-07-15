@@ -33,6 +33,7 @@ use bitcoin::OutPoint;
 use bitcoin::Work;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::hashes::sha256;
+use chainparams::ChainParams;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
 use rustreexo::stump::Stump;
@@ -166,6 +167,8 @@ pub trait BlockchainInterface {
 
     /// Returns this chain's params
     fn get_params(&self) -> bitcoin::params::Params;
+
+    fn get_chain_params(&self) -> ChainParams;
 
     /// Returns our current acc
     fn acc(&self) -> Stump;
@@ -336,6 +339,10 @@ impl<T: BlockchainInterface> BlockchainInterface for Arc<T> {
 
     fn get_params(&self) -> bitcoin::params::Params {
         T::get_params(self)
+    }
+
+    fn get_chain_params(&self) -> ChainParams {
+        T::get_chain_params(self)
     }
 
     fn acc(&self) -> Stump {

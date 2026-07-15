@@ -1121,6 +1121,10 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
         self.chain_params().params
     }
 
+    fn get_chain_params(&self) -> ChainParams {
+        self.chain_params()
+    }
+
     fn get_work(&self, tip: BlockHash) -> Result<Work, Self::Error> {
         let header = self.get_block_header(&tip)?;
         self.get_branch_work(header)
