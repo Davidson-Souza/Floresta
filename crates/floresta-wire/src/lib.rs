@@ -31,6 +31,9 @@ pub use p2p_wire::bitcoin_socket_addr;
 pub use p2p_wire::block_proof;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::error;
+#[cfg(all(feature = "fuzzing", not(target_arch = "wasm32")))]
+#[doc(hidden)]
+pub use p2p_wire::fuzz;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::network_message_ext;
 #[cfg(not(target_arch = "wasm32"))]
