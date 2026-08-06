@@ -296,7 +296,7 @@ where
         });
 
         // Use create_peer function instead of manually creating the peer
-        Peer::<WriteHalf>::create_peer(
+        let handle = Peer::<WriteHalf>::create_peer(
             peer_id_count,
             peer_address,
             mempool,
@@ -310,6 +310,9 @@ where
             cancellation_sender,
             transport_protocol,
         );
+
+        // We drop the returned join handle because we will never join on the actor
+        drop(handle);
 
         Ok(())
     }
@@ -342,7 +345,7 @@ where
             }
         });
 
-        Peer::<WriteHalf>::create_peer(
+        let handle = Peer::<WriteHalf>::create_peer(
             peer_id_count,
             peer_address,
             mempool,
@@ -356,6 +359,10 @@ where
             cancellation_sender,
             transport_protocol,
         );
+
+        // We drop the returned join handle because we will never join on the actor
+        drop(handle);
+
         Ok(())
     }
 

@@ -15,10 +15,12 @@ arbitrary = { version = "=1.4.2", features = ["derive"] }
 bitcoin = { workspace = true }
 libfuzzer-sys = { version = "=0.4.13" }
 tempfile = { workspace = true }
+tokio = { workspace = true }
 
 # Local dependencies
 floresta-chain = { workspace = true, features = ["flat-chainstore"] }
-floresta-wire = { workspace = true }
+floresta-mempool = { workspace = true }
+floresta-wire = { workspace = true, features = ["fuzzing"] }
 
 [[bin]]
 name = "local_address_str"
@@ -107,6 +109,20 @@ bench = false
 [[bin]]
 name = "p2p_v2_message"
 path = "fuzz_targets/p2p_v2_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_v1_peer"
+path = "fuzz_targets/p2p_v1_peer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_v2_peer"
+path = "fuzz_targets/p2p_v2_peer.rs"
 test = false
 doc = false
 bench = false

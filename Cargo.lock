@@ -1122,9 +1122,11 @@ dependencies = [
  "arbitrary",
  "bitcoin",
  "floresta-chain",
+ "floresta-mempool",
  "floresta-wire",
  "libfuzzer-sys",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
