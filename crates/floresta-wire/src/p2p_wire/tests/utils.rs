@@ -203,6 +203,7 @@ pub fn get_node_config(
         pow_fraud_proofs,
         datadir: datadir.as_ref().into(),
         user_agent: "node_test".to_string(),
+        max_tip_age_secs: u32::MAX,
         ..Default::default()
     }
 }

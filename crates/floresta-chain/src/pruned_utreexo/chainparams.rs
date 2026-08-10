@@ -499,7 +499,7 @@ pub fn buried_deployments_for(network: Network) -> &'static [(&'static str, u32)
 /// Returns the minimum cumulative chainwork a valid chain must demonstrate.
 /// Mirrors [`nMinimumChainWork`](https://github.com/bitcoin/bitcoin/blob/8d5515465542336d3d0fb83935d79783e91048a0/src/kernel/chainparams.cpp) in Bitcoin Core.
 pub fn minimum_chain_work(network: Network) -> Work {
-    // TODO: sync this value with nMinimumChainWork in Bitcoin Core's chainparams.cpp on each Core release.
+    // TODO(@Micah-Shallom): sync this value with nMinimumChainWork in Bitcoin Core's chainparams.cpp on each Core release.
     match network {
         // https://github.com/bitcoin/bitcoin/blob/8d5515465542336d3d0fb83935d79783e91048a0/src/kernel/chainparams.cpp#L117
         Network::Bitcoin => {
