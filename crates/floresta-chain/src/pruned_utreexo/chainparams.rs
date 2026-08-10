@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Network;
+use bitcoin::Work;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::p2p::ServiceFlags;
@@ -492,5 +493,35 @@ pub fn buried_deployments_for(network: Network) -> &'static [(&'static str, u32)
         Network::Testnet4 => TESTNET4_BURIED,
         Network::Signet => SIGNET_BURIED,
         Network::Regtest => REGTEST_BURIED,
+    }
+}
+
+/// Returns the minimum cumulative chainwork a valid chain must demonstrate.
+/// Mirrors [`nMinimumChainWork`](https://github.com/bitcoin/bitcoin/blob/8d5515465542336d3d0fb83935d79783e91048a0/src/kernel/chainparams.cpp) in Bitcoin Core.
+pub fn minimum_chain_work(network: Network) -> Work {
+    // TODO: sync this value with nMinimumChainWork in Bitcoin Core's chainparams.cpp on each Core release.
+    match network {
+        // https://github.com/bitcoin/bitcoin/blob/8d5515465542336d3d0fb83935d79783e91048a0/src/kernel/chainparams.cpp#L117
+        Network::Bitcoin => {
+            Work::from_hex("0x0000000000000000000000000000000000000001128750f82f4c366153a3a030")
+                .expect("hardcoded work")
+        }
+        // https://github.com/bitcoin/bitcoin/blob/8d5515465542336d3d0fb83935d79783e91048a0/src/kernel/chainparams.cpp#L248
+        Network::Testnet => {
+            Work::from_hex("0x0000000000000000000000000000000000000000000017dde1c649f3708d14b6")
+                .expect("hardcoded work")
+        }
+        // https://github.com/bitcoin/bitcoin/blob/8d5515465542336d3d0fb83935d79783e91048a0/src/kernel/chainparams.cpp#L356
+        Network::Testnet4 => {
+            Work::from_hex("0x0000000000000000000000000000000000000000000009a0fe15d0177d086304")
+                .expect("hardcoded work")
+        }
+        // https://github.com/bitcoin/bitcoin/blob/8d5515465542336d3d0fb83935d79783e91048a0/src/kernel/chainparams.cpp#L447
+        // Custom -signetchallenge signets use 0; Floresta targets the default signet.
+        Network::Signet => {
+            Work::from_hex("0x00000000000000000000000000000000000000000000000000000b463ea0a4b8")
+                .expect("hardcoded work")
+        }
+        _ => Work::from_be_bytes([0u8; 32]),
     }
 }
