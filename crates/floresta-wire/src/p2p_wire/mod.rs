@@ -92,6 +92,7 @@ pub mod address_man;
 pub mod bitcoin_socket_addr;
 pub mod block_proof;
 pub mod error;
+pub(crate) mod headers_sync;
 pub mod network_message_ext;
 pub mod node;
 pub mod node_context;
