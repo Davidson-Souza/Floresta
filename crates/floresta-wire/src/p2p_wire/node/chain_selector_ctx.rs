@@ -187,10 +187,11 @@ where
             return Ok(());
         }
 
-        // Presync only guards the initial DownloadingHeaders phase against disk-fill DoS.
-        // During LookingForForks, headers may start at an arbitrary fork point below our tip;
-        // routing them through presync would fail the continuity check and wrongly ban the peer.
-        if !matches!(self.context.state, ChainSelectorState::DownloadingHeaders) {
+        // Gate on per-peer presync state, not the global ChainSelector phase. Once any
+        // peer advances the state to LookingForForks, peers that are still mid-presync
+        // must continue routing through their own state machine. Peers with no active
+        // presync entry have already completed presync and go directly to accept_header.
+        if !self.context.presync_states.contains_key(&peer) {
             for header in &headers {
                 if let Err(e) = self.chain.accept_header(*header) {
                     error!("Error while accepting fork header from peer={peer} err={e}");
@@ -1179,12 +1180,32 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
+    use bitcoin::CompactTarget;
+    use bitcoin::Network;
+    use bitcoin::TxMerkleNode;
+    use bitcoin::block::Version;
+    use bitcoin::hashes::Hash;
+    use floresta_chain::AssumeValidArg;
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
+    use floresta_chain::FlatChainStoreConfig;
+    use floresta_common::Ema;
+    use floresta_mempool::Mempool;
     use rustreexo::node_hash::BitcoinNodeHash;
+    use tokio::sync::Mutex;
+    use tokio::sync::RwLock;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
+    use crate::UtreexoNodeConfig;
+    use crate::address_man::AddressMan;
+    use crate::node::ConnectionKind;
+    use crate::node::LocalPeerView;
+    use crate::node::NodeRequest;
+    use crate::node::PeerStatus;
+    use crate::p2p_wire::transport::TransportProtocol;
 
     type TestNode = UtreexoNode<Arc<ChainState<FlatChainStore>>, ChainSelector>;
 
@@ -1285,6 +1306,107 @@ mod tests {
                     BitcoinNodeHash::from([0u8; 32]),
                 ],
             },
+        );
+    }
+
+    /// Reproduces the shared-state race: once any peer pushes the global ChainSelector state
+    /// to `LookingForForks`, headers from a peer that is still mid-presync must continue
+    /// routing through that peer's presync state machine rather than bypassing it.
+    ///
+    /// The test builds a chain of easy-PoW headers rooted at `BlockHash::all_zeros()`.
+    /// On Signet that parent is unknown, so `accept_header` rejects them -- if the global-
+    /// state gate incorrectly bypasses presync, the peer gets banned. If presync correctly
+    /// gates per-peer, the headers accumulate work inside the state machine and the peer
+    /// remains connected while waiting for more batches.
+    #[tokio::test]
+    async fn presync_gate_is_per_peer_not_global() {
+        let datadir = format!("./tmp-db/{}.cs_presync_race", rand::random::<u32>());
+        let chainstore = FlatChainStore::new(FlatChainStoreConfig::new(&datadir)).unwrap();
+        let chain = Arc::new(
+            ChainState::open(chainstore, Network::Signet, AssumeValidArg::Disabled).unwrap(),
+        );
+        let mempool = Arc::new(Mutex::new(Mempool::new(1000)));
+        let kill_signal = Arc::new(RwLock::new(false));
+
+        let mut node = TestNode::new(
+            UtreexoNodeConfig {
+                network: Network::Signet,
+                max_tip_age_secs: u32::MAX,
+                ..Default::default()
+            },
+            chain,
+            mempool,
+            None,
+            kill_signal,
+            AddressMan::new(None, &[]),
+        )
+        .unwrap();
+
+        // Wire up peer B with a live channel so send_to_peer doesn't error.
+        const PEER_B: u32 = 1;
+        let (peer_b_tx, _peer_b_rx) = unbounded_channel::<NodeRequest>();
+        node.peers.insert(
+            PEER_B,
+            LocalPeerView {
+                message_times: Ema::with_half_life_50(),
+                address: "127.0.0.1:8334".parse().unwrap(),
+                services: ServiceFlags::NONE,
+                user_agent: "test_peer".to_string(),
+                height: 0,
+                time_offset: 0,
+                state: PeerStatus::Ready,
+                channel: peer_b_tx,
+                kind: ConnectionKind::Regular(ServiceFlags::NONE),
+                banscore: 0,
+                _last_message: Instant::now(),
+                transport_protocol: TransportProtocol::V2,
+            },
+        );
+
+        // Simulate peer A having already finished: global state is now LookingForForks.
+        node.context.state = ChainSelectorState::LookingForForks(Instant::now());
+
+        // Peer B was mid-presync when peer A triggered the transition.
+        let genesis =
+            bitcoin::BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::all_zeros());
+        let easy_bits = CompactTarget::from_consensus(0x207f_ffff);
+        node.context.presync_states.insert(
+            PEER_B,
+            HeadersSyncState::new(0, genesis, easy_bits, Network::Signet),
+        );
+
+        // Build easy-PoW headers rooted at all_zeros.
+        // On Signet, all_zeros is not the real genesis hash, so accept_header rejects them.
+        // Presync only checks continuity and accumulates work, so it accepts them.
+        let mut headers = Vec::new();
+        let mut prev = genesis;
+        for i in 0..5u32 {
+            let h = (0u32..)
+                .map(|nonce| bitcoin::block::Header {
+                    version: Version::from_consensus(1),
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::all_zeros(),
+                    ),
+                    time: 1_000_000 + i,
+                    bits: easy_bits,
+                    nonce,
+                })
+                .find(|h| h.validate_pow(h.target()).is_ok())
+                .unwrap();
+            prev = h.block_hash();
+            headers.push(h);
+        }
+
+        node.handle_headers(PEER_B, headers).await.unwrap();
+
+        // Correct behavior: presync ran per-peer, accumulated work, peer B stays connected.
+        // Bug behavior: global gate bypassed presync, accept_header rejected the unknown-
+        // parent headers, peer B was banned.
+        assert_eq!(
+            node.peers.get(&PEER_B).map(|p| p.state),
+            Some(PeerStatus::Ready),
+            "peer B must stay connected while presync accumulates work on its active state"
         );
     }
 }
