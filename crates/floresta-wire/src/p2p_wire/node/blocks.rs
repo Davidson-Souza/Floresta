@@ -354,7 +354,8 @@ where
             }
 
             // The block is invalid, so we have to invalidate it in our chain.
-            BlockValidationErrors::InvalidCoinbase(_)
+            BlockValidationErrors::ContextFreeValidation(_)
+            | BlockValidationErrors::InvalidCoinbase(_)
             | BlockValidationErrors::ScriptValidationError(_)
             | BlockValidationErrors::NullPrevOut
             | BlockValidationErrors::DuplicateInput

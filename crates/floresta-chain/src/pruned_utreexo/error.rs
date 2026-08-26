@@ -123,6 +123,7 @@ pub struct TransactionError {
 /// Represents errors encountered during block validation.
 pub enum BlockValidationErrors {
     BlockDoesntExtendTip,
+    ContextFreeValidation(String),
     InvalidCoinbase(String),
     UtxoNotFound(OutPoint),
     ScriptValidationError(String),
@@ -176,6 +177,9 @@ impl Display for BlockValidationErrors {
         match self {
             Self::BlockDoesntExtendTip => {
                 write!(f, "This block doesn't build directly on the tip")
+            }
+            Self::ContextFreeValidation(e) => {
+                write!(f, "Context-free consensus validation failed: {e}")
             }
             Self::ScriptValidationError(e) => {
                 write!(f, "{e}")

@@ -29,7 +29,21 @@ use bitcoin::hashes::sha256;
 use bitcoin::merkle_tree;
 use bitcoin::script;
 #[cfg(feature = "bitcoinkernel")]
+use bitcoinkernel::BLOCK_CHECK_BASE;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoinkernel::BLOCK_CHECK_MERKLE;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoinkernel::BlockCheckResult;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoinkernel::BlockValidationResult;
+#[cfg(feature = "bitcoinkernel")]
 use bitcoinkernel::PrecomputedTransactionData;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoinkernel::TxCheckResult;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoinkernel::prelude::BlockValidationStateExt as _;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoinkernel::prelude::TransactionExt as _;
 use floresta_common::prelude::*;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
@@ -508,6 +522,41 @@ impl Consensus {
     pub fn check_transaction_context_free(
         transaction: &Transaction,
     ) -> Result<Amount, BlockchainError> {
+        #[cfg(feature = "bitcoinkernel")]
+        {
+            let txid = || transaction.compute_txid();
+            let transaction_bytes = serialize(transaction);
+            let kernel_transaction =
+                bitcoinkernel::Transaction::try_from(transaction_bytes.as_slice())
+                    .map_err(|e| tx_err!(txid, ContextFreeValidation, e.to_string()))?;
+
+            match kernel_transaction.check() {
+                TxCheckResult::Valid => {
+                    // `CheckTransaction` accepts coinbase transactions, while this entry point is
+                    // specifically for non-coinbase transactions.
+                    if transaction.is_coinbase() {
+                        Err(tx_err!(txid, NullPrevOut))?;
+                    }
+
+                    Self::total_out_value(transaction)
+                }
+                TxCheckResult::Invalid(result) => {
+                    // Preserve the more specific errors exposed by Floresta where possible.
+                    Self::diagnose_transaction_context_free(transaction)?;
+
+                    Err(tx_err!(txid, ContextFreeValidation, format!("{result:?}")).into())
+                }
+            }
+        }
+
+        #[cfg(not(feature = "bitcoinkernel"))]
+        Self::diagnose_transaction_context_free(transaction)
+    }
+
+    /// Diagnoses context-free transaction failures using Floresta's error variants.
+    fn diagnose_transaction_context_free(
+        transaction: &Transaction,
+    ) -> Result<Amount, BlockchainError> {
         let txid = || transaction.compute_txid();
 
         if transaction.input.is_empty() {
@@ -554,11 +603,64 @@ impl Consensus {
     /// successful, returns the list of [`Txid`]s computed for the merkle root check.
     ///
     /// This verifies:
+    /// - base context-free block rules (size, coinbase, transactions, and sigops)
     /// - the header merkle root matches the block's txids
     /// - BIP34 coinbase-encoded height once activated (at `bip34_height`)
     /// - if there are SegWit transactions, the witness commitment is present and correct
     /// - total block weight is within the 4,000,000 WU limit
     pub fn check_block(&self, block: &Block, height: u32) -> Result<Vec<Txid>, BlockchainError> {
+        #[cfg(feature = "bitcoinkernel")]
+        {
+            let block_bytes = serialize(block);
+            let kernel_block = bitcoinkernel::Block::try_from(block_bytes.as_slice())
+                .map_err(|e| BlockValidationErrors::ContextFreeValidation(e.to_string()))?;
+            let chain_params = bitcoinkernel::ChainParams::new(match self.parameters.network {
+                Network::Bitcoin => bitcoinkernel::ChainType::Mainnet,
+                Network::Testnet => bitcoinkernel::ChainType::Testnet,
+                Network::Testnet4 => bitcoinkernel::ChainType::Testnet4,
+                Network::Signet => bitcoinkernel::ChainType::Signet,
+                Network::Regtest => bitcoinkernel::ChainType::Regtest,
+            });
+
+            // Header validation already checks proof of work, so only run the block-level checks.
+            match kernel_block.check(&chain_params, BLOCK_CHECK_BASE | BLOCK_CHECK_MERKLE) {
+                BlockCheckResult::Valid => {}
+                BlockCheckResult::Invalid(state) => {
+                    if state.result() == BlockValidationResult::Mutated {
+                        Err(BlockValidationErrors::BadMerkleRoot)?;
+                    }
+
+                    // Keep established errors for checks Floresta can identify precisely.
+                    if Self::check_merkle_root(block).is_none() {
+                        Err(BlockValidationErrors::BadMerkleRoot)?;
+                    }
+                    if block.txdata.is_empty() {
+                        Err(BlockValidationErrors::EmptyBlock)?;
+                    }
+                    if !block.txdata[0].is_coinbase() {
+                        Err(BlockValidationErrors::FirstTxIsNotCoinbase)?;
+                    }
+                    if block.weight() > Weight::MAX_BLOCK {
+                        Err(BlockValidationErrors::BlockTooBig)?;
+                    }
+
+                    Self::verify_coinbase(&block.txdata[0])?;
+                    for transaction in &block.txdata[1..] {
+                        if transaction.is_coinbase() {
+                            Err(BlockValidationErrors::InvalidCoinbase(
+                                "Block contains multiple coinbase transactions".into(),
+                            ))?;
+                        }
+                        Self::check_transaction_context_free(transaction)?;
+                    }
+
+                    return Err(
+                        BlockValidationErrors::ContextFreeValidation(format!("{state:?}")).into(),
+                    );
+                }
+            }
+        }
+
         let Some(txids) = Self::check_merkle_root(block) else {
             Err(BlockValidationErrors::BadMerkleRoot)?
         };
@@ -699,9 +801,34 @@ impl Consensus {
         Ok(())
     }
 
-    /// Validates the coinbase transaction's input. The checks on the outputs require context about
-    /// the block and are performed by [`Consensus::verify_block_transactions`].
+    /// Performs context-free validation of a coinbase transaction. The reward check requires
+    /// context about the block and is performed by [`Consensus::verify_block_transactions`].
     pub fn verify_coinbase(tx: &Transaction) -> Result<(), TransactionError> {
+        #[cfg(feature = "bitcoinkernel")]
+        {
+            let txid = || tx.compute_txid();
+            let transaction_bytes = serialize(tx);
+            let kernel_transaction =
+                bitcoinkernel::Transaction::try_from(transaction_bytes.as_slice())
+                    .map_err(|e| tx_err!(txid, ContextFreeValidation, e.to_string()))?;
+
+            match kernel_transaction.check() {
+                TxCheckResult::Valid if tx.is_coinbase() => Ok(()),
+                TxCheckResult::Valid => Self::diagnose_coinbase(tx),
+                TxCheckResult::Invalid(result) => {
+                    Self::diagnose_coinbase(tx)?;
+
+                    Err(tx_err!(txid, ContextFreeValidation, format!("{result:?}")))
+                }
+            }
+        }
+
+        #[cfg(not(feature = "bitcoinkernel"))]
+        Self::diagnose_coinbase(tx)
+    }
+
+    /// Diagnoses coinbase failures using Floresta's error variants.
+    fn diagnose_coinbase(tx: &Transaction) -> Result<(), TransactionError> {
         let txid = || tx.compute_txid();
         let input = match tx.input.as_slice() {
             [i] => i,
@@ -1373,6 +1500,20 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn context_free_block_check_rejects_mutated_merkle_tree() {
+        let consensus = Consensus::from(Network::Regtest);
+        let mut block = genesis_block(Network::Regtest);
+        block.txdata.push(block.txdata[0].clone());
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        match consensus.check_block(&block, 0) {
+            Err(BlockchainError::BlockValidation(BlockValidationErrors::BadMerkleRoot)) => {}
+            other => panic!("Expected BadMerkleRoot, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_validate_script_size() {
         use bitcoin::hashes::Hash;
@@ -1393,8 +1534,13 @@ mod tests {
     fn test_validate_coinbase() {
         let valid_one = coinbase(true);
         let invalid_one = coinbase(false);
+        let regular_tx = build_tx(
+            vec![txin!(dummy_outpoint())],
+            vec![txout!(0, ScriptBuf::new())],
+        );
         // The case that should be valid
         assert_ok!(Consensus::verify_coinbase(&valid_one));
+        assert_err!(Consensus::verify_coinbase(&regular_tx));
         // Invalid coinbase script
         assert_eq!(
             Consensus::verify_coinbase(&invalid_one)
@@ -1614,6 +1760,18 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn context_free_transaction_allows_op_return_script_sig() {
+        let tx = build_tx(
+            vec![txin!(dummy_outpoint(), ScriptBuf::from_bytes(vec![0x6a]))],
+            vec![txout!(0, ScriptBuf::new())],
+        );
+
+        Consensus::check_transaction_context_free(&tx)
+            .expect("OP_RETURN in scriptSig is valid before script execution");
     }
 
     #[test]
