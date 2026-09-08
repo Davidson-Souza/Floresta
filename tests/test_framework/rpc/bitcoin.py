@@ -78,8 +78,20 @@ class BitcoinRPC(BaseRPC):
         """
         return self.perform_request("createwallet", params=[wallet_name])
 
-    def send_to_address(self, address: str, amount: float) -> str:
+    def send_to_address(
+        self,
+        address: str,
+        amount: float,
+        fee_rate: float | None = None,
+    ) -> str:
         """
         Send a specified amount to a given address.
+
+        A fixed fee rate is expressed in sat/vB and avoids depending on fee
+        estimation in short regtest chains.
         """
-        return self.perform_request("sendtoaddress", params=[address, amount])
+        params = [address, amount]
+        if fee_rate is not None:
+            params.extend([None, None, False, True, None, "unset", None, fee_rate])
+
+        return self.perform_request("sendtoaddress", params=params)

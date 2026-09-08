@@ -230,7 +230,7 @@ def florestad_bitcoind_utreexod_with_chain(
             florestad_node.rpc.load_descriptor(descriptor)
 
         if addr_coinbase:
-            bitcoind_node.rpc.generatetoaddress(blocks, addr_coinbase)
+            bitcoind_node.rpc.generate_block_to_address(blocks, addr_coinbase)
         else:
             utreexod_node.rpc.generate(blocks)
 
