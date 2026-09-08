@@ -111,5 +111,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "utreexo_tx_des"
+path = "fuzz_targets/utreexo_tx_des.rs"
+test = false
+doc = false
+bench = false
+
 [lints]
 workspace = true
