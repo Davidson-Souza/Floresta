@@ -13,6 +13,7 @@ use std::time::UNIX_EPOCH;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Transaction;
+use bitcoin::Txid;
 use bitcoin::bip158::BlockFilter;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::deserialize;
@@ -56,6 +57,14 @@ use crate::node::MAX_ADDRV2_ADDRESSES;
 use crate::p2p_wire::block_proof::GetUtreexoProof;
 use crate::p2p_wire::block_proof::UtreexoProof;
 use crate::p2p_wire::transport::ReadTransport;
+use crate::p2p_wire::tx_relay::MSG_UTREEXO_PROOF_HASH;
+use crate::p2p_wire::tx_relay::MSG_UTREEXO_TX;
+use crate::p2p_wire::tx_relay::MSG_WITNESS_UTREEXO_TX;
+use crate::p2p_wire::tx_relay::UTREEXO_TX_CMD_STRING;
+use crate::p2p_wire::tx_relay::UtreexoTx;
+use crate::p2p_wire::tx_relay::UtreexoTxInv;
+use crate::p2p_wire::tx_relay::pack_utreexo_proof_hashes;
+use crate::p2p_wire::tx_relay::parse_utreexo_proof_hash;
 
 /// If we send a ping, and our peer takes more than PING_TIMEOUT to
 /// reply, disconnect.
@@ -91,6 +100,22 @@ const BASIC_FILTER_VERSION: u8 = 0;
 
 /// How many filter (or filter headers) are allowed in a single message.
 const MAX_FILTERS_PER_MESSAGE: usize = 2_000;
+
+fn utreexo_tx_getdata(txid: Txid, proof_positions: &[u64]) -> Vec<Inventory> {
+    let mut inventory = Vec::with_capacity(1 + proof_positions.len().div_ceil(4));
+    inventory.push(Inventory::Unknown {
+        inv_type: MSG_WITNESS_UTREEXO_TX,
+        hash: txid.to_byte_array(),
+    });
+    inventory.extend(
+        pack_utreexo_proof_hashes(proof_positions).map(|hash| Inventory::Unknown {
+            inv_type: MSG_UTREEXO_PROOF_HASH,
+            hash,
+        }),
+    );
+
+    inventory
+}
 
 #[derive(Debug, PartialEq)]
 enum State {
@@ -410,6 +435,9 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 self.write(NetworkMessage::GetData(vec![Inventory::Transaction(txid)]))
                     .await?;
             }
+            NodeRequest::FeeFilter(fee_rate) => {
+                self.write(NetworkMessage::FeeFilter(fee_rate)).await?;
+            }
             NodeRequest::SendAddresses(addresses) => {
                 self.write(NetworkMessage::AddrV2(addresses)).await?;
             }
@@ -456,6 +484,16 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 self.write(NetworkMessage::GetCFHeaders(get_cfheaders))
                     .await?;
             }
+            NodeRequest::GetUtreexoTx {
+                txid,
+                proof_positions,
+            } => {
+                self.write(NetworkMessage::GetData(utreexo_tx_getdata(
+                    txid,
+                    &proof_positions,
+                )))
+                .await?;
+            }
         }
         Ok(())
     }
@@ -472,22 +510,61 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
         match self.state {
             State::Connected => match message {
                 NetworkMessage::Inv(inv) => {
-                    let mut block_inv_elements = 0;
-
-                    // Silently drop
-                    if self.last_inv.elapsed() < INV_MESSAGE_INTERVAL {
+                    let has_transaction = inv.iter().any(|inv_entry| {
+                        matches!(
+                            inv_entry,
+                            Inventory::Transaction(_) | Inventory::WitnessTransaction(_)
+                        ) || matches!(
+                            inv_entry,
+                            Inventory::Unknown { inv_type, .. }
+                                if *inv_type == MSG_UTREEXO_TX
+                                    || *inv_type == MSG_WITNESS_UTREEXO_TX
+                        )
+                    });
+                    if !has_transaction && self.last_inv.elapsed() < INV_MESSAGE_INTERVAL {
                         return Ok(());
                     }
 
                     self.last_inv = Instant::now();
 
+                    let mut block_inv_elements = 0;
+                    let mut pending_utreexo_tx = None;
+                    let flush_utreexo_tx = |pending: &mut Option<UtreexoTxInv>| {
+                        if let Some(inv) = pending.take() {
+                            self.send_to_node(PeerMessages::UtreexoTxInv(inv), time);
+                        }
+                    };
+
                     for inv_entry in inv {
                         match inv_entry {
-                            Inventory::Error => {}
-                            Inventory::Transaction(_) => {}
+                            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                                flush_utreexo_tx(&mut pending_utreexo_tx);
+                                pending_utreexo_tx = Some(UtreexoTxInv {
+                                    txid,
+                                    positions: Vec::new(),
+                                });
+                            }
+                            Inventory::Unknown { inv_type, hash }
+                                if inv_type == MSG_UTREEXO_TX
+                                    || inv_type == MSG_WITNESS_UTREEXO_TX =>
+                            {
+                                flush_utreexo_tx(&mut pending_utreexo_tx);
+                                pending_utreexo_tx = Some(UtreexoTxInv {
+                                    txid: Txid::from_byte_array(hash),
+                                    positions: Vec::new(),
+                                });
+                            }
+                            Inventory::Unknown { inv_type, hash }
+                                if inv_type == MSG_UTREEXO_PROOF_HASH =>
+                            {
+                                if let Some(tx_inv) = pending_utreexo_tx.as_mut() {
+                                    tx_inv.positions.extend(parse_utreexo_proof_hash(&hash));
+                                }
+                            }
                             Inventory::Block(block_hash)
                             | Inventory::WitnessBlock(block_hash)
                             | Inventory::CompactBlock(block_hash) => {
+                                flush_utreexo_tx(&mut pending_utreexo_tx);
                                 block_inv_elements += 1;
                                 if block_inv_elements >= MAX_BLOCKS_PER_INV {
                                     return Err(PeerError::MessageTooBig);
@@ -495,9 +572,11 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
 
                                 self.send_to_node(PeerMessages::NewBlock(block_hash), time);
                             }
-                            _ => {}
+                            _ => flush_utreexo_tx(&mut pending_utreexo_tx),
                         }
                     }
+
+                    flush_utreexo_tx(&mut pending_utreexo_tx);
                 }
                 NetworkMessage::GetHeaders(_) => {
                     self.write(NetworkMessage::Headers(Vec::new())).await?;
@@ -512,9 +591,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 NetworkMessage::Ping(nonce) => {
                     self.handle_ping(nonce).await?;
                 }
-                NetworkMessage::FeeFilter(_) => {
-                    self.write(NetworkMessage::FeeFilter(1000)).await?;
-                }
+                NetworkMessage::FeeFilter(_) => {}
                 NetworkMessage::AddrV2(addresses) => {
                     // As per BIP 155, limit the number of addresses to 1,000
                     if addresses.len() > MAX_ADDRV2_ADDRESSES {
@@ -573,14 +650,24 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                         CommandString::try_from_static(UTREEXO_PROOF_CMD_STRING)
                             .expect("Invalid command string");
 
-                    if command != utreexo_proof_cmd {
-                        warn!("Unknown command string: {command}");
+                    let utreexo_tx_cmd = CommandString::try_from_static(UTREEXO_TX_CMD_STRING)
+                        .expect("Invalid command string");
+
+                    if command == utreexo_proof_cmd {
+                        let utreexo_proof: UtreexoProof = deserialize(&payload)?;
+                        self.send_to_node(PeerMessages::UtreexoProof(utreexo_proof), time);
+
                         return Ok(());
                     }
 
-                    let utreexo_proof: UtreexoProof = deserialize(&payload)?;
-                    self.send_to_node(PeerMessages::UtreexoProof(utreexo_proof), time);
+                    if command == utreexo_tx_cmd {
+                        let utreexo_tx: UtreexoTx = deserialize(&payload)?;
+                        self.send_to_node(PeerMessages::UtreexoTx(utreexo_tx), time);
 
+                        return Ok(());
+                    }
+
+                    warn!("Unknown command string: {command}");
                     return Ok(());
                 }
                 NetworkMessage::Block(block) => {
@@ -796,6 +883,7 @@ pub(super) mod peer_utils {
     use bitcoin::p2p::message_network::VersionMessage;
     use floresta_common::PROTOCOL_VERSION;
     use floresta_common::advertised_services;
+    use floresta_common::service_flags;
     use rand::RngExt;
     use rand::rng;
 
@@ -839,8 +927,10 @@ pub(super) mod peer_utils {
         // Inform the peer of this node's chain tip.
         let start_height = best_block as i32;
 
-        // Floresta does not implement transaction relay.
-        let relay = false;
+        // Only Utreexo peers can provide transaction inclusion proofs.
+        let relay = peer_address
+            .get_services()
+            .has(service_flags::UTREEXO.into());
 
         NetworkMessage::Version(VersionMessage {
             version: PROTOCOL_VERSION,
@@ -909,6 +999,19 @@ pub enum PeerMessages {
 
     /// Remote peer sent us compact block filter headers
     CFHeaders(CFHeaders),
+
+    /// Remote peer sent us a transaction together with its Utreexo inclusion proof
+    /// (`utreexotx` P2P message, BIP-183).
+    UtreexoTx(crate::p2p_wire::tx_relay::UtreexoTx),
+
+    /// Remote peer announced a transaction with its Utreexo merkle-forest
+    /// positions.
+    ///
+    /// This is produced when an `inv` transaction vector is immediately
+    /// followed by one or more
+    /// [`crate::p2p_wire::tx_relay::MSG_UTREEXO_PROOF_HASH`] vectors. The
+    /// positions from all consecutive proof-hash vectors are collected.
+    UtreexoTxInv(UtreexoTxInv),
 }
 
 #[cfg(test)]
@@ -919,15 +1022,27 @@ mod tests {
     use std::time::Instant;
 
     use bitcoin::Network;
+    use bitcoin::Txid;
+    use bitcoin::hashes::Hash;
     use bitcoin::p2p::ServiceFlags;
     use bitcoin::p2p::address::AddrV2;
     use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_blockdata::Inventory;
+    use floresta_common::service_flags;
     use floresta_mempool::Mempool;
+
     use tokio::sync::Mutex;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::sync::mpsc::unbounded_channel;
     use tokio::sync::oneshot;
+
+    use super::PeerMessages;
+    use super::utreexo_tx_getdata;
+    use crate::p2p_wire::tx_relay::MSG_UTREEXO_PROOF_HASH;
+    use crate::p2p_wire::tx_relay::MSG_WITNESS_UTREEXO_TX;
+    use crate::p2p_wire::tx_relay::pack_utreexo_proof_hashes;
+    use crate::p2p_wire::tx_relay::parse_utreexo_proof_hash;
 
     use crate::TransportProtocol;
     use crate::address_man::AddressState;
@@ -1082,5 +1197,119 @@ mod tests {
 
         // Prevents those channels from being dropped, so we don't get a `Channel` error
         drop(node_receiver);
+    }
+
+    #[tokio::test]
+    async fn inv_collects_all_positions_for_each_transaction() {
+        let SetupData {
+            mut peer,
+            mut node_receiver,
+            ..
+        } = create_peer();
+        let first_txid = Txid::all_zeros();
+        let second_txid = Txid::from_byte_array([1; 32]);
+        let first_positions = [0, 1, 2, 3, 4, 5];
+        let second_positions = [8, 13];
+
+        peer.handle_peer_message(
+            NetworkMessage::Inv(vec![
+                Inventory::Transaction(first_txid),
+                Inventory::Unknown {
+                    inv_type: MSG_UTREEXO_PROOF_HASH,
+                    hash: pack_positions(&first_positions),
+                },
+                Inventory::Unknown {
+                    inv_type: MSG_UTREEXO_PROOF_HASH,
+                    hash: pack_positions(&first_positions[4..]),
+                },
+                Inventory::WitnessTransaction(second_txid),
+                Inventory::Unknown {
+                    inv_type: MSG_UTREEXO_PROOF_HASH,
+                    hash: pack_positions(&second_positions),
+                },
+            ]),
+            Instant::now(),
+        )
+        .await
+        .expect("inventory must be processed");
+
+        let NodeNotification::FromPeer(_, PeerMessages::UtreexoTxInv(first), _) = node_receiver
+            .recv()
+            .await
+            .expect("first transaction inventory")
+        else {
+            panic!("expected Utreexo transaction inventory");
+        };
+        let NodeNotification::FromPeer(_, PeerMessages::UtreexoTxInv(second), _) = node_receiver
+            .recv()
+            .await
+            .expect("second transaction inventory")
+        else {
+            panic!("expected Utreexo transaction inventory");
+        };
+
+        assert_eq!(first.txid, first_txid);
+        assert_eq!(first.positions, first_positions);
+        assert_eq!(second.txid, second_txid);
+        assert_eq!(second.positions, second_positions);
+    }
+
+    #[test]
+    fn getdata_requests_every_required_proof_position() {
+        let txid = Txid::from_byte_array([42; 32]);
+        let positions = [0, 1, 2, 3, 4];
+        let inventory = utreexo_tx_getdata(txid, &positions);
+
+        assert_eq!(inventory.len(), 3);
+        assert!(matches!(
+            inventory[0],
+            Inventory::Unknown {
+                inv_type: MSG_WITNESS_UTREEXO_TX,
+                hash,
+            } if hash == txid.to_byte_array()
+        ));
+        let requested_positions: Vec<_> = inventory[1..]
+            .iter()
+            .flat_map(|inventory| match inventory {
+                Inventory::Unknown {
+                    inv_type: MSG_UTREEXO_PROOF_HASH,
+                    hash,
+                } => parse_utreexo_proof_hash(hash),
+                _ => panic!("proof request must use a proof-hash inventory vector"),
+            })
+            .collect();
+
+        assert_eq!(requested_positions, positions);
+    }
+
+    #[test]
+    fn version_requests_relay_only_from_utreexo_peers() {
+        let mut address = LocalAddress::new(
+            BitcoinSocketAddr::new(AddrV2::Ipv4(Ipv4Addr::LOCALHOST), 8333),
+            0,
+            AddressState::NeverTried,
+            ServiceFlags::NONE,
+            0,
+        );
+        let NetworkMessage::Version(version) =
+            peer_utils::build_version_message("/Floresta-test:0.0.0/".into(), 0, &address)
+        else {
+            panic!("version builder must return a version message");
+        };
+        assert!(!version.relay);
+
+        address.set_services(service_flags::UTREEXO.into());
+        let NetworkMessage::Version(version) =
+            peer_utils::build_version_message("/Floresta-test:0.0.0/".into(), 0, &address)
+        else {
+            panic!("version builder must return a version message");
+        };
+        assert!(version.relay);
+    }
+
+    fn pack_positions(positions: &[u64]) -> [u8; 32] {
+        pack_utreexo_proof_hashes(positions)
+            .next()
+            .expect("positions are not empty")
     }
 }

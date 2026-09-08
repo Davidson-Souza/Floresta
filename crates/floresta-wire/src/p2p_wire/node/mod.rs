@@ -91,6 +91,10 @@ pub enum NodeRequest {
     /// Ask for an unconfirmed transaction
     MempoolTransaction(Txid),
 
+    /// Set the minimum transaction fee rate this peer should relay, in
+    /// satoshis per kvB.
+    FeeFilter(i64),
+
     /// Sends know addresses to our peers
     SendAddresses(Vec<AddrV2Message>),
 
@@ -117,6 +121,16 @@ pub enum NodeRequest {
     GetCFHeaders {
         start_height: u32,
         stop_hash: BlockHash,
+    },
+
+    /// Ask an Utreexo-capable peer for a witness transaction together with
+    /// its accumulator inclusion proof (`utreexotx`, BIP-183).
+    ///
+    /// `proof_positions` contains every proof hash needed for the announced
+    /// input positions. No proof hashes are assumed to be cached locally.
+    GetUtreexoTx {
+        txid: Txid,
+        proof_positions: Vec<u64>,
     },
 }
 

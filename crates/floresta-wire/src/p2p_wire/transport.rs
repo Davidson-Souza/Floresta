@@ -408,8 +408,7 @@ where
                 let payload = protocol.read().await?;
                 let contents = payload.contents();
 
-                let msg = NetworkMessage::deserialize_v2(contents)?;
-                Ok(msg)
+                Ok(NetworkMessage::deserialize_v2(contents)?)
             }
             Self::V1(reader, network) => {
                 let mut data: Vec<u8> = vec![0; 24];

@@ -36,6 +36,12 @@ pub trait NodeContext {
     /// How long we wait for a peer to respond to our request
     const REQUEST_TIMEOUT: u64;
 
+    /// Minimum transaction fee rate peers should relay, in satoshis per kvB.
+    ///
+    /// IBD contexts use the maximum valid Bitcoin amount, which suppresses
+    /// transaction inventory without violating BIP133 fee-filter bounds.
+    const FEE_FILTER: i64 = 21_000_000 * 100_000_000;
+
     /// Max number of simultaneous connections we initiates we are willing to hold
     const MAX_OUTGOING_PEERS: usize = 10;
 

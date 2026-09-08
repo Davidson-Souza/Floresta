@@ -227,6 +227,8 @@ where
             p.state = PeerStatus::Ready;
         });
 
+        self.send_to_peer(peer, NodeRequest::FeeFilter(T::FEE_FILTER))?;
+
         // Ask for new addresses to populate our address manager
         self.send_to_peer(peer, NodeRequest::GetAddresses)?;
         self.inflight
@@ -900,7 +902,6 @@ where
         debug!("Adding node {}", local_address);
 
         local_address.set_services(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS);
-
         // Check if the peer already exists
         if self
             .added_peers

@@ -5,7 +5,9 @@
 //! CPU to run, being bound by the number of blocks found in a given period.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -54,6 +56,83 @@ const MAX_LAST_INVS: usize = 144; // Around one day worth of blocks
 
 /// To prevent disk filling attacks, we forbid reorgs that are over two days deep.
 const MAX_REORG_DEPTH: u32 = 288; // The expected amount of blocks mined in two days
+/// Derive the accumulator hashes required to prove `targets` at `num_leaves`.
+///
+/// This mirrors rustreexo's internal proof-position calculation, which is not public in the
+/// workspace's pinned rustreexo release.
+fn get_proof_positions(targets: &[u64], num_leaves: u64) -> Vec<u64> {
+    let forest_rows = tree_rows(num_leaves);
+    let mut proof_positions = BTreeSet::new();
+    let mut computed_positions = targets.to_vec();
+    let mut known_positions = HashSet::with_capacity(targets.len());
+
+    computed_positions.reserve(targets.len() * 2);
+    known_positions.extend(targets.iter().copied());
+
+    let mut index = 0;
+    while index < computed_positions.len() {
+        let position = computed_positions[index];
+        if is_root_position(position, num_leaves, forest_rows) {
+            index += 1;
+            continue;
+        }
+
+        let sibling = position ^ 1;
+        if !known_positions.contains(&sibling) {
+            proof_positions.insert(sibling);
+        }
+
+        if known_positions.contains(&sibling) {
+            proof_positions.remove(&position);
+        }
+
+        let parent = parent(position, forest_rows);
+        if known_positions.insert(parent) {
+            computed_positions.push(parent);
+        }
+
+        index += 1;
+    }
+
+    proof_positions.into_iter().collect()
+}
+
+fn is_root_position(position: u64, num_leaves: u64, forest_rows: u8) -> bool {
+    let row = detect_row(position, forest_rows);
+    num_leaves & (1 << row) != 0 && root_position(num_leaves, row, forest_rows) == position
+}
+
+fn root_position(num_leaves: u64, row: u8, forest_rows: u8) -> u64 {
+    let mask = (2_u64 << forest_rows) - 1;
+    let before = num_leaves & (mask << (row + 1));
+    let shifted = (before >> row) | (mask << (forest_rows + 1 - row));
+
+    shifted & mask
+}
+
+fn detect_row(position: u64, forest_rows: u8) -> u8 {
+    let mut marker = 1_u64 << forest_rows;
+    let mut row = 0;
+
+    while position & marker != 0 {
+        marker >>= 1;
+        row += 1;
+    }
+
+    row
+}
+
+fn parent(position: u64, forest_rows: u8) -> u64 {
+    (position >> 1) | (1 << forest_rows)
+}
+
+fn tree_rows(num_leaves: u64) -> u8 {
+    if num_leaves == 0 {
+        return 0;
+    }
+
+    (64 - (num_leaves - 1).leading_zeros()) as u8
+}
 
 #[derive(Debug, Clone)]
 pub struct RunningNode {
@@ -69,6 +148,8 @@ pub struct RunningNode {
 
 impl NodeContext for RunningNode {
     const REQUEST_TIMEOUT: u64 = 2 * 60;
+
+    const FEE_FILTER: i64 = 10;
 
     fn get_required_services(&self) -> ServiceFlags {
         ServiceFlags::NETWORK
@@ -357,6 +438,8 @@ where
             }
             return;
         }
+
+        self.broadcast_to_peers(NodeRequest::FeeFilter(RunningNode::FEE_FILTER));
 
         self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
         if let Some(ref cfilters) = self.block_filters {
@@ -657,9 +740,26 @@ where
                 };
 
                 match unhandled {
+                    PeerMessages::UtreexoTxInv(inv) => {
+                        let positions =
+                            get_proof_positions(&inv.positions, self.chain.get_acc().leaves);
+                        let request = NodeRequest::GetUtreexoTx {
+                            txid: inv.txid,
+                            proof_positions: positions,
+                        };
+
+                        self.send_to_fast_peer(request, service_flags::UTREEXO.into())?;
+                    }
+
                     PeerMessages::UtreexoProof(uproof) => {
                         self.attach_proof(uproof, peer)?;
                         self.process_pending_blocks()?;
+                    }
+
+                    PeerMessages::UtreexoTx(transaction) => {
+                        let txid = transaction.tx.compute_txid();
+                        info!("Received Utreexo transaction txid={txid}");
+                        self.handle_tx_msg(transaction.tx)?;
                     }
 
                     PeerMessages::NewBlock(block) => {
@@ -862,5 +962,15 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_proof_positions;
+
+    #[test]
+    fn calculates_shared_proof_positions() {
+        assert_eq!(get_proof_positions(&[4, 5, 7, 8], 8), vec![6, 9]);
     }
 }

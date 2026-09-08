@@ -148,18 +148,20 @@ impl NetworkMessageExt for NetworkMessage {
         let short_id = buffer[0];
         let mut payload_buffer = &buffer[1..];
 
-        // TODO: remove this once https://github.com/rust-bitcoin/rust-bitcoin/pull/5671
-        // and https://github.com/rust-bitcoin/rust-bitcoin/pull/5009 make it into a release
-        /// P2PV2 BIP-0324 message type for `uproof`.
+        // TODO: remove this once rust-bitcoin supports these BIP-0324
+        // Utreexo message types.
         const P2PV2_UPROOF_MSG_TYPE: u8 = 29;
-        if short_id == P2PV2_UPROOF_MSG_TYPE {
-            let msg = Self::Unknown {
-                command: CommandString::try_from_static("uproof")
-                    .expect("`uproof` is a valid command string"),
+        const P2PV2_UTREEXO_TX_MSG_TYPE: u8 = 34;
+        let utreexo_command = match short_id {
+            P2PV2_UPROOF_MSG_TYPE => Some("uproof"),
+            P2PV2_UTREEXO_TX_MSG_TYPE => Some("utreexotx"),
+            _ => None,
+        };
+        if let Some(command) = utreexo_command {
+            return Ok(Self::Unknown {
+                command: CommandString::try_from_static(command).expect("Utreexo command is valid"),
                 payload: payload_buffer.to_vec(),
-            };
-
-            return Ok(msg);
+            });
         }
 
         match short_id {
@@ -340,6 +342,20 @@ mod tests {
             NetworkMessage::deserialize_v2(&encoded).expect("serialized message must decode");
 
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn deserialize_v2_utreexo_transaction() {
+        let message = NetworkMessage::deserialize_v2(&[34, 0xf8, 0x08])
+            .expect("Utreexo transaction frame must decode");
+
+        assert_eq!(
+            message,
+            NetworkMessage::Unknown {
+                command: CommandString::try_from_static("utreexotx").expect("valid command"),
+                payload: vec![0xf8, 0x08],
+            }
+        );
     }
 
     #[test]

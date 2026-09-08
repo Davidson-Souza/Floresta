@@ -105,3 +105,4 @@ mod stump_updater;
 #[doc(hidden)]
 pub mod tests;
 pub mod transport;
+pub mod tx_relay;
