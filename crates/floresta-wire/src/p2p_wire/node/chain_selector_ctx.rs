@@ -33,19 +33,20 @@
 //!
 //! # Implementation
 //!
-//! In Floresta, we try to pick a good balance between data downloaded and security. We could
-//! simply download all chains from all peers and pick the most work one. But each header is
-//! 80 bytes-long, with ~800k blocks, that's around 60 MBs. If we have 10 peers, that's 600MBs
-//! (excluding overhead by the p2p messages). Moreover, it's very uncommon to actually have peers
-//! in different chains. So we can optmistically download all headers from one random peer, and
-//! then check with the others if they agree. If they have another chain for us, we download that
-//! chain, and pick whichever has more work.
+//! Floresta runs the disk-free PRESYNC phase independently against every connected peer. The
+//! first peer to demonstrate the network's minimum chainwork supplies full header hashes at
+//! 100,000-block boundaries. Requests to the other presync peers are then aborted.
 //!
-//! Most likely we'll only download one chain and all peers will agree with it. Then we can start
-//! downloading the actual blocks and validating them.
+//! The checkpoint ranges are redownloaded concurrently through distinct peers chosen by the
+//! normal latency-weighted selector. A complete range is inserted directly only after its ending
+//! checkpoint hash is reproduced; completed ranges are committed in height order. Once every
+//! range and the remaining headers have arrived, Floresta asks all peers whether they agree and
+//! downloads competing forks before choosing the most-work chain.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -88,9 +89,12 @@ use crate::node_context::LoopControl;
 use crate::node_context::NodeContext;
 use crate::node_context::PeerId;
 use crate::p2p_wire::error::WireError;
+use crate::p2p_wire::headers_sync::HeaderCheckpoint;
+use crate::p2p_wire::headers_sync::HeaderRange;
+use crate::p2p_wire::headers_sync::HeadersRangeDownload;
 use crate::p2p_wire::headers_sync::HeadersSyncState;
 use crate::p2p_wire::headers_sync::PresyncPhase;
-use crate::p2p_wire::headers_sync::ProcessingResult;
+use crate::p2p_wire::headers_sync::RangeProgress;
 use crate::p2p_wire::peer::PeerMessages;
 
 #[derive(Debug, Default, Clone)]
@@ -108,8 +112,38 @@ pub struct ChainSelector {
     /// Keep track each peer's tip
     tip_cache: HashMap<PeerId, BlockHash>,
 
-    /// Per-peer headers pre-synchronization state machines.
+    /// Independent PRESYNC state machines for peers still racing.
     presync_states: HashMap<PeerId, HeadersSyncState>,
+
+    /// Outstanding `getheaders` requests, tracked independently by peer.
+    headers_requests: HashMap<PeerId, Instant>,
+
+    /// Peer pinned for ordinary header download after parallel range redownload completes.
+    headers_sync_peer: Option<PeerId>,
+
+    /// Checkpoint ranges not yet assigned to a peer.
+    redownload_pending: VecDeque<HeaderRange>,
+
+    /// One independently verified checkpoint range per busy peer.
+    redownload_active: HashMap<PeerId, HeadersRangeDownload>,
+
+    /// Completed ranges waiting for all lower ranges before direct insertion.
+    redownload_completed: BTreeMap<u32, Vec<Header>>,
+
+    /// First height not yet inserted through `push_headers`.
+    redownload_next_height: Option<u32>,
+
+    /// Final checkpoint that concurrent redownload must reproduce.
+    redownload_target: Option<HeaderCheckpoint>,
+
+    /// Peers being disconnected after an invalid or timed-out range response.
+    unavailable_headers_peers: HashSet<PeerId>,
+
+    /// Peers with one outstanding response from an aborted PRESYNC request.
+    stale_presync_responses: HashSet<PeerId>,
+
+    /// Whether every checkpoint range was verified and inserted.
+    redownload_complete: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -117,7 +151,8 @@ pub enum ChainSelectorState {
     #[default]
     /// We are opening connection with some peers
     CreatingConnections,
-    /// We are downloading headers from only one peer, assuming this peer is honest
+    /// We are racing PRESYNC peers, redownloading checkpoint ranges concurrently, or fetching the
+    /// remaining headers from one fast peer.
     DownloadingHeaders,
     /// We've downloaded all headers, and now we are checking with our peers if they
     /// have an alternative tip with more PoW. Very unlikely, but we shouldn't trust
@@ -181,129 +216,193 @@ where
         &mut self,
         peer: PeerId,
         headers: Vec<Header>,
+        received_at: Instant,
     ) -> Result<(), WireError> {
-        if headers.is_empty() {
-            self.empty_headers_message(peer).await?;
+        // A peer may still owe one response to a PRESYNC request that was aborted when another
+        // peer won. Drain it without consuming a newer range request assigned to the same peer.
+        if self.context.stale_presync_responses.remove(&peer) {
+            debug!("Ignoring aborted presync response from peer={peer}");
             return Ok(());
         }
 
-        // Gate on per-peer presync state, not the global ChainSelector phase. Once any
-        // peer advances the state to LookingForForks, peers that are still mid-presync
-        // must continue routing through their own state machine. Peers with no active
-        // presync entry have already completed presync and go directly to accept_header.
-        if !self.context.presync_states.contains_key(&peer) {
+        // Fork agreement is deliberately unreachable until all checkpoint ranges and remaining
+        // headers have been downloaded.
+        if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
+            if headers.is_empty() {
+                return self.empty_headers_message(peer).await;
+            }
+
             for header in &headers {
-                if let Err(e) = self.chain.accept_header(*header) {
-                    error!("Error while accepting fork header from peer={peer} err={e}");
+                if let Err(error) = self.chain.accept_header(*header) {
+                    error!("Error while accepting fork header from peer={peer}: {error}");
                     self.disconnect_and_ban(peer)?;
                     return Ok(());
                 }
             }
-            let last = headers.last().unwrap().block_hash();
-            self.context
-                .tip_cache
-                .entry(peer)
-                .and_modify(|e| *e = last)
-                .or_insert(last);
+
+            let last = headers
+                .last()
+                .expect("non-empty headers response")
+                .block_hash();
+            self.context.tip_cache.insert(peer, last);
             self.last_tip_update = Instant::now();
-            self.request_headers(last)?;
+            let locator = self
+                .chain
+                .get_block_locator_for_tip(last)
+                .unwrap_or_default();
+            self.send_to_peer(peer, NodeRequest::GetHeaders(locator))?;
             return Ok(());
         }
 
-        // Route through the headers pre-sync state machine before touching permanent storage.
-        let (start_height, start_hash) = self.chain.get_best_block()?;
-        let start_bits = self.chain.get_block_header(&start_hash)?.bits;
-        let network = self.network;
+        if self.context.state != ChainSelectorState::DownloadingHeaders {
+            debug!("Ignoring headers from peer={peer} before header sync starts");
+            return Ok(());
+        }
 
-        let (result, presync_start, phase_after) = {
-            let state = self.context.presync_states.entry(peer).or_insert_with(|| {
-                HeadersSyncState::new(start_height, start_hash, start_bits, network)
-            });
+        let is_presync = self.context.presync_states.contains_key(&peer);
+        let is_range_download = self.context.redownload_active.contains_key(&peer);
+        let is_normal_download =
+            self.context.redownload_complete && self.context.headers_sync_peer == Some(peer);
+        if !is_presync && !is_range_download && !is_normal_download {
+            debug!("Ignoring headers from peer={peer} without assigned header work");
+            return Ok(());
+        }
 
-            info!(
-                "Downloading headers from peer={peer} at height={} hash={}",
-                state.start_height + 1,
-                headers[0].block_hash()
-            );
+        let Some(sent_at) = self.context.headers_requests.remove(&peer) else {
+            debug!("Ignoring unsolicited headers from peer={peer}");
+            return Ok(());
+        };
+        let elapsed = received_at.saturating_duration_since(sent_at).as_secs_f64();
+        if let Some(peer_data) = self.peers.get_mut(&peer) {
+            peer_data.message_times.add(elapsed * 1_000.0);
+        }
 
-            let result = match state.phase() {
-                PresyncPhase::Presync => state.process_presync(&headers),
-                PresyncPhase::Redownload => state.process_redownload(&headers),
-                PresyncPhase::Final | PresyncPhase::Aborted => ProcessingResult {
-                    success: true,
-                    ..Default::default()
-                },
+        if is_presync {
+            if headers.is_empty() {
+                // Regtest has no minimum-work gate. No returned headers means the actual chain is
+                // already complete, so agreement may begin immediately.
+                if self.network == Network::Regtest {
+                    self.context.presync_states.clear();
+                    self.context.headers_requests.clear();
+                    self.context.redownload_complete = true;
+                    self.context.headers_sync_peer = Some(peer);
+                    return self.empty_headers_message(peer).await;
+                }
+
+                self.context.presync_states.remove(&peer);
+                self.context.unavailable_headers_peers.insert(peer);
+                let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
+                if self.context.presync_states.is_empty() {
+                    self.context.state = ChainSelectorState::CreatingConnections;
+                }
+                return Ok(());
+            }
+
+            let (result, phase_after) = {
+                let state = self
+                    .context
+                    .presync_states
+                    .get_mut(&peer)
+                    .expect("presync assignment checked above");
+                let result = state.process_presync(&headers);
+                (result, state.phase().clone())
             };
 
-            (result, state.start_hash, state.phase().clone())
-        };
+            if !result.success {
+                error!("Peer={peer} failed headers presync; disconnecting and banning");
+                self.context.presync_states.remove(&peer);
+                self.disconnect_and_ban(peer)?;
+                return Ok(());
+            }
 
-        if !result.success {
-            error!("Peer {peer} failed headers presync, disconnecting and banning");
-            self.context.presync_states.remove(&peer);
-            self.disconnect_and_ban(peer)?;
+            match phase_after {
+                PresyncPhase::Presync => {
+                    if let Some(hash) = self
+                        .context
+                        .presync_states
+                        .get(&peer)
+                        .and_then(HeadersSyncState::next_locator_hash)
+                    {
+                        self.send_tracked_headers_request(peer, vec![hash], None)?;
+                    }
+                }
+                PresyncPhase::Redownload => {
+                    let ranges = self
+                        .context
+                        .presync_states
+                        .get(&peer)
+                        .and_then(HeadersSyncState::redownload_ranges)
+                        .expect("redownload phase has checkpoint ranges");
+                    info!(
+                        "Peer={peer} won headers presync with {} checkpoint ranges",
+                        ranges.len()
+                    );
+                    self.begin_parallel_redownload(ranges)?;
+                }
+                PresyncPhase::Aborted => {
+                    self.context.presync_states.remove(&peer);
+                    self.context.unavailable_headers_peers.insert(peer);
+                    let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
+                }
+            }
             return Ok(());
         }
 
-        // Accept only headers that passed commitment verification.
-        for header in &result.headers_to_accept {
-            if let Err(e) = self.chain.accept_header(*header) {
-                error!("Error while downloading headers from peer={peer} err={e}");
-                self.context.presync_states.remove(&peer);
+        if is_range_download {
+            if headers.is_empty() {
+                self.fail_redownload_range(peer)?;
+                return Ok(());
+            }
+
+            let (range, progress) = {
+                let download = self
+                    .context
+                    .redownload_active
+                    .get_mut(&peer)
+                    .expect("range assignment checked above");
+                (download.range(), download.process(&headers))
+            };
+
+            match progress {
+                RangeProgress::InProgress => self.request_active_range(peer)?,
+                RangeProgress::Complete(headers) => {
+                    self.context.redownload_active.remove(&peer);
+                    self.context
+                        .redownload_completed
+                        .insert(range.start.height + 1, headers);
+                    self.commit_completed_redownload_ranges()?;
+                    self.dispatch_redownload_ranges()?;
+                }
+                RangeProgress::Invalid => self.fail_redownload_range(peer)?,
+            }
+            return Ok(());
+        }
+
+        if headers.is_empty() {
+            return self.empty_headers_message(peer).await;
+        }
+
+        // Minimum work and every checkpoint range are already verified. Continue from the
+        // committed tip with the selected fast peer using normal header validation.
+        for header in &headers {
+            if let Err(error) = self.chain.accept_header(*header) {
+                error!("Error while downloading headers from peer={peer}: {error}");
+                self.context.unavailable_headers_peers.insert(peer);
+                // Keep the selected slot occupied until the disconnect notification arrives.
+                self.context.headers_requests.insert(peer, Instant::now());
                 self.disconnect_and_ban(peer)?;
-                let peer_info = self.peers.get(&peer).unwrap();
-                self.common.address_man.update_set_state(
-                    peer_info.address.id,
-                    AddressState::Banned(ChainSelector::BAN_TIME),
-                );
                 return Ok(());
             }
         }
-
-        let last = headers.last().unwrap().block_hash();
-        self.context
-            .tip_cache
-            .entry(peer)
-            .and_modify(|e| *e = last)
-            .or_insert(last);
+        let last = headers
+            .last()
+            .expect("non-empty headers response")
+            .block_hash();
+        self.context.tip_cache.insert(peer, last);
         self.last_tip_update = Instant::now();
-
-        match phase_after {
-            // PRESYNC just passed the tip-age gate; begin REDOWNLOAD from the start.
-            PresyncPhase::Redownload if !result.request_more => {
-                debug!(
-                    "Peer={peer} passed the presync work gate at tip={last}, redownloading headers for commitment verification"
-                );
-                let locator = self
-                    .chain
-                    .get_block_locator_for_tip(presync_start)
-                    .unwrap_or_default();
-                self.send_to_peer(peer, NodeRequest::GetHeaders(locator))?;
-            }
-            // REDOWNLOAD complete; discard state and continue with the normal sync flow.
-            PresyncPhase::Final => {
-                debug!("Peer={peer} finished headers redownload, presync complete at tip={last}");
-                self.context.presync_states.remove(&peer);
-                self.request_headers(last)?;
-            }
-            // Commitment cap hit; not misbehavior, silently drop this peer's presync.
-            PresyncPhase::Aborted => {
-                self.context.presync_states.remove(&peer);
-            }
-            // Still in PRESYNC or mid-REDOWNLOAD; request the next batch from this peer.
-            // Use an in-memory locator hash -- presync headers are never on disk.
-            _ => {
-                if let Some(hash) = self
-                    .context
-                    .presync_states
-                    .get(&peer)
-                    .and_then(|s| s.next_locator_hash())
-                {
-                    self.send_to_peer(peer, NodeRequest::GetHeaders(vec![hash]))?;
-                }
-            }
+        if !self.context.unavailable_headers_peers.contains(&peer) {
+            self.request_headers_from_peer(peer, last)?;
         }
-
         Ok(())
     }
 
@@ -742,9 +841,21 @@ where
                             tip_age,
                             "header sync reached a stale tip; staying in IBD until the chain advances"
                         );
+                        self.last_tip_update = Instant::now();
                         return Ok(());
                     }
                 }
+
+                self.context.done_peers.clear();
+                self.context.headers_sync_peer = None;
+                self.context.presync_states.clear();
+                self.context.headers_requests.clear();
+                self.context.redownload_pending.clear();
+                self.context.redownload_active.clear();
+                self.context.redownload_completed.clear();
+                self.context.redownload_next_height = None;
+                self.context.redownload_target = None;
+                self.context.redownload_complete = true;
 
                 info!("Finished downloading headers from peer={peer}, checking if our peers agree");
                 self.poke_peers()?;
@@ -753,8 +864,13 @@ where
             }
             ChainSelectorState::LookingForForks(_) => {
                 self.context.done_peers.insert(peer);
-                for peer in self.common.peer_ids.iter() {
-                    // at least one peer haven't finished
+                for peer in self
+                    .common
+                    .peer_ids
+                    .iter()
+                    .filter(|peer| !self.context.unavailable_headers_peers.contains(peer))
+                {
+                    // At least one usable peer has not finished.
                     if !self.context.done_peers.contains(peer) {
                         return Ok(());
                     }
@@ -884,24 +1000,307 @@ where
         Ok(())
     }
 
-    /// Ask for headers, given a tip
-    ///
-    /// This function will send a `getheaders` request to our peers, assuming this
-    /// peer is following a chain with `tip` inside it. We use this in case some of
-    /// our peer is in a fork, so we can learn about all blocks in that fork and
-    /// compare the candidate chains to pick the best one.
-    fn request_headers(&mut self, tip: BlockHash) -> Result<(), WireError> {
+    /// Sends a tracked ordinary or checkpoint-bounded `getheaders` request.
+    fn send_tracked_headers_request(
+        &mut self,
+        peer: PeerId,
+        locator: Vec<BlockHash>,
+        stop_hash: Option<BlockHash>,
+    ) -> Result<(), WireError> {
+        let request = match stop_hash {
+            Some(stop_hash) => NodeRequest::GetHeadersRange { locator, stop_hash },
+            None => NodeRequest::GetHeaders(locator),
+        };
+        self.send_to_peer(peer, request)?;
+        self.context.headers_requests.insert(peer, Instant::now());
+        Ok(())
+    }
+
+    fn request_headers_from_peer(&mut self, peer: PeerId, tip: BlockHash) -> Result<(), WireError> {
         let locator = self
             .chain
             .get_block_locator_for_tip(tip)
             .unwrap_or_default();
+        self.send_tracked_headers_request(peer, locator, None)
+    }
 
-        let peer = self.send_to_fast_peer(NodeRequest::GetHeaders(locator), ServiceFlags::NONE)?;
+    /// Starts one independent PRESYNC state machine for every available connected peer.
+    fn start_headers_presync(&mut self) -> Result<(), WireError> {
+        let (start_height, start_hash) = self.chain.get_best_block()?;
+        let start_bits = self.chain.get_block_header(&start_hash)?.bits;
+        let locator = self
+            .chain
+            .get_block_locator_for_tip(start_hash)
+            .unwrap_or_default();
+        let peers = self.peer_ids.clone();
 
-        self.inflight
-            .insert(InflightRequests::Headers, (peer, Instant::now()));
+        self.context.presync_states.clear();
+        self.context.headers_requests.clear();
+        self.context.headers_sync_peer = None;
+        self.context.redownload_pending.clear();
+        self.context.redownload_active.clear();
+        self.context.redownload_completed.clear();
+        self.context.redownload_next_height = None;
+        self.context.redownload_target = None;
+        self.context.redownload_complete = false;
+        self.inflight.remove(&InflightRequests::Headers);
 
+        for peer in peers {
+            if self.context.unavailable_headers_peers.contains(&peer) {
+                continue;
+            }
+            if let Err(error) = self.send_tracked_headers_request(peer, locator.clone(), None) {
+                debug!("Failed to start headers presync with peer={peer}: {error}");
+                continue;
+            }
+            self.context.presync_states.insert(
+                peer,
+                HeadersSyncState::new(start_height, start_hash, start_bits, self.network),
+            );
+        }
+
+        if self.context.presync_states.is_empty() {
+            return Err(WireError::NoPeersAvailable);
+        }
+
+        info!(
+            "Started headers presync with {} peers",
+            self.context.presync_states.len()
+        );
+        self.context.state = ChainSelectorState::DownloadingHeaders;
         Ok(())
+    }
+
+    /// Aborts the remaining PRESYNC requests and starts bounded ranges on distinct fast peers.
+    fn begin_parallel_redownload(&mut self, ranges: Vec<HeaderRange>) -> Result<(), WireError> {
+        let outstanding = self
+            .context
+            .headers_requests
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for peer in outstanding {
+            self.context.headers_requests.remove(&peer);
+            self.context.stale_presync_responses.insert(peer);
+        }
+        self.context.presync_states.clear();
+        self.context.headers_sync_peer = None;
+        self.context.redownload_active.clear();
+        self.context.redownload_completed.clear();
+        self.context.redownload_complete = false;
+
+        let Some(first) = ranges.first().copied() else {
+            self.context.redownload_complete = true;
+            return self.start_remaining_headers();
+        };
+        let target = ranges.last().expect("checked as non-empty").end;
+        self.context.redownload_next_height = Some(first.start.height + 1);
+        self.context.redownload_target = Some(target);
+        self.context.redownload_pending = ranges.into();
+
+        info!(
+            ranges = self.context.redownload_pending.len(),
+            target_height = target.height,
+            "Starting parallel checkpoint-range redownload"
+        );
+        self.dispatch_redownload_ranges()
+    }
+
+    /// Fills every idle peer slot with the next checkpoint range.
+    fn dispatch_redownload_ranges(&mut self) -> Result<(), WireError> {
+        loop {
+            let Some(range) = self.context.redownload_pending.front().copied() else {
+                return Ok(());
+            };
+
+            let mut excluded = self
+                .context
+                .redownload_active
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>();
+            excluded.extend(self.context.unavailable_headers_peers.iter().copied());
+            excluded.extend(
+                self.peers
+                    .keys()
+                    .filter(|peer| !self.peer_ids.contains(peer))
+                    .copied(),
+            );
+
+            let request = NodeRequest::GetHeadersRange {
+                locator: vec![range.start.hash],
+                stop_hash: range.end.hash,
+            };
+            let peer =
+                match self.send_to_fast_peer_excluding(request, ServiceFlags::NONE, &excluded) {
+                    Ok(peer) => peer,
+                    Err(WireError::NoPeersAvailable) => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+
+            self.context.redownload_pending.pop_front();
+            self.context
+                .redownload_active
+                .insert(peer, HeadersRangeDownload::new(range, self.network));
+            self.context.headers_requests.insert(peer, Instant::now());
+            debug!(
+                "Assigned header range {}..={} to peer={peer}",
+                range.start.height, range.end.height
+            );
+        }
+    }
+
+    fn request_active_range(&mut self, peer: PeerId) -> Result<(), WireError> {
+        let download = self
+            .context
+            .redownload_active
+            .get(&peer)
+            .ok_or(WireError::PeerNotFound)?;
+        self.send_tracked_headers_request(
+            peer,
+            vec![download.next_locator_hash()],
+            Some(download.stop_hash()),
+        )
+    }
+
+    /// Requeues an incomplete range and removes its peer from this scheduling round.
+    fn fail_redownload_range(&mut self, peer: PeerId) -> Result<(), WireError> {
+        if let Some(download) = self.context.redownload_active.remove(&peer) {
+            self.context.redownload_pending.push_front(download.range());
+        }
+        self.context.headers_requests.remove(&peer);
+        self.context.unavailable_headers_peers.insert(peer);
+        let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
+        self.dispatch_redownload_ranges()
+    }
+
+    /// Inserts completed ranges in height order through the prevalidated fast path.
+    fn commit_completed_redownload_ranges(&mut self) -> Result<(), WireError> {
+        let Some(mut next_height) = self.context.redownload_next_height else {
+            return Ok(());
+        };
+
+        while let Some(headers) = self.context.redownload_completed.remove(&next_height) {
+            let count = headers.len() as u32;
+            self.chain.push_headers(headers, next_height)?;
+            next_height += count;
+        }
+        self.context.redownload_next_height = Some(next_height);
+
+        let complete = self
+            .context
+            .redownload_target
+            .is_some_and(|target| next_height == target.height + 1)
+            && self.context.redownload_pending.is_empty()
+            && self.context.redownload_active.is_empty()
+            && self.context.redownload_completed.is_empty();
+        if !complete {
+            return Ok(());
+        }
+
+        let target = self
+            .context
+            .redownload_target
+            .expect("completion requires a target");
+        if self.chain.get_block_hash(target.height)? != target.hash {
+            error!("Direct header insertion did not reproduce the presync checkpoint");
+            return Err(WireError::PeerMisbehaving);
+        }
+
+        self.context.redownload_complete = true;
+        info!(
+            height = target.height,
+            hash = %target.hash,
+            "Finished parallel checkpoint-range redownload"
+        );
+        self.start_remaining_headers()
+    }
+
+    /// Uses the normal latency-weighted selector for headers after checkpoint redownload.
+    fn start_remaining_headers(&mut self) -> Result<(), WireError> {
+        if self.context.headers_sync_peer.is_some() {
+            return Ok(());
+        }
+        let (_, tip) = self.chain.get_best_block()?;
+        let locator = self
+            .chain
+            .get_block_locator_for_tip(tip)
+            .unwrap_or_default();
+        let mut excluded = self.context.unavailable_headers_peers.clone();
+        excluded.extend(
+            self.peers
+                .keys()
+                .filter(|peer| !self.peer_ids.contains(peer))
+                .copied(),
+        );
+        let peer = self.send_to_fast_peer_excluding(
+            NodeRequest::GetHeaders(locator),
+            ServiceFlags::NONE,
+            &excluded,
+        )?;
+        self.context.headers_sync_peer = Some(peer);
+        self.context.headers_requests.insert(peer, Instant::now());
+        Ok(())
+    }
+
+    fn check_headers_request_timeouts(&mut self) -> Result<(), WireError> {
+        let now = Instant::now();
+        let timed_out = self
+            .context
+            .headers_requests
+            .iter()
+            .filter_map(|(&peer, &sent_at)| {
+                (now.saturating_duration_since(sent_at).as_secs() > ChainSelector::REQUEST_TIMEOUT)
+                    .then_some(peer)
+            })
+            .collect::<Vec<_>>();
+
+        for peer in timed_out {
+            warn!("Headers request to peer={peer} timed out; disconnecting it");
+            let is_selected_peer = self.context.headers_sync_peer == Some(peer);
+            self.context.headers_requests.remove(&peer);
+
+            if let Some(download) = self.context.redownload_active.remove(&peer) {
+                self.context.redownload_pending.push_front(download.range());
+            } else if self.context.presync_states.remove(&peer).is_some() {
+                self.context.stale_presync_responses.insert(peer);
+            } else if is_selected_peer {
+                // Ordinary header download remains pinned until this peer actually disconnects.
+                self.context.headers_requests.insert(peer, now);
+            }
+
+            self.context.unavailable_headers_peers.insert(peer);
+            let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
+        }
+
+        self.dispatch_redownload_ranges()?;
+        if self.context.redownload_complete && self.context.headers_sync_peer.is_none() {
+            let _ = self.start_remaining_headers();
+        } else if !self.context.redownload_complete
+            && self.context.presync_states.is_empty()
+            && self.context.redownload_pending.is_empty()
+            && self.context.redownload_active.is_empty()
+        {
+            self.context.state = ChainSelectorState::CreatingConnections;
+        }
+        Ok(())
+    }
+
+    /// Rechecks a stale completed tip with the same fast peer after the normal timeout.
+    fn maybe_retry_stale_tip(&mut self) -> Result<(), WireError> {
+        if !self.context.redownload_complete || !self.context.headers_requests.is_empty() {
+            return Ok(());
+        }
+        if self.context.headers_sync_peer.is_none() {
+            return self.start_remaining_headers();
+        }
+        if self.last_tip_update.elapsed().as_secs() <= ChainSelector::REQUEST_TIMEOUT {
+            return Ok(());
+        }
+
+        let peer = self.context.headers_sync_peer.expect("checked as present");
+        let (_, tip) = self.chain.get_best_block()?;
+        self.request_headers_from_peer(peer, tip)
     }
 
     /// Sends a `getheaders` to all our peers
@@ -912,7 +1311,12 @@ where
     /// the most PoW one.
     fn poke_peers(&self) -> Result<(), WireError> {
         let locator = self.chain.get_block_locator().unwrap();
-        for peer in self.common.peer_ids.iter() {
+        for peer in self
+            .common
+            .peer_ids
+            .iter()
+            .filter(|peer| !self.context.unavailable_headers_peers.contains(peer))
+        {
             let get_headers = NodeRequest::GetHeaders(locator.clone());
             self.send_to_peer(*peer, get_headers)?;
         }
@@ -1000,22 +1404,16 @@ where
             }
         }
 
-        if let ChainSelectorState::DownloadingHeaders = self.context.state {
-            let elapsed = self.last_tip_update.elapsed().as_secs();
-            let should_request = elapsed > ChainSelector::REQUEST_TIMEOUT
-                && !self.inflight.contains_key(&InflightRequests::Headers);
-
-            if should_request {
-                self.request_headers(self.chain.get_best_block()?.1)?;
+        if self.context.state == ChainSelectorState::CreatingConnections {
+            // Once enough peers are ready, race all of them through independent presyncs.
+            if self.can_start_headers_sync() {
+                try_and_log!(self.start_headers_presync());
             }
         }
 
-        if self.context.state == ChainSelectorState::CreatingConnections {
-            // If we have enough peers, try to download headers
-            if self.can_start_headers_sync() {
-                try_and_log!(self.request_headers(self.chain.get_best_block()?.1));
-                self.context.state = ChainSelectorState::DownloadingHeaders;
-            }
+        if self.context.state == ChainSelectorState::DownloadingHeaders {
+            try_and_log!(self.maybe_retry_stale_tip());
+            try_and_log!(self.check_headers_request_timeouts());
         }
 
         // We downloaded all headers in the most-pow chain, and all our peers agree
@@ -1140,8 +1538,14 @@ where
 
         match unhandled {
             PeerMessages::Headers(headers) => {
-                self.inflight.remove(&InflightRequests::Headers);
-                return self.handle_headers(peer, headers).await;
+                if self
+                    .inflight
+                    .get(&InflightRequests::Headers)
+                    .is_some_and(|(request_peer, _)| *request_peer == peer)
+                {
+                    self.inflight.remove(&InflightRequests::Headers);
+                }
+                return self.handle_headers(peer, headers, time).await;
             }
 
             PeerMessages::Ready(version) => {
@@ -1149,14 +1553,44 @@ where
                 if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
                     let locator = self.chain.get_block_locator().unwrap();
                     self.send_to_peer(peer, NodeRequest::GetHeaders(locator))?;
+                } else if self.context.state == ChainSelectorState::DownloadingHeaders
+                    && !self.context.redownload_pending.is_empty()
+                {
+                    self.dispatch_redownload_ranges()?;
                 }
             }
 
             PeerMessages::Disconnected(idx) => {
+                let was_sync_peer = self.context.headers_sync_peer == Some(peer);
+                self.context.headers_requests.remove(&peer);
+                self.context.stale_presync_responses.remove(&peer);
+                self.context.unavailable_headers_peers.remove(&peer);
+                self.context.presync_states.remove(&peer);
+                if let Some(download) = self.context.redownload_active.remove(&peer) {
+                    self.context.redownload_pending.push_front(download.range());
+                }
+                if was_sync_peer {
+                    self.context.headers_sync_peer = None;
+                }
+
+                self.handle_disconnection(peer, idx)?;
+
+                if self.context.state == ChainSelectorState::DownloadingHeaders {
+                    self.dispatch_redownload_ranges()?;
+                    if self.context.redownload_complete && was_sync_peer {
+                        let _ = self.start_remaining_headers();
+                    } else if !self.context.redownload_complete
+                        && self.context.presync_states.is_empty()
+                        && self.context.redownload_pending.is_empty()
+                        && self.context.redownload_active.is_empty()
+                    {
+                        self.context.state = ChainSelectorState::CreatingConnections;
+                    }
+                }
+
                 if self.peers.is_empty() {
                     self.context.state = ChainSelectorState::CreatingConnections;
                 }
-                self.handle_disconnection(peer, idx)?;
             }
 
             // During chain selection we don't ask for blocks, unless it's an explicit
@@ -1188,6 +1622,7 @@ mod tests {
     use bitcoin::block::Version;
     use bitcoin::hashes::Hash;
     use floresta_chain::AssumeValidArg;
+    use floresta_chain::BlockchainInterface;
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
     use floresta_chain::FlatChainStoreConfig;
@@ -1196,6 +1631,7 @@ mod tests {
     use rustreexo::node_hash::BitcoinNodeHash;
     use tokio::sync::Mutex;
     use tokio::sync::RwLock;
+    use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
@@ -1309,104 +1745,309 @@ mod tests {
         );
     }
 
-    /// Reproduces the shared-state race: once any peer pushes the global ChainSelector state
-    /// to `LookingForForks`, headers from a peer that is still mid-presync must continue
-    /// routing through that peer's presync state machine rather than bypassing it.
-    ///
-    /// The test builds a chain of easy-PoW headers rooted at `BlockHash::all_zeros()`.
-    /// On Signet that parent is unknown, so `accept_header` rejects them -- if the global-
-    /// state gate incorrectly bypasses presync, the peer gets banned. If presync correctly
-    /// gates per-peer, the headers accumulate work inside the state machine and the peer
-    /// remains connected while waiting for more batches.
-    #[tokio::test]
-    async fn presync_gate_is_per_peer_not_global() {
-        let datadir = format!("./tmp-db/{}.cs_presync_race", rand::random::<u32>());
+    fn test_node(network: Network, name: &str) -> TestNode {
+        let datadir = format!("./tmp-db/{}.cs_{name}", rand::random::<u32>());
         let chainstore = FlatChainStore::new(FlatChainStoreConfig::new(&datadir)).unwrap();
-        let chain = Arc::new(
-            ChainState::open(chainstore, Network::Signet, AssumeValidArg::Disabled).unwrap(),
-        );
-        let mempool = Arc::new(Mutex::new(Mempool::new(1000)));
-        let kill_signal = Arc::new(RwLock::new(false));
+        let chain =
+            Arc::new(ChainState::open(chainstore, network, AssumeValidArg::Disabled).unwrap());
 
-        let mut node = TestNode::new(
+        TestNode::new(
             UtreexoNodeConfig {
-                network: Network::Signet,
+                network,
                 max_tip_age_secs: u32::MAX,
                 ..Default::default()
             },
             chain,
-            mempool,
+            Arc::new(Mutex::new(Mempool::new(1000))),
             None,
-            kill_signal,
+            Arc::new(RwLock::new(false)),
             AddressMan::new(None, &[]),
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        // Wire up peer B with a live channel so send_to_peer doesn't error.
-        const PEER_B: u32 = 1;
-        let (peer_b_tx, _peer_b_rx) = unbounded_channel::<NodeRequest>();
+    fn add_test_peer(
+        node: &mut TestNode,
+        peer: PeerId,
+        latency_ms: f64,
+    ) -> UnboundedReceiver<NodeRequest> {
+        let (sender, receiver) = unbounded_channel();
+        let mut message_times = Ema::with_half_life_50();
+        message_times.add(latency_ms);
         node.peers.insert(
-            PEER_B,
+            peer,
             LocalPeerView {
-                message_times: Ema::with_half_life_50(),
-                address: "127.0.0.1:8334".parse().unwrap(),
+                message_times,
+                address: format!("127.0.0.1:{}", 8333 + peer).parse().unwrap(),
                 services: ServiceFlags::NONE,
-                user_agent: "test_peer".to_string(),
+                user_agent: format!("test_peer_{peer}"),
                 height: 0,
                 time_offset: 0,
                 state: PeerStatus::Ready,
-                channel: peer_b_tx,
+                channel: sender,
                 kind: ConnectionKind::Regular(ServiceFlags::NONE),
                 banscore: 0,
                 _last_message: Instant::now(),
                 transport_protocol: TransportProtocol::V2,
             },
         );
+        node.peer_ids.push(peer);
+        receiver
+    }
 
-        // Simulate peer A having already finished: global state is now LookingForForks.
-        node.context.state = ChainSelectorState::LookingForForks(Instant::now());
+    fn make_header(prev: BlockHash, time: u32, bits: CompactTarget) -> Header {
+        (0u32..=u32::MAX)
+            .map(|nonce| Header {
+                version: Version::from_consensus(1),
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time,
+                bits,
+                nonce,
+            })
+            .find(|header| header.validate_pow(header.target()).is_ok())
+            .expect("regtest target should produce a valid nonce")
+    }
 
-        // Peer B was mid-presync when peer A triggered the transition.
-        let genesis =
-            bitcoin::BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::all_zeros());
-        let easy_bits = CompactTarget::from_consensus(0x207f_ffff);
-        node.context.presync_states.insert(
-            PEER_B,
-            HeadersSyncState::new(0, genesis, easy_bits, Network::Signet),
-        );
+    fn make_headers(
+        prev: BlockHash,
+        first_time: u32,
+        bits: CompactTarget,
+        count: usize,
+    ) -> Vec<Header> {
+        let mut headers = Vec::with_capacity(count);
+        let mut prev = prev;
+        for offset in 0..count {
+            let header = make_header(prev, first_time + offset as u32, bits);
+            prev = header.block_hash();
+            headers.push(header);
+        }
+        headers
+    }
 
-        // Build easy-PoW headers rooted at all_zeros.
-        // On Signet, all_zeros is not the real genesis hash, so accept_header rejects them.
-        // Presync only checks continuity and accumulates work, so it accepts them.
-        let mut headers = Vec::new();
-        let mut prev = genesis;
-        for i in 0..5u32 {
-            let h = (0u32..)
-                .map(|nonce| bitcoin::block::Header {
-                    version: Version::from_consensus(1),
-                    prev_blockhash: prev,
-                    merkle_root: TxMerkleNode::from_raw_hash(
-                        bitcoin::hashes::sha256d::Hash::all_zeros(),
-                    ),
-                    time: 1_000_000 + i,
-                    bits: easy_bits,
-                    nonce,
-                })
-                .find(|h| h.validate_pow(h.target()).is_ok())
+    fn assert_getheaders(receiver: &mut UnboundedReceiver<NodeRequest>) {
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(NodeRequest::GetHeaders(_) | NodeRequest::GetHeadersRange { .. })
+        ));
+    }
+
+    fn assert_range_request(receiver: &mut UnboundedReceiver<NodeRequest>) {
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(NodeRequest::GetHeadersRange { .. })
+        ));
+    }
+
+    #[test]
+    fn presync_starts_for_every_connected_peer() {
+        let mut node = test_node(Network::Regtest, "presync_all_peers");
+        let mut peer_one = add_test_peer(&mut node, 1, 10.0);
+        let mut peer_two = add_test_peer(&mut node, 2, 20.0);
+
+        node.start_headers_presync().unwrap();
+
+        assert_eq!(node.context.presync_states.len(), 2);
+        assert_eq!(node.context.headers_requests.len(), 2);
+        assert_eq!(node.context.headers_sync_peer, None);
+        assert_getheaders(&mut peer_one);
+        assert_getheaders(&mut peer_two);
+    }
+
+    #[tokio::test]
+    async fn first_presync_peer_stops_other_presync_requests() {
+        const WINNER: PeerId = 1;
+        const OTHER: PeerId = 2;
+
+        let mut node = test_node(Network::Regtest, "presync_first_wins");
+        let mut winner_requests = add_test_peer(&mut node, WINNER, 20.0);
+        let mut other_requests = add_test_peer(&mut node, OTHER, 30.0);
+        node.start_headers_presync().unwrap();
+        assert_getheaders(&mut winner_requests);
+        assert_getheaders(&mut other_requests);
+
+        let (_, genesis) = node.chain.get_best_block().unwrap();
+        let genesis_header = node.chain.get_block_header(&genesis).unwrap();
+        let header = make_header(genesis, genesis_header.time + 1, genesis_header.bits);
+        node.handle_headers(WINNER, vec![header], Instant::now())
+            .await
+            .unwrap();
+
+        assert!(node.context.presync_states.is_empty());
+        assert!(node.context.stale_presync_responses.contains(&OTHER));
+        assert_eq!(node.context.redownload_active.len(), 1);
+        assert!(node.context.redownload_pending.is_empty());
+        assert_eq!(node.context.headers_requests.len(), 1);
+        assert_eq!(node.context.headers_sync_peer, None);
+        assert!(!node.context.redownload_complete);
+        assert_eq!(node.chain.get_best_block().unwrap().0, 0);
+
+        let range_requests = [winner_requests.try_recv(), other_requests.try_recv()]
+            .into_iter()
+            .filter(|request| matches!(request, Ok(NodeRequest::GetHeadersRange { .. })))
+            .count();
+        assert_eq!(range_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ranges_download_concurrently_and_commit_in_order() {
+        let mut node = test_node(Network::Regtest, "parallel_redownload");
+        let mut peer_one = add_test_peer(&mut node, 1, 10.0);
+        let mut peer_two = add_test_peer(&mut node, 2, 20.0);
+        let mut peer_three = add_test_peer(&mut node, 3, 30.0);
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+
+        let (_, genesis) = node.chain.get_best_block().unwrap();
+        let genesis_header = node.chain.get_block_header(&genesis).unwrap();
+        let headers = make_headers(genesis, genesis_header.time + 1, genesis_header.bits, 6);
+        let checkpoints = [
+            HeaderCheckpoint {
+                height: 0,
+                hash: genesis,
+                bits: genesis_header.bits,
+            },
+            HeaderCheckpoint {
+                height: 2,
+                hash: headers[1].block_hash(),
+                bits: headers[1].bits,
+            },
+            HeaderCheckpoint {
+                height: 4,
+                hash: headers[3].block_hash(),
+                bits: headers[3].bits,
+            },
+            HeaderCheckpoint {
+                height: 6,
+                hash: headers[5].block_hash(),
+                bits: headers[5].bits,
+            },
+        ];
+        let ranges = checkpoints
+            .windows(2)
+            .map(|pair| HeaderRange {
+                start: pair[0],
+                end: pair[1],
+            })
+            .collect();
+
+        node.context.stale_presync_responses.insert(1);
+        node.begin_parallel_redownload(ranges).unwrap();
+        assert_eq!(node.context.redownload_active.len(), 3);
+        assert_eq!(node.context.headers_requests.len(), 3);
+        assert_range_request(&mut peer_one);
+        assert_range_request(&mut peer_two);
+        assert_range_request(&mut peer_three);
+
+        let peer_one_range = node.context.redownload_active[&1].range();
+        node.handle_headers(1, vec![headers[0]], Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(node.context.redownload_active[&1].range(), peer_one_range);
+        assert!(node.context.headers_requests.contains_key(&1));
+
+        // Complete the high ranges first. They stay in memory until the missing lower range
+        // arrives, then all three are inserted through push_headers in height order.
+        let mut assignments = node
+            .context
+            .redownload_active
+            .iter()
+            .map(|(&peer, download)| (peer, download.range()))
+            .collect::<Vec<_>>();
+        assignments.sort_by_key(|item| std::cmp::Reverse(item.1.start.height));
+        for (peer, range) in assignments {
+            let start = range.start.height as usize;
+            let end = range.end.height as usize;
+            node.handle_headers(peer, headers[start..end].to_vec(), Instant::now())
+                .await
                 .unwrap();
-            prev = h.block_hash();
-            headers.push(h);
         }
 
-        node.handle_headers(PEER_B, headers).await.unwrap();
-
-        // Correct behavior: presync ran per-peer, accumulated work, peer B stays connected.
-        // Bug behavior: global gate bypassed presync, accept_header rejected the unknown-
-        // parent headers, peer B was banned.
+        assert!(node.context.redownload_complete);
+        assert!(node.context.redownload_active.is_empty());
+        assert!(node.context.redownload_completed.is_empty());
         assert_eq!(
-            node.peers.get(&PEER_B).map(|p| p.state),
-            Some(PeerStatus::Ready),
-            "peer B must stay connected while presync accumulates work on its active state"
+            node.chain.get_best_block().unwrap(),
+            (6, headers[5].block_hash())
         );
+
+        let sync_peer = node
+            .context
+            .headers_sync_peer
+            .expect("normal header download should use a fast peer");
+        match sync_peer {
+            1 => assert_getheaders(&mut peer_one),
+            2 => assert_getheaders(&mut peer_two),
+            3 => assert_getheaders(&mut peer_three),
+            _ => panic!("unexpected sync peer"),
+        }
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+
+        node.handle_headers(sync_peer, Vec::new(), Instant::now())
+            .await
+            .unwrap();
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn disconnected_range_is_reassigned_to_an_idle_peer() {
+        let mut node = test_node(Network::Regtest, "parallel_failover");
+        let mut peer_one = add_test_peer(&mut node, 1, 10.0);
+        let mut peer_two = add_test_peer(&mut node, 2, 20.0);
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+
+        let (_, genesis) = node.chain.get_best_block().unwrap();
+        let genesis_header = node.chain.get_block_header(&genesis).unwrap();
+        let headers = make_headers(genesis, genesis_header.time + 1, genesis_header.bits, 2);
+        let range = HeaderRange {
+            start: HeaderCheckpoint {
+                height: 0,
+                hash: genesis,
+                bits: genesis_header.bits,
+            },
+            end: HeaderCheckpoint {
+                height: 2,
+                hash: headers[1].block_hash(),
+                bits: headers[1].bits,
+            },
+        };
+
+        node.begin_parallel_redownload(vec![range]).unwrap();
+        let first_peer = *node
+            .context
+            .redownload_active
+            .keys()
+            .next()
+            .expect("range should be assigned");
+        match first_peer {
+            1 => assert_range_request(&mut peer_one),
+            2 => assert_range_request(&mut peer_two),
+            _ => panic!("unexpected range peer"),
+        }
+
+        let address_id = node.peers[&first_peer].address.id;
+        node.handle_peer_notification(
+            PeerMessages::Disconnected(address_id),
+            first_peer,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+
+        let replacement = *node
+            .context
+            .redownload_active
+            .keys()
+            .next()
+            .expect("range should be reassigned");
+        assert_ne!(replacement, first_peer);
+        assert_eq!(node.context.redownload_active[&replacement].range(), range);
+        match replacement {
+            1 => assert_range_request(&mut peer_one),
+            2 => assert_range_request(&mut peer_two),
+            _ => panic!("unexpected replacement peer"),
+        }
     }
 }

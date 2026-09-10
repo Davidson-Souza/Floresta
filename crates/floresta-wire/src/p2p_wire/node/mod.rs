@@ -79,6 +79,12 @@ pub enum NodeRequest {
     /// Asks peer for headers
     GetHeaders(Vec<BlockHash>),
 
+    /// Asks a peer for headers after `locator`, stopping at `stop_hash`.
+    GetHeadersRange {
+        locator: Vec<BlockHash>,
+        stop_hash: BlockHash,
+    },
+
     /// Ask for other peers addresses
     GetAddresses,
 

@@ -193,6 +193,11 @@ pub trait UpdatableChainstate {
     ///
     /// This function returns whether this block is on our best-known chain, or in a fork
     fn accept_header(&self, header: BlockHeader) -> Result<(), BlockchainError>;
+    /// Inserts a prevalidated contiguous header range directly at `height`.
+    ///
+    /// This bypasses `accept_header`; callers must already have verified proof of work,
+    /// difficulty transitions, continuity, and the range's committed endpoint.
+    fn push_headers(&self, headers: Vec<BlockHeader>, height: u32) -> Result<(), BlockchainError>;
     /// Not used for now, but in a future blockchain with mempool, we can process transactions
     /// that are not in a block yet.
     fn handle_transaction(&self) -> Result<(), BlockchainError>;
@@ -265,6 +270,10 @@ impl<T: UpdatableChainstate> UpdatableChainstate for Arc<T> {
 
     fn accept_header(&self, header: BlockHeader) -> Result<(), BlockchainError> {
         T::accept_header(self, header)
+    }
+
+    fn push_headers(&self, headers: Vec<BlockHeader>, height: u32) -> Result<(), BlockchainError> {
+        T::push_headers(self, headers, height)
     }
 
     fn get_root_hashes(&self) -> Vec<BitcoinNodeHash> {

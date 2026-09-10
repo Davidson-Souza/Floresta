@@ -186,7 +186,11 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         Ok(())
     }
 
-    /// Just adds headers to the chainstate, without validating them.
+    /// Inserts prevalidated headers without repeating consensus or continuity checks.
+    ///
+    /// If the range starts immediately after the current best block, its last header becomes the
+    /// new best tip. Out-of-order ranges are indexed but do not advance the tip until their
+    /// predecessors are inserted. The corresponding blocks remain pending validation.
     pub fn push_headers(
         &self,
         headers: Vec<BlockHeader>,
@@ -194,10 +198,17 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
     ) -> Result<(), BlockchainError> {
         for (offset, &header) in headers.iter().enumerate() {
             let disk_height = height + offset as u32;
-            let disk_header = DiskBlockHeader::FullyValid(header, disk_height);
+            let disk_header = DiskBlockHeader::HeadersOnly(header, disk_height);
             let hash = disk_header.block_hash();
-
             self.update_header_and_index(&disk_header, hash, disk_height)?;
+        }
+
+        if let Some(last) = headers.last() {
+            let mut inner = write_lock!(self);
+            if height == inner.best_block.depth + 1 {
+                let last_height = height + headers.len() as u32 - 1;
+                inner.best_block.new_block(last.block_hash(), last_height);
+            }
         }
 
         Ok(())
@@ -1268,6 +1279,9 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
 }
 
 impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedState> {
+    fn push_headers(&self, headers: Vec<BlockHeader>, height: u32) -> Result<(), BlockchainError> {
+        Self::push_headers(self, headers, height)
+    }
     fn switch_chain(&self, new_tip: BlockHash) -> Result<(), BlockchainError> {
         let new_tip = self.get_block_header(&new_tip)?;
         self.reorg(new_tip)

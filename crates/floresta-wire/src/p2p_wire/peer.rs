@@ -395,6 +395,17 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     ))
                     .await;
             }
+            NodeRequest::GetHeadersRange { locator, stop_hash } => {
+                let _ = self
+                    .write(NetworkMessage::GetHeaders(
+                        bitcoin::p2p::message_blockdata::GetHeadersMessage {
+                            version: 0,
+                            locator_hashes: locator,
+                            stop_hash,
+                        },
+                    ))
+                    .await;
+            }
             NodeRequest::Shutdown => {
                 self.shutdown = true;
                 self.writer.shutdown().await?;

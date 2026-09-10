@@ -115,6 +115,37 @@ impl SimulatedPeer {
                         .send(NodeNotification::FromPeer(self.peer_id, peer_msg, now))
                         .unwrap();
                 }
+                NodeRequest::GetHeadersRange { locator, stop_hash } => {
+                    let start = locator
+                        .iter()
+                        .find_map(|hash| {
+                            self.headers
+                                .iter()
+                                .position(|header| header.block_hash() == *hash)
+                        })
+                        .unwrap_or(0);
+                    let headers = self
+                        .headers
+                        .iter()
+                        .skip(start + 1)
+                        .take_while(|header| header.block_hash() != stop_hash)
+                        .chain(
+                            self.headers
+                                .iter()
+                                .skip(start + 1)
+                                .find(|header| header.block_hash() == stop_hash),
+                        )
+                        .copied()
+                        .take(2_000)
+                        .collect();
+                    self.node_tx
+                        .send(NodeNotification::FromPeer(
+                            self.peer_id,
+                            PeerMessages::Headers(headers),
+                            now,
+                        ))
+                        .unwrap();
+                }
                 NodeRequest::GetUtreexoState((hash, _)) => {
                     let accs = self.accs.get(&hash).unwrap().clone();
 
