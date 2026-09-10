@@ -117,22 +117,16 @@ where
 
         debug!("Attempting connection with address={peer_address:?} kind={conn_kind:?}",);
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        // Defaults to failed, if the connection is successful, we'll update the state
-        self.address_man
-            .update_set_state(peer_id, AddressState::Failed(now));
-
         // Don't connect to the same peer twice
-        if self
-            .common
-            .peers
-            .values()
-            .any(|p| p.address == peer_address)
-        {
+        if self.common.peers.values().any(|peer| {
+            peer.address.as_bitcoin_socket_addr() == peer_address.as_bitcoin_socket_addr()
+        }) {
+            if !self.has_fixed_peers() {
+                // Repair stale address-manager state as well as rejecting this attempt, otherwise
+                // the same active endpoint would remain eligible on every subsequent draw.
+                self.address_man
+                    .update_set_state(peer_id, AddressState::Connected);
+            }
             return Err(WireError::PeerAlreadyExists(peer_address));
         }
 
@@ -141,10 +135,13 @@ where
         let allow_v1_fallback =
             matches!(conn_kind, ConnectionKind::Manual) || self.config.allow_v1_fallback;
 
-        // Open a connection to the peer.
-        self.open_connection(conn_kind, peer_address, allow_v1_fallback)?;
-
-        Ok(())
+        // Open a connection to the peer. Release the address-manager reservation if setup fails
+        // before the peer actor can report a connection result.
+        let result = self.open_connection(conn_kind, peer_address, allow_v1_fallback);
+        if result.is_err() && !self.has_fixed_peers() {
+            self.address_man.cancel_connection_attempt(peer_id);
+        }
+        result
     }
 
     pub(crate) fn open_feeler_connection(&mut self) -> Result<(), WireError> {

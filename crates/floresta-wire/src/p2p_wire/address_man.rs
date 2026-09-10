@@ -24,6 +24,8 @@ use bitcoin::p2p::address::AddrV2Message;
 use floresta_chain::DnsSeed;
 use floresta_common::service_flags;
 use rand::RngExt;
+use rand::distr::Distribution;
+use rand::distr::weighted::WeightedIndex;
 use rand::seq::IteratorRandom;
 use serde::Deserialize;
 use serde::Serialize;
@@ -36,8 +38,32 @@ use crate::bitcoin_socket_addr::BitcoinSocketAddr;
 use crate::bitcoin_socket_addr::InvalidAddressError;
 use crate::onion::OnionV3Addr;
 
-/// How long we'll wait before trying to connect to a peer that failed
-const RETRY_TIME: u64 = 10 * 60; // 10 minutes
+/// Time constant used to reduce the weight of addresses that were attempted recently.
+const RETRY_TAU: f64 = 10.0 * 60.0; // 10 minutes
+
+/// Time constant used to restore the weight of addresses after a failed attempt.
+const FAILURE_TAU: f64 = 6.0 * 60.0 * 60.0; // 6 hours
+
+/// Minimum retry score assigned to an address attempted just now.
+const RETRY_FLOOR: f64 = 0.01;
+
+/// Minimum result score assigned to an address whose latest attempt failed.
+const FAILURE_FLOOR: f64 = 0.05;
+
+/// Reliability multiplier for an address with a previously successful connection.
+const TRIED_PEER_BONUS: f64 = 10.0;
+
+/// Multiplier applied for each connected or in-flight peer in an address's network group.
+const NETWORK_GROUP_PENALTY: f64 = 0.05;
+
+/// Probability mass reserved for compact-filter-capable peers.
+const COMPACT_FILTERS_WEIGHT: f64 = 0.20;
+
+/// Probability mass reserved for Utreexo-capable peers.
+const UTREEXO_WEIGHT: f64 = 0.20;
+
+/// Probability mass kept for the unconditioned peer distribution.
+const MIXED_PEERS_WEIGHT: f64 = 0.60;
 
 /// The minimum amount of addresses we need to have on the [`AddressMan`].
 const MIN_ADDRESSES: usize = 15;
@@ -57,6 +83,33 @@ const MAX_ADDRESSES: usize = 50_000;
 
 /// A type alias for a list of addresses to send to our peers
 type AddressToSend = Vec<(AddrV2, u64, ServiceFlags, u16)>;
+
+/// A network group used to keep one overrepresented network from dominating peer selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AddressGroup {
+    /// IPv4 addresses are grouped by their /16 prefix.
+    Ipv4(u16),
+    /// IPv6 addresses are grouped by their /32 prefix, the IPv6 analogue used here for /16s.
+    Ipv6(u32),
+    /// Overlay-network addresses have no meaningful IP subnet and form individual groups.
+    Overlay(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectionCandidate {
+    id: usize,
+    group: AddressGroup,
+    health: f64,
+    services: ServiceFlags,
+}
+
+#[derive(Debug, Default)]
+struct AddressGroupStats {
+    represented: usize,
+    total_health: f64,
+    maximum_health: f64,
+    selection_weight: f64,
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
 /// A local state for how we see this peer. It helps us during peer selection,
@@ -304,6 +357,52 @@ impl LocalAddress {
         }
     }
 
+    /// Returns the network group used for peer diversity.
+    fn address_group(&self) -> AddressGroup {
+        match self.address.as_addrv2() {
+            AddrV2::Ipv4(ip) => {
+                let octets = ip.octets();
+                AddressGroup::Ipv4(u16::from_be_bytes([octets[0], octets[1]]))
+            }
+            AddrV2::Ipv6(ip) => {
+                let octets = ip.octets();
+                AddressGroup::Ipv6(u32::from_be_bytes([
+                    octets[0], octets[1], octets[2], octets[3],
+                ]))
+            }
+            AddrV2::Cjdns(_) | AddrV2::I2p(_) | AddrV2::TorV2(_) | AddrV2::TorV3(_) => {
+                AddressGroup::Overlay(self.id)
+            }
+            AddrV2::Unknown(_, _) => AddressGroup::Overlay(self.id),
+        }
+    }
+
+    /// Computes this address's health score at `now`.
+    ///
+    /// Connected and banned addresses are ineligible. Never-tried addresses start at the
+    /// baseline weight. A previously successful address receives a reliability bonus after its
+    /// retry cooldown, while a recent failure receives both the retry and failure penalties.
+    fn selection_health(&self, now: u64) -> Option<f64> {
+        fn recovery_score(age: u64, time_constant: f64, floor: f64) -> f64 {
+            floor + (1.0 - floor) * (1.0 - (-(age as f64) / time_constant).exp())
+        }
+
+        match self.state {
+            AddressState::Banned(_) | AddressState::Connected => None,
+            AddressState::NeverTried => Some(1.0),
+            AddressState::Tried(last_attempt) => Some(
+                TRIED_PEER_BONUS
+                    * recovery_score(now.saturating_sub(last_attempt), RETRY_TAU, RETRY_FLOOR),
+            ),
+            AddressState::Failed(last_attempt) => {
+                let age = now.saturating_sub(last_attempt);
+                let retry_score = recovery_score(age, RETRY_TAU, RETRY_FLOOR);
+                let failure_score = recovery_score(age, FAILURE_TAU, FAILURE_FLOOR);
+                Some(retry_score * failure_score)
+            }
+        }
+    }
+
     /// Returns a reference to the inner [`BitcoinSocketAddr`].
     pub fn as_addrv2(&self) -> &AddrV2 {
         self.address.as_addrv2()
@@ -433,6 +532,12 @@ pub struct AddressMan {
     /// This works similarly to `good_peers_by_service`. However, we keep all peers here, not only good peers
     peers_by_service: HashMap<ServiceFlags, Vec<usize>>,
 
+    /// Addresses with an in-flight connection attempt.
+    ///
+    /// These are excluded from subsequent draws, which makes sequential selection operate
+    /// without replacement. Their network groups still count toward the diversity penalty.
+    attempting: HashSet<usize>,
+
     /// The maximum number of entries this address manager can hold
     max_size: usize,
 
@@ -454,6 +559,7 @@ impl AddressMan {
             good_addresses: Vec::new(),
             good_peers_by_service: HashMap::new(),
             peers_by_service: HashMap::new(),
+            attempting: HashSet::new(),
             max_size: max_size.unwrap_or(MAX_ADDRESSES),
             reachable_networks,
         }
@@ -542,6 +648,7 @@ impl AddressMan {
 
         for (oldest_id, _) in oldest_ids.into_iter().take(excess) {
             self.addresses.remove(&oldest_id);
+            self.attempting.remove(&oldest_id);
             self.good_addresses.retain(|&x| x != oldest_id);
             for peers in self.good_peers_by_service.values_mut() {
                 peers.retain(|&x| x != oldest_id);
@@ -644,7 +751,28 @@ impl AddressMan {
             .collect()
     }
 
-    fn do_lookup(host: &str, default_port: u16, socks5: Option<SocketAddr>) -> Vec<LocalAddress> {
+    fn dns_seed_address(
+        ip: IpAddr,
+        default_port: u16,
+        services: ServiceFlags,
+        now: u64,
+    ) -> LocalAddress {
+        let address = match ip {
+            IpAddr::V4(ip) => AddrV2::Ipv4(ip),
+            IpAddr::V6(ip) => AddrV2::Ipv6(ip),
+        };
+        let mut address = LocalAddress::from(BitcoinSocketAddr::new(address, default_port));
+        address.services = services;
+        address.state = AddressState::Tried(now);
+        address
+    }
+
+    fn do_lookup(
+        host: &str,
+        default_port: u16,
+        socks5: Option<SocketAddr>,
+        services: ServiceFlags,
+    ) -> Vec<LocalAddress> {
         let ips = match socks5 {
             Some(proxy) => {
                 debug!("Performing DNS lookup for host: {host}, using SOCKS5 proxy: {proxy}");
@@ -670,14 +798,10 @@ impl AddressMan {
             info!("Fetched {} peer addresses from DNS host: {host}", ips.len());
         }
 
-        let mut addresses = Vec::new();
-        for ip in ips {
-            if let Ok(ip) = format!("{ip}:{default_port}").parse::<LocalAddress>() {
-                addresses.push(ip);
-            }
-        }
-
-        addresses
+        let now = Self::time_since_unix();
+        ips.into_iter()
+            .map(|ip| Self::dns_seed_address(ip, default_port, services, now))
+            .collect()
     }
 
     pub fn get_seeds_from_dns(
@@ -686,132 +810,211 @@ impl AddressMan {
         socks5: Option<SocketAddr>,
     ) -> Result<Vec<LocalAddress>, std::io::Error> {
         let mut addresses = Vec::new();
-        let now = Self::time_since_unix();
 
         // ask for utreexo peers (if filtering is available)
         if seed.filters.has(service_flags::UTREEXO.into()) {
             let host = format!("x1000.{}", seed.seed);
-            let _addresses = Self::do_lookup(&host, default_port, socks5);
-            let _addresses = _addresses.into_iter().map(|mut x| {
-                x.services = ServiceFlags::NETWORK_LIMITED
-                    | service_flags::UTREEXO.into()
-                    | ServiceFlags::WITNESS;
-                x.state = AddressState::Tried(now);
-                x
-            });
-
-            addresses.extend(_addresses);
+            let services = ServiceFlags::NETWORK_LIMITED
+                | service_flags::UTREEXO.into()
+                | ServiceFlags::WITNESS;
+            addresses.extend(Self::do_lookup(&host, default_port, socks5, services));
         }
 
         // ask for compact filter peers (if filtering is available)
         if seed.filters.has(ServiceFlags::COMPACT_FILTERS) {
             let host = format!("x49.{}", seed.seed);
-            let _addresses = Self::do_lookup(&host, default_port, socks5);
-            let _addresses = _addresses.into_iter().map(|mut x| {
-                x.services = ServiceFlags::COMPACT_FILTERS
-                    | ServiceFlags::NETWORK_LIMITED
-                    | ServiceFlags::WITNESS;
-                x.state = AddressState::Tried(now);
-                x
-            });
-
-            addresses.extend(_addresses);
+            let services = ServiceFlags::COMPACT_FILTERS
+                | ServiceFlags::NETWORK_LIMITED
+                | ServiceFlags::WITNESS;
+            addresses.extend(Self::do_lookup(&host, default_port, socks5, services));
         }
 
         // ask for any peer (if filtering is available)
         if seed.filters.has(ServiceFlags::WITNESS) {
             let host = format!("x9.{}", seed.seed);
-            let _addresses = Self::do_lookup(&host, default_port, socks5);
-            let _addresses = _addresses.into_iter().map(|mut x| {
-                x.services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
-                x.state = AddressState::Tried(now);
-                x
-            });
-
-            addresses.extend(_addresses);
+            let services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+            addresses.extend(Self::do_lookup(&host, default_port, socks5, services));
         }
 
         // ask for any peer (if filtering isn't available)
         if seed.filters == ServiceFlags::NONE {
-            let _addresses = Self::do_lookup(seed.seed, default_port, socks5);
-            let _addresses = _addresses.into_iter().map(|mut x| {
-                x.services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
-                x.state = AddressState::Tried(now);
-                x
-            });
-
-            addresses.extend(_addresses);
+            let services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+            addresses.extend(Self::do_lookup(seed.seed, default_port, socks5, services));
         }
 
         Ok(addresses)
     }
 
-    /// Returns a new random address to open a new connection, we try to get addresses with
-    /// a set of features supported for our peers
+    /// Builds the weighted distribution used for a regular outgoing connection.
     ///
-    /// If no peers are known with the required service bit, we may return a random peer.
-    /// Service bits are learned from DNS seeds or peer gossip and may be outdated or
-    /// inaccurate, so we sometimes try random peers expecting they might implement the service.
+    /// The base distribution samples network groups before addresses. IPv4 /16s and IPv6 /32s
+    /// therefore do not gain probability merely by contributing more addresses. Address health
+    /// favors peers that have not been attempted recently and heavily penalizes recent failures.
+    /// Connected and in-flight peers reduce their network group's probability exponentially.
+    fn build_selection_weights(
+        &self,
+        required_service: ServiceFlags,
+        now: u64,
+    ) -> Vec<(usize, f64)> {
+        let mut candidates = Vec::with_capacity(self.addresses.len());
+        let mut groups = HashMap::<AddressGroup, AddressGroupStats>::new();
+
+        for (&id, address) in &self.addresses {
+            let group = address.address_group();
+            let stats = groups.entry(group).or_default();
+
+            if address.state == AddressState::Connected || self.attempting.contains(&id) {
+                stats.represented += 1;
+                continue;
+            }
+
+            let Some(health) = address.selection_health(now) else {
+                continue;
+            };
+
+            stats.total_health += health;
+            stats.maximum_health = stats.maximum_health.max(health);
+            candidates.push(SelectionCandidate {
+                id,
+                group,
+                health,
+                services: address.services,
+            });
+        }
+
+        let mut total_group_weight = 0.0;
+        for stats in groups.values_mut().filter(|stats| stats.total_health > 0.0) {
+            let represented = i32::try_from(stats.represented).unwrap_or(i32::MAX);
+            stats.selection_weight = NETWORK_GROUP_PENALTY.powi(represented) * stats.maximum_health;
+            total_group_weight += stats.selection_weight;
+        }
+
+        if total_group_weight <= 0.0 || !total_group_weight.is_finite() {
+            return Vec::new();
+        }
+
+        let mut probabilities = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            let stats = groups
+                .get(&candidate.group)
+                .expect("candidate network group must have statistics");
+            let group_probability = stats.selection_weight / total_group_weight;
+            probabilities.push(group_probability * candidate.health / stats.total_health);
+        }
+
+        if required_service != ServiceFlags::NONE {
+            let service_mass: f64 = candidates
+                .iter()
+                .zip(&probabilities)
+                .filter(|(candidate, _)| candidate.services.has(required_service))
+                .map(|(_, probability)| probability)
+                .sum();
+
+            if service_mass > 0.0 {
+                for (candidate, probability) in candidates.iter().zip(&mut probabilities) {
+                    if candidate.services.has(required_service) {
+                        *probability /= service_mass;
+                    } else {
+                        *probability = 0.0;
+                    }
+                }
+            } else {
+                debug!(
+                    "No eligible address advertises required services {required_service}; using base peer distribution"
+                );
+            }
+        } else {
+            let utreexo = service_flags::UTREEXO.into();
+            let utreexo_mass: f64 = candidates
+                .iter()
+                .zip(&probabilities)
+                .filter(|(candidate, _)| candidate.services.has(utreexo))
+                .map(|(_, probability)| probability)
+                .sum();
+            let compact_filters_mass: f64 = candidates
+                .iter()
+                .zip(&probabilities)
+                .filter(|(candidate, _)| candidate.services.has(ServiceFlags::COMPACT_FILTERS))
+                .map(|(_, probability)| probability)
+                .sum();
+
+            let mut base_weight = MIXED_PEERS_WEIGHT;
+            if utreexo_mass == 0.0 {
+                base_weight += UTREEXO_WEIGHT;
+                debug!(
+                    "No eligible Utreexo address; assigning its reserved probability to the base peer distribution"
+                );
+            }
+            if compact_filters_mass == 0.0 {
+                base_weight += COMPACT_FILTERS_WEIGHT;
+                debug!(
+                    "No eligible compact-filter address; assigning its reserved probability to the base peer distribution"
+                );
+            }
+
+            for (candidate, probability) in candidates.iter().zip(&mut probabilities) {
+                let base_probability = *probability;
+                *probability = base_weight * base_probability;
+
+                if utreexo_mass > 0.0 && candidate.services.has(utreexo) {
+                    *probability += UTREEXO_WEIGHT * base_probability / utreexo_mass;
+                }
+                if compact_filters_mass > 0.0
+                    && candidate.services.has(ServiceFlags::COMPACT_FILTERS)
+                {
+                    *probability +=
+                        COMPACT_FILTERS_WEIGHT * base_probability / compact_filters_mass;
+                }
+            }
+        }
+
+        candidates
+            .into_iter()
+            .zip(probabilities)
+            .map(|(candidate, probability)| (candidate.id, probability))
+            .collect()
+    }
+
+    /// Returns a weighted address for a new connection and reserves it as in-flight.
+    ///
+    /// Calling [`AddressMan::update_set_state`] completes the attempt and releases the
+    /// reservation. If no address advertises `required_service`, selection falls back to the
+    /// unconditioned distribution because service advertisements may be stale.
     pub fn get_address_to_connect(
         &mut self,
         required_service: ServiceFlags,
         feeler: bool,
     ) -> Option<(usize, LocalAddress)> {
-        if self.addresses.is_empty() {
-            return None;
-        }
-
-        // Feeler connection are used to test if a peer is still alive, we don't care about
-        // the features it supports or even if it's a valid peer. The only thing we care about
-        // is that we haven't banned it.
-        if feeler {
-            let idx = rand::rng().random_range(0..self.addresses.len());
-            let peer = self.addresses.keys().nth(idx)?;
-            let address = self.addresses.get(peer)?.to_owned();
-
-            // don't try to connect to a peer that is banned or already connected
-            if matches!(address.state, AddressState::Banned(_))
-                | matches!(address.state, AddressState::Connected)
-            {
-                return None;
-            }
-
-            return Some((*peer, address));
+        let selected_id = if feeler {
+            self.addresses
+                .iter()
+                .filter(|(id, address)| {
+                    !self.attempting.contains(id)
+                        && !matches!(
+                            address.state,
+                            AddressState::Banned(_) | AddressState::Connected
+                        )
+                })
+                .map(|(&id, _)| id)
+                .choose(&mut rand::rng())?
+        } else {
+            let weighted_addresses =
+                self.build_selection_weights(required_service, Self::time_since_unix());
+            let distribution =
+                WeightedIndex::new(weighted_addresses.iter().map(|(_, weight)| *weight)).ok()?;
+            weighted_addresses
+                .get(distribution.sample(&mut rand::rng()))?
+                .0
         };
 
-        for _ in 0..10 {
-            let (id, peer) = self
-                .get_address_by_service(required_service)
-                .or_else(|| self.get_random_address(required_service))?;
+        let address = self.addresses.get(&selected_id)?.clone();
+        self.attempting.insert(selected_id);
+        Some((selected_id, address))
+    }
 
-            match peer.state {
-                AddressState::NeverTried | AddressState::Tried(_) => {
-                    return Some((id, peer));
-                }
-
-                AddressState::Connected => {
-                    // if we are connected to this peer, don't try to connect again
-                    continue;
-                }
-
-                AddressState::Failed(when) => {
-                    let now = Self::time_since_unix();
-                    if when + RETRY_TIME < now {
-                        return Some((id, peer));
-                    }
-
-                    if let Some(peers) = self.good_peers_by_service.get_mut(&required_service) {
-                        peers.retain(|&x| x != id)
-                    }
-
-                    self.good_addresses.retain(|&x| x != id);
-                }
-
-                AddressState::Banned(_) => {}
-            }
-        }
-
-        None
+    /// Releases a reservation when a connection could not be started.
+    pub(crate) fn cancel_connection_attempt(&mut self, id: usize) {
+        self.attempting.remove(&id);
     }
 
     pub fn dump_peers(&self, datadir: impl AsRef<Path>) -> std::io::Result<()> {
@@ -848,19 +1051,6 @@ impl AddressMan {
             std::fs::write(datadir.join("anchors.json"), addresses)?;
         }
         Ok(())
-    }
-
-    fn get_address_by_service(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
-        let candidates = self.good_peers_by_service.get(&service)?;
-
-        candidates
-            .iter()
-            .filter_map(|id| {
-                let addr = self.addresses.get(id)?;
-                (addr.state != AddressState::Connected).then_some((id, addr))
-            })
-            .choose(&mut rand::rng())
-            .map(|(id, addr)| (*id, addr.to_owned()))
     }
 
     pub fn start_addr_man(&mut self, datadir: impl AsRef<Path>) -> Vec<LocalAddress> {
@@ -921,63 +1111,9 @@ impl AddressMan {
         }
     }
 
-    /// Attempt to find one random peer that advertises the required service
-    ///
-    /// If we cannot find a peer that advertises the required service, we return any peer
-    /// that we have in our list of known peers. Luckily, either we'll connect to a peer that has
-    /// this but we didn't know, or one of those peers will give us useful addresses.
-    fn try_with_service(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
-        if let Some(peers) = self.peers_by_service.get(&service) {
-            let peers = peers
-                .iter()
-                .filter(|&x| {
-                    if let Some(address) = self.addresses.get(x) {
-                        if let AddressState::Failed(when) = address.state {
-                            let now = Self::time_since_unix();
-
-                            if (when + RETRY_TIME) < now {
-                                return true;
-                            }
-                        }
-
-                        return matches!(address.state, AddressState::Tried(_))
-                            || matches!(address.state, AddressState::NeverTried);
-                    }
-
-                    false
-                })
-                .collect::<Vec<_>>();
-
-            if peers.is_empty() {
-                return None;
-            }
-
-            let idx = rand::rng().random_range(0..peers.len());
-            let utreexo_peer = peers.get(idx)?;
-            return Some((**utreexo_peer, self.addresses.get(utreexo_peer)?.to_owned()));
-        }
-
-        None
-    }
-
-    fn get_random_address(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
-        if self.addresses.is_empty() {
-            return None;
-        }
-
-        if let Some(address) = self.try_with_service(service) {
-            return Some(address);
-        }
-
-        // if we can't find a peer that advertises the required service, get any peer
-        let idx = rand::rng().random_range(0..self.addresses.len());
-        let peer = self.addresses.keys().nth(idx)?;
-
-        Some((*peer, self.addresses.get(peer)?.to_owned()))
-    }
-
     /// Updates the state of an address
     pub fn update_set_state(&mut self, idx: usize, state: AddressState) -> &mut Self {
+        self.attempting.remove(&idx);
         if let Some(address) = self.addresses.get_mut(&idx) {
             address.state = state;
         }
@@ -1083,6 +1219,7 @@ impl AddressMan {
         // if this peer turns out to not have the minimum required services, we remove it
         if !flags.has(ServiceFlags::NETWORK_LIMITED) || !flags.has(ServiceFlags::WITNESS) {
             self.addresses.remove(&idx);
+            self.attempting.remove(&idx);
             for peers in self.peers_by_service.values_mut() {
                 peers.retain(|&x| x != idx);
             }
@@ -1376,6 +1513,313 @@ mod test {
         }
 
         Ok(addresses)
+    }
+
+    fn selection_test_address(
+        ip: &str,
+        id: usize,
+        state: AddressState,
+        services: ServiceFlags,
+    ) -> LocalAddress {
+        LocalAddress {
+            address: format!("{ip}:8333").parse().unwrap(),
+            last_connected: 0,
+            state,
+            services,
+            id,
+        }
+    }
+
+    fn assert_probability(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected probability {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn test_dns_seed_addresses_are_marked_tried() {
+        let now = 1_000_000;
+        let services = ServiceFlags::NETWORK_LIMITED
+            | ServiceFlags::WITNESS
+            | ServiceFlags::COMPACT_FILTERS
+            | service_flags::UTREEXO.into();
+
+        for ip in ["8.8.8.8", "2001:4860:4860::8888"] {
+            let address = AddressMan::dns_seed_address(ip.parse().unwrap(), 8333, services, now);
+            assert_eq!(address.state, AddressState::Tried(now));
+            assert_eq!(address.services, services);
+        }
+    }
+
+    #[test]
+    fn test_selection_health_penalizes_and_recovers_failed_addresses() {
+        let now = 1_000_000;
+        let recent_failure =
+            selection_test_address("11.1.1.1", 1, AddressState::Failed(now), ServiceFlags::NONE);
+        let old_failure = selection_test_address(
+            "12.1.1.1",
+            2,
+            AddressState::Failed(now - FAILURE_TAU as u64),
+            ServiceFlags::NONE,
+        );
+        let never_tried =
+            selection_test_address("13.1.1.1", 3, AddressState::NeverTried, ServiceFlags::NONE);
+
+        let recent_health = recent_failure.selection_health(now).unwrap();
+        let old_health = old_failure.selection_health(now).unwrap();
+        let never_tried_health = never_tried.selection_health(now).unwrap();
+
+        assert_probability(recent_health, RETRY_FLOOR * FAILURE_FLOOR);
+        assert!(recent_health < old_health);
+        assert!(old_health < never_tried_health);
+        assert_probability(never_tried_health, 1.0);
+    }
+
+    #[test]
+    fn test_selection_prefers_tried_addresses() {
+        let now = 1_000_000;
+        let mut address_man = AddressMan::new(None, &[]);
+        address_man.addresses.insert(
+            1,
+            selection_test_address(
+                "11.1.0.1",
+                1,
+                AddressState::Tried(now - 10 * RETRY_TAU as u64),
+                ServiceFlags::NONE,
+            ),
+        );
+        address_man.addresses.insert(
+            2,
+            selection_test_address("12.1.0.1", 2, AddressState::NeverTried, ServiceFlags::NONE),
+        );
+
+        let weights = address_man.build_selection_weights(ServiceFlags::NONE, now);
+        let tried_probability = weights
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .expect("tried address is eligible")
+            .1;
+        let never_tried_probability = weights
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .expect("never-tried address is eligible")
+            .1;
+
+        assert!(tried_probability > 0.9);
+        assert!(never_tried_probability < 0.1);
+    }
+
+    #[test]
+    fn test_selection_equalizes_subnets_and_penalizes_connected_subnets() {
+        let mut address_man = AddressMan::new(None, &[]);
+
+        for id in 0..20 {
+            let address = selection_test_address(
+                &format!("11.1.0.{}", id + 1),
+                id,
+                AddressState::NeverTried,
+                ServiceFlags::NONE,
+            );
+            address_man.addresses.insert(id, address);
+        }
+        address_man.addresses.insert(
+            20,
+            selection_test_address("12.1.0.1", 20, AddressState::NeverTried, ServiceFlags::NONE),
+        );
+
+        let crowded_group = address_man.addresses[&0].address_group();
+        let probability_for_crowded_group = |address_man: &AddressMan, weights: &[(usize, f64)]| {
+            weights
+                .iter()
+                .filter(|(id, _)| address_man.addresses[id].address_group() == crowded_group)
+                .map(|(_, probability)| probability)
+                .sum::<f64>()
+        };
+
+        let weights = address_man.build_selection_weights(ServiceFlags::NONE, 1_000_000);
+        assert_probability(probability_for_crowded_group(&address_man, &weights), 0.5);
+
+        address_man.addresses.get_mut(&0).unwrap().state = AddressState::Connected;
+        let weights = address_man.build_selection_weights(ServiceFlags::NONE, 1_000_000);
+        assert_probability(
+            probability_for_crowded_group(&address_man, &weights),
+            NETWORK_GROUP_PENALTY / (1.0 + NETWORK_GROUP_PENALTY),
+        );
+
+        address_man.addresses.get_mut(&0).unwrap().state = AddressState::NeverTried;
+        address_man.attempting.insert(0);
+        let weights = address_man.build_selection_weights(ServiceFlags::NONE, 1_000_000);
+        assert_probability(
+            probability_for_crowded_group(&address_man, &weights),
+            NETWORK_GROUP_PENALTY / (1.0 + NETWORK_GROUP_PENALTY),
+        );
+    }
+
+    #[test]
+    fn test_selection_reserves_twenty_percent_for_each_service() {
+        let mut address_man = AddressMan::new(None, &[]);
+        let utreexo: ServiceFlags = service_flags::UTREEXO.into();
+
+        for id in 0..100 {
+            let services = match id {
+                98 => ServiceFlags::COMPACT_FILTERS,
+                99 => utreexo,
+                _ => ServiceFlags::NONE,
+            };
+            let address = selection_test_address(
+                &format!("20.{}.0.1", id + 1),
+                id,
+                AddressState::NeverTried,
+                services,
+            );
+            address_man.addresses.insert(id, address);
+        }
+
+        let weights = address_man.build_selection_weights(ServiceFlags::NONE, 1_000_000);
+        let total_probability: f64 = weights.iter().map(|(_, probability)| probability).sum();
+        let utreexo_probability: f64 = weights
+            .iter()
+            .filter(|(id, _)| address_man.addresses[id].services.has(utreexo))
+            .map(|(_, probability)| probability)
+            .sum();
+        let compact_filters_probability: f64 = weights
+            .iter()
+            .filter(|(id, _)| {
+                address_man.addresses[id]
+                    .services
+                    .has(ServiceFlags::COMPACT_FILTERS)
+            })
+            .map(|(_, probability)| probability)
+            .sum();
+
+        assert_probability(total_probability, 1.0);
+        assert_probability(
+            utreexo_probability,
+            UTREEXO_WEIGHT + MIXED_PEERS_WEIGHT / 100.0,
+        );
+        assert_probability(
+            compact_filters_probability,
+            COMPACT_FILTERS_WEIGHT + MIXED_PEERS_WEIGHT / 100.0,
+        );
+
+        let required_weights = address_man.build_selection_weights(utreexo, 1_000_000);
+        assert_probability(
+            required_weights.iter().find(|(id, _)| *id == 99).unwrap().1,
+            1.0,
+        );
+        assert!(
+            required_weights
+                .iter()
+                .filter(|(id, _)| *id != 99)
+                .all(|(_, probability)| *probability == 0.0)
+        );
+    }
+
+    #[test]
+    fn test_selection_service_weights_are_additive() {
+        let mut address_man = AddressMan::new(None, &[]);
+        let utreexo: ServiceFlags = service_flags::UTREEXO.into();
+        let compact_filters = ServiceFlags::COMPACT_FILTERS;
+        let services = [
+            ServiceFlags::NONE,
+            compact_filters,
+            utreexo,
+            compact_filters | utreexo,
+        ];
+
+        for (id, services) in services.into_iter().enumerate() {
+            address_man.addresses.insert(
+                id,
+                selection_test_address(
+                    &format!("30.{}.0.1", id + 1),
+                    id,
+                    AddressState::NeverTried,
+                    services,
+                ),
+            );
+        }
+
+        let weights = address_man.build_selection_weights(ServiceFlags::NONE, 1_000_000);
+        let probability = |id| {
+            weights
+                .iter()
+                .find(|(candidate_id, _)| *candidate_id == id)
+                .unwrap()
+                .1
+        };
+
+        assert_probability(probability(0), 0.15);
+        assert_probability(probability(1), 0.25);
+        assert_probability(probability(2), 0.25);
+        assert_probability(probability(3), 0.35);
+    }
+
+    #[test]
+    fn test_selection_is_without_replacement_until_attempt_finishes() {
+        let mut address_man = AddressMan::new(None, &[]);
+        address_man.addresses.insert(
+            1,
+            selection_test_address("11.1.0.1", 1, AddressState::NeverTried, ServiceFlags::NONE),
+        );
+        address_man.addresses.insert(
+            2,
+            selection_test_address("12.1.0.1", 2, AddressState::NeverTried, ServiceFlags::NONE),
+        );
+
+        let first = address_man
+            .get_address_to_connect(ServiceFlags::NONE, false)
+            .unwrap()
+            .0;
+        let second = address_man
+            .get_address_to_connect(ServiceFlags::NONE, false)
+            .unwrap()
+            .0;
+
+        assert_ne!(first, second);
+        assert!(
+            address_man
+                .get_address_to_connect(ServiceFlags::NONE, false)
+                .is_none()
+        );
+
+        address_man.update_set_state(first, AddressState::Failed(AddressMan::time_since_unix()));
+        assert_eq!(
+            address_man
+                .get_address_to_connect(ServiceFlags::NONE, false)
+                .unwrap()
+                .0,
+            first
+        );
+    }
+
+    #[test]
+    fn test_selection_excludes_connected_addresses() {
+        let mut address_man = AddressMan::new(None, &[]);
+        let preferred_services =
+            ServiceFlags::COMPACT_FILTERS | ServiceFlags::from(service_flags::UTREEXO);
+        address_man.addresses.insert(
+            1,
+            selection_test_address("11.1.0.1", 1, AddressState::Connected, preferred_services),
+        );
+        address_man.addresses.insert(
+            2,
+            selection_test_address("12.1.0.1", 2, AddressState::NeverTried, ServiceFlags::NONE),
+        );
+
+        assert_eq!(
+            address_man
+                .get_address_to_connect(ServiceFlags::NONE, false)
+                .unwrap()
+                .0,
+            2
+        );
+        address_man.update_set_state(2, AddressState::Connected);
+        assert!(
+            address_man
+                .get_address_to_connect(ServiceFlags::NONE, false)
+                .is_none()
+        );
     }
 
     #[test]

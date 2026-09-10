@@ -12,7 +12,6 @@ use bitcoin::p2p::message_blockdata::Inventory;
 use floresta_chain::ChainBackend;
 use floresta_common::service_flags;
 use floresta_common::service_flags_strings;
-use floresta_common::try_and_log;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::IteratorRandom;
@@ -279,16 +278,14 @@ where
             }
         }
 
+        // Every peer with a completed handshake is connected, regardless of its connection kind.
+        // Keeping this state accurate prevents the address manager from selecting the same
+        // endpoint while a feeler, extra, or soon-to-be-disconnected peer is still alive.
+        self.address_man
+            .update_set_service_flag(version.address_id, version.services)
+            .update_set_state(version.address_id, AddressState::Connected);
+
         if version.kind == ConnectionKind::Feeler {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            self.address_man
-                .update_set_service_flag(version.address_id, version.services)
-                .update_set_state(version.address_id, AddressState::Tried(now));
-
             return Ok(());
         }
 
@@ -322,18 +319,6 @@ where
                         peer_data.services, needs
                     );
                     peer_data.channel.send(NodeRequest::Shutdown)?;
-                    self.address_man.update_set_state(
-                        version.address_id,
-                        AddressState::Tried(
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                        ),
-                    );
-
-                    self.address_man
-                        .update_set_service_flag(version.address_id, version.services);
 
                     return Ok(());
                 }
@@ -374,10 +359,6 @@ where
                     .or_default()
                     .push(peer);
             }
-
-            self.address_man
-                .update_set_state(version.address_id, AddressState::Connected)
-                .update_set_service_flag(version.address_id, version.services);
 
             self.peer_ids.push(peer);
         }
@@ -624,6 +605,10 @@ where
     /// sent the request. It will also resend the request to another peer.
     pub(crate) fn check_for_timeout(&mut self) -> Result<(), WireError> {
         let now = Instant::now();
+        let failure_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         let timed_out_fn = |req: &InflightRequests, time: &Instant| match req {
             InflightRequests::Connect(_)
@@ -648,28 +633,35 @@ where
                 continue;
             };
 
-            // If a feeler connection times out, we ban them at the first message
+            // A feeler can time out while connecting or while waiting for its address response.
             if let Some(peer_data) = self.peers.get(&peer) {
                 if peer_data.kind == ConnectionKind::Feeler {
+                    let address_id = peer_data.address.id;
                     debug!("Feeler peer {peer} timed out request");
                     self.send_to_peer(peer, NodeRequest::Shutdown)?;
                     self.peers.remove(&peer);
+                    self.address_man
+                        .update_set_state(address_id, AddressState::Failed(failure_time));
                     continue;
                 }
             }
 
             if let InflightRequests::Connect(_) = req {
-                // ignore the output as it might fail due to the task being cancelled
+                let address_id = self.peers.get(&peer).map(|peer| peer.address.id);
+                // Ignore the output as it might fail due to the task being cancelled.
                 let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
                 self.peers.remove(&peer);
+                if let Some(address_id) = address_id {
+                    self.address_man
+                        .update_set_state(address_id, AddressState::Failed(failure_time));
+                }
                 continue;
             }
 
             debug!("Request timed out: {req:?}");
+            let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
 
             // Increase the banscore and try banning the peer if needed, then re-request
-            try_and_log!(self.increase_banscore(peer, 1));
-
             if let Err(e) = self.redo_inflight_request(&req) {
                 // CRITICAL: never drop the request, so we retry it later
                 self.inflight.insert(req, (peer, time));
