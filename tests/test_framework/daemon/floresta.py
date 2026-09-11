@@ -24,6 +24,12 @@ class FlorestaDaemon(BaseDaemon):
         """
         Return the network configuration flags for the node.
         """
+        if any(
+            argument == "--network" or argument.startswith("--network=")
+            for argument in self.extra_args
+        ):
+            return []
+
         return [
             "--network=regtest",
         ]
