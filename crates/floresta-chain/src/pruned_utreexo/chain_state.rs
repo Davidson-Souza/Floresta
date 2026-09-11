@@ -30,14 +30,12 @@ use core::ops::Add;
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
-use bitcoin::Network;
 use bitcoin::OutPoint;
 use bitcoin::Target;
 use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::Work;
 use bitcoin::block::Header as BlockHeader;
-use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256;
 use floresta_common::Channel;
@@ -595,9 +593,12 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         }
     }
 
-    fn new(mut chainstore: PersistedState, network: Network, assume_valid: AssumeValidArg) -> Self {
-        let parameters = network.into();
-        let genesis = genesis_block(&parameters);
+    fn new(
+        mut chainstore: PersistedState,
+        parameters: ChainParams,
+        assume_valid: AssumeValidArg,
+    ) -> Self {
+        let genesis = parameters.genesis.clone();
 
         chainstore
             .save_header(&DiskBlockHeader::FullyValid(genesis.header, 0))
@@ -607,7 +608,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             .update_block_index(0, genesis.block_hash())
             .expect("Error updating index");
 
-        let assume_valid = ChainParams::get_assume_valid(network, assume_valid);
+        let assume_valid = parameters.get_assume_valid(assume_valid);
 
         Self {
             inner: RwLock::new(ChainStateInner {
@@ -760,9 +761,10 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
     fn load_chain_state(
         mut chainstore: PersistedState,
-        network: Network,
+        parameters: ChainParams,
         assume_valid: AssumeValidArg,
     ) -> Result<Self, BlockchainError> {
+        let assume_valid = parameters.get_assume_valid(assume_valid);
         let best_block = chainstore
             .load_height()?
             .ok_or(BlockchainError::ChainNotInitialized)?;
@@ -784,10 +786,8 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             fee_estimation: (1_f64, 1_f64, 1_f64),
             subscribers: Vec::new(),
             ibd: IBDState::HeadersSync,
-            consensus: Consensus {
-                parameters: network.into(),
-            },
-            assume_valid: ChainParams::get_assume_valid(network, assume_valid),
+            consensus: Consensus { parameters },
+            assume_valid,
         };
 
         info!(
@@ -808,20 +808,22 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
     ///
     /// This is the main entry point for instantiating a [`ChainState`]. If the store already
     /// has data, the state is loaded from it. Otherwise, the chain is initialized from the
-    /// genesis block for the given network.
+    /// genesis block for the given chain parameters.
     ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be read or if the persisted state is corrupted.
     pub fn open(
         chainstore: PersistedState,
-        network: Network,
+        parameters: impl Into<ChainParams>,
         assume_valid: AssumeValidArg,
     ) -> Result<Self, BlockchainError> {
+        let parameters = parameters.into();
+
         if chainstore.load_height()?.is_some() {
-            return Self::load_chain_state(chainstore, network, assume_valid);
+            return Self::load_chain_state(chainstore, parameters, assume_valid);
         }
-        Ok(Self::new(chainstore, network, assume_valid))
+        Ok(Self::new(chainstore, parameters, assume_valid))
     }
 
     /// Checks whether our database got a file-level corruption, and if so, reindex.
@@ -1522,7 +1524,7 @@ impl<T: ChainStore> TryFrom<ChainStateBuilder<T>> for ChainState<T> {
             acc: builder.acc().unwrap_or_default(),
             chainstore: builder.chainstore()?,
             best_block: builder.best_block()?,
-            assume_valid: builder.assume_valid(),
+            assume_valid: builder.assume_valid()?,
             ibd: builder.ibd_state(),
             subscribers: Vec::new(),
             fee_estimation: (1_f64, 1_f64, 1_f64),
@@ -2374,7 +2376,11 @@ mod test {
             })
             .unwrap();
 
-        let chainstate = ChainState::new(chainstore, Network::Bitcoin, AssumeValidArg::Disabled);
+        let chainstate = ChainState::new(
+            chainstore,
+            Network::Bitcoin.into(),
+            AssumeValidArg::Disabled,
+        );
         let header = headers[headers.len() - 1];
         let fork = headers[headers.len() / 2];
 

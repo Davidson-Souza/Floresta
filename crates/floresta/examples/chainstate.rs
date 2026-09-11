@@ -20,7 +20,7 @@ const DATA_DIR: &str = "./tmp-db";
 #[tokio::main]
 async fn main() {
     let network = Network::Bitcoin;
-    let params = ChainParams::from(Network::Bitcoin);
+    let params = ChainParams::from(network);
     let genesis = genesis_block(&params);
     // Create a new chain state, which will store the accumulator and the headers chain.
     // It will be stored in the DATA_DIR directory. With this chain state, we don't keep
@@ -47,7 +47,7 @@ async fn main() {
     // to validate the blockchain. If you set the chain height, you should update
     // the accumulator to the state of the blockchain at that height too.
     let _chain = ChainStateBuilder::new()
-        .with_assume_valid(AssumeValidArg::Disabled, network)
+        .with_assume_valid(AssumeValidArg::Disabled)
         .with_chain_params(params)
         .with_tip((genesis.block_hash(), 0), genesis.header)
         .assume_utreexo(Stump::new())

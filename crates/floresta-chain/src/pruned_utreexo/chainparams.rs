@@ -144,6 +144,16 @@ pub struct AssumeUtreexoValue {
 }
 
 impl ChainParams {
+    /// Returns whether these parameters select a custom signet challenge.
+    pub fn is_custom_signet(&self) -> bool {
+        self.network == Network::Signet
+            && self
+                .signet_challenge
+                .as_deref()
+                .map(|script| script.as_bytes())
+                != Some(DEFAULT_SIGNET_CHALLENGE)
+    }
+
     /// This method is called when Assume Utreexo is set to true. It means that the user will accept the hardcoded utreexo state for the specified block, if it is found in the best chain. We can then sync rapidly from this state.
     pub fn get_assume_utreexo(network: Network) -> AssumeUtreexoValue {
         let genesis = genesis_block(Params::new(network));
@@ -228,17 +238,19 @@ impl ChainParams {
     /// # Variants
     /// - [`AssumeValidArg::Disabled`] — no checkpoint; all scripts are validated.
     /// - [`AssumeValidArg::UserInput`] — use the provided hash.
-    /// - [`AssumeValidArg::Hardcoded`] — use a release-time checkpoint per [`Network`]:
+    /// - [`AssumeValidArg::Hardcoded`] — use a release-time checkpoint per [`Network`].
+    ///   Custom signets have no hardcoded checkpoint:
     ///   - **Bitcoin**: block [939,969](https://mempool.space/block/939969)
     ///   - **Signet**: block [296,870](https://mempool.space/signet/block/296870)
     ///   - **Testnet**: block [4,887,983](https://mempool.space/testnet/block/4887983)
     ///   - **Testnet4**: block [126,514](https://mempool.space/testnet4/block/126514)
     ///   - **Regtest**: genesis block
-    pub fn get_assume_valid(network: Network, arg: AssumeValidArg) -> Option<BlockHash> {
+    pub fn get_assume_valid(&self, arg: AssumeValidArg) -> Option<BlockHash> {
         match arg {
             AssumeValidArg::Disabled => None,
             AssumeValidArg::UserInput(hash) => Some(hash),
-            AssumeValidArg::Hardcoded => match network {
+            AssumeValidArg::Hardcoded if self.is_custom_signet() => None,
+            AssumeValidArg::Hardcoded => match self.network {
                 Network::Bitcoin => Some(bhash!(
                     "000000000000000000009d36aae180d04aeac872adb14e22f65c8b6647a8bf79" // 939_969
                 )),
@@ -532,6 +544,29 @@ mod tests {
                 .as_deref()
                 .map(|script| script.as_bytes()),
             Some(DEFAULT_SIGNET_CHALLENGE)
+        );
+    }
+
+    #[test]
+    fn distinguishes_default_and_custom_signet() {
+        let mut params = ChainParams::from(Network::Signet);
+        assert!(!params.is_custom_signet());
+
+        params.signet_challenge = Some(ScriptBuf::from_bytes(vec![0x51]));
+        assert!(params.is_custom_signet());
+        assert!(!ChainParams::from(Network::Bitcoin).is_custom_signet());
+    }
+
+    #[test]
+    fn custom_signet_disables_only_hardcoded_assume_valid() {
+        let mut params = ChainParams::from(Network::Signet);
+        params.signet_challenge = Some(ScriptBuf::from_bytes(vec![0x51]));
+        let explicit_checkpoint = params.genesis.block_hash();
+
+        assert_eq!(params.get_assume_valid(AssumeValidArg::Hardcoded), None);
+        assert_eq!(
+            params.get_assume_valid(AssumeValidArg::UserInput(explicit_checkpoint)),
+            Some(explicit_checkpoint)
         );
     }
 
