@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use bitcoin::BlockHash;
 use bitcoin::Network;
-#[cfg(unix)]
+use bitcoin::ScriptBuf;
 use clap::CommandFactory;
 use clap::Parser;
 use floresta_node::AssumeValidArg;
@@ -28,6 +28,10 @@ pub struct Cli {
     #[arg(short, long, default_value_t=Network::Bitcoin)]
     /// Which network should we use
     pub network: Network,
+
+    #[arg(long, value_name = "HEX", value_parser = parse_signet_challenge)]
+    /// Use a custom BIP-325 challenge script for signet.
+    pub signet_challenge: Option<ScriptBuf>,
 
     #[arg(short, long, default_value_t = false)]
     /// Turn debugging information on
@@ -198,6 +202,12 @@ impl Cli {
     /// Checks:
     ///   - If `--pid-file` is passed, `--daemon` must also be passed.
     pub fn validate(&self) {
+        if let Err(message) = self.validate_signet_options() {
+            Self::command()
+                .error(clap::error::ErrorKind::InvalidValue, message)
+                .exit();
+        }
+
         #[cfg(unix)]
         if self.pid_file.is_some() && !self.daemon {
             Self::command()
@@ -207,6 +217,14 @@ impl Cli {
                 )
                 .exit();
         }
+    }
+
+    fn validate_signet_options(&self) -> Result<(), &'static str> {
+        if self.signet_challenge.is_some() && self.network != Network::Signet {
+            return Err("--signet-challenge requires --network signet");
+        }
+
+        Ok(())
     }
 }
 
@@ -218,5 +236,57 @@ fn parse_assume_valid(s: &str) -> Result<AssumeValidArg, String> {
             .parse::<BlockHash>()
             .map(AssumeValidArg::UserInput)
             .map_err(|e| format!("expected 0 or a block hash, got '{other}': {e}")),
+    }
+}
+
+fn parse_signet_challenge(value: &str) -> Result<ScriptBuf, String> {
+    ScriptBuf::from_hex(value)
+        .map_err(|error| format!("expected a hexadecimal script, got '{value}': {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_custom_signet_challenge() {
+        let cli = Cli::try_parse_from([
+            "florestad",
+            "--network",
+            "signet",
+            "--signet-challenge",
+            "51",
+        ])
+        .expect("valid signet arguments");
+
+        assert_eq!(
+            cli.signet_challenge,
+            Some(ScriptBuf::from_bytes(vec![0x51]))
+        );
+        assert!(cli.validate_signet_options().is_ok());
+    }
+
+    #[test]
+    fn rejects_non_hex_signet_challenge() {
+        let result = Cli::try_parse_from([
+            "florestad",
+            "--network",
+            "signet",
+            "--signet-challenge",
+            "not-hex",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn custom_signet_challenge_requires_signet_network() {
+        let cli = Cli::try_parse_from(["florestad", "--signet-challenge", "51"])
+            .expect("challenge is valid hex");
+
+        assert_eq!(
+            cli.validate_signet_options(),
+            Err("--signet-challenge requires --network signet")
+        );
     }
 }

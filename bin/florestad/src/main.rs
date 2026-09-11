@@ -62,7 +62,7 @@ fn main() {
         datadir,
         disable_dns_seeds: !params.connect.is_empty() || params.disable_dns_seeds,
         network: params.network,
-        signet_challenge: None,
+        signet_challenge: params.signet_challenge,
         debug: params.debug,
         cfilters: !params.no_cfilters,
         proxy: params.proxy,
