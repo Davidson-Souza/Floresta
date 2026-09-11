@@ -10,7 +10,7 @@ authors = ["Floresta Developers <contact@getfloresta.org>"]
 [dependencies]
 # All dependencies MUST be pinned precisely with `X.Y.z`
 axum = { workspace = true, optional = true }
-bitcoin = { workspace = true }
+bitcoin = { workspace = true, features = ["serde"] }
 corepc-types = { workspace = true }
 dns-lookup = { workspace = true }
 miniscript = { workspace = true, features = ["std"] }
@@ -39,6 +39,7 @@ floresta-metrics = { workspace = true, optional = true }
 
 [dev-dependencies]
 pretty_assertions = { version = "=1.4.1" }
+tempfile = { workspace = true }
 
 [target.'cfg(target_env = "gnu")'.dependencies]
 libc = { version = "=0.2.186" }
