@@ -31,6 +31,14 @@ impl ConfigFile {
     }
 }
 
+/// Reads the optional signet challenge from a TOML configuration file.
+///
+/// Returns [`None`] when the file is missing, unreadable, invalid, or does not
+/// configure a challenge.
+pub fn read_signet_challenge(path: impl AsRef<Path>) -> Option<ScriptBuf> {
+    ConfigFile::from_file(path).ok()?.signet_challenge
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

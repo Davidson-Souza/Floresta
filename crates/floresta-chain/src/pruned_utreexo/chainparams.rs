@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Network;
+use bitcoin::Script;
 use bitcoin::ScriptBuf;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
@@ -144,14 +145,15 @@ pub struct AssumeUtreexoValue {
 }
 
 impl ChainParams {
+    /// Returns the default Bitcoin signet challenge.
+    pub fn default_signet_challenge() -> &'static Script {
+        Script::from_bytes(DEFAULT_SIGNET_CHALLENGE)
+    }
+
     /// Returns whether these parameters select a custom signet challenge.
     pub fn is_custom_signet(&self) -> bool {
         self.network == Network::Signet
-            && self
-                .signet_challenge
-                .as_deref()
-                .map(|script| script.as_bytes())
-                != Some(DEFAULT_SIGNET_CHALLENGE)
+            && self.signet_challenge.as_deref() != Some(Self::default_signet_challenge())
     }
 
     /// This method is called when Assume Utreexo is set to true. It means that the user will accept the hardcoded utreexo state for the specified block, if it is found in the best chain. We can then sync rapidly from this state.

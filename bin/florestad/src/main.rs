@@ -30,10 +30,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::Network;
+use bitcoin::Script;
+use bitcoin::ScriptBuf;
 use clap::Parser;
 use cli::Cli;
 use floresta_node::Config;
 use floresta_node::Florestad;
+use floresta_node::read_signet_challenge;
+use floresta_node::signet_data_dir_name;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio::time::timeout;
@@ -48,9 +52,12 @@ fn main() {
     let params = Cli::parse();
     params.validate();
 
-    // If not provided, defaults to `$HOME/.floresta`.
-    // Uses a subdirectory for non-mainnet networks.
-    let datadir = datadir_path(params.data_dir, params.network);
+    let (datadir, config_file, signet_challenge) = resolve_data_paths(
+        params.data_dir.as_deref(),
+        params.network,
+        params.signet_challenge,
+        params.config_file,
+    );
 
     // Create the data directory if it doesn't exist
     fs::create_dir_all(&datadir).unwrap_or_else(|e| {
@@ -62,14 +69,14 @@ fn main() {
         datadir,
         disable_dns_seeds: !params.connect.is_empty() || params.disable_dns_seeds,
         network: params.network,
-        signet_challenge: params.signet_challenge,
+        signet_challenge,
         debug: params.debug,
         cfilters: !params.no_cfilters,
         proxy: params.proxy,
         assume_utreexo: !params.no_assume_utreexo,
         connect: params.connect,
         wallet_xpub: params.wallet_xpub,
-        config_file: params.config_file,
+        config_file,
         #[cfg(unix)]
         log_to_stdout: !params.daemon,
         #[cfg(not(unix))]
@@ -169,6 +176,33 @@ fn main() {
     drop(_logger_guard);
 }
 
+fn resolve_data_paths(
+    base_dir: Option<&Path>,
+    network: Network,
+    cli_signet_challenge: Option<ScriptBuf>,
+    config_file: Option<PathBuf>,
+) -> (PathBuf, Option<PathBuf>, Option<ScriptBuf>) {
+    // Resolve the default config location before reading a file-based challenge.
+    // A file that selects a custom signet remains at this discoverable path.
+    let initial_datadir = datadir_path(base_dir, network, cli_signet_challenge.as_deref());
+    let config_file_is_explicit = config_file.is_some();
+    let config_file_path = config_file.unwrap_or_else(|| initial_datadir.join("config.toml"));
+    let file_signet_challenge = if cli_signet_challenge.is_none() {
+        read_signet_challenge(&config_file_path)
+    } else {
+        None
+    };
+    let signet_challenge = cli_signet_challenge.or(file_signet_challenge);
+    let datadir = datadir_path(base_dir, network, signet_challenge.as_deref());
+    let config_file = if config_file_is_explicit || datadir != initial_datadir {
+        Some(config_file_path)
+    } else {
+        None
+    };
+
+    (datadir, config_file, signet_challenge)
+}
+
 /// Assemble the data directory [`PathBuf`] for the given [`Network`].
 ///
 /// The data directory path is determined in this order:
@@ -178,11 +212,15 @@ fn main() {
 /// - If `base_dir` is not provided and the `$HOME` environment
 ///   variable is not set, the current directory is used.
 ///
-/// For non-mainnet networks, the data directory is suffixed with
-/// the network name (e.g. `<base_dir>/signet`).
+/// For non-mainnet networks, the data directory is suffixed with the
+/// network name. Custom signets use `signet-<message-start-bytes>`.
 ///
 /// Paths with redundant slashes are automatically normalized.
-fn datadir_path(base_dir: Option<impl AsRef<Path>>, network: Network) -> PathBuf {
+fn datadir_path(
+    base_dir: Option<impl AsRef<Path>>,
+    network: Network,
+    signet_challenge: Option<&Script>,
+) -> PathBuf {
     let base_dir = base_dir
         .map(|p| {
             let s = p.as_ref().to_string_lossy().replace('\\', "/");
@@ -196,7 +234,7 @@ fn datadir_path(base_dir: Option<impl AsRef<Path>>, network: Network) -> PathBuf
 
     match network {
         Network::Bitcoin => base_dir,
-        Network::Signet => base_dir.join("signet"),
+        Network::Signet => base_dir.join(signet_data_dir_name(signet_challenge)),
         Network::Testnet => base_dir.join("testnet3"),
         Network::Testnet4 => base_dir.join("testnet4"),
         Network::Regtest => base_dir.join("regtest"),
@@ -205,6 +243,8 @@ fn datadir_path(base_dir: Option<impl AsRef<Path>>, network: Network) -> PathBuf
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -232,7 +272,7 @@ mod tests {
                     Some(s) => PathBuf::from(normalized_path).join(s),
                     None => PathBuf::from(normalized_path),
                 };
-                assert_eq!(datadir_path(Some(input_path), network), expected_path);
+                assert_eq!(datadir_path(Some(input_path), network, None), expected_path);
             }
         }
 
@@ -242,8 +282,33 @@ mod tests {
             .join(".floresta");
 
         assert_eq!(
-            datadir_path(None::<&str>, Network::Bitcoin),
+            datadir_path(None::<&str>, Network::Bitcoin, None),
             default_expected
         );
+
+        assert_eq!(
+            datadir_path(
+                Some("path/to/dir"),
+                Network::Signet,
+                Some(Script::from_bytes(&[0x51]))
+            ),
+            PathBuf::from("path/to/dir/signet-54d26fbd")
+        );
+    }
+
+    #[test]
+    fn file_configured_signet_uses_challenge_specific_directory() {
+        let tempdir = tempdir().expect("temporary directory");
+        let default_signet_dir = tempdir.path().join("signet");
+        fs::create_dir(&default_signet_dir).expect("default signet directory");
+        let config_path = default_signet_dir.join("config.toml");
+        fs::write(&config_path, "signet_challenge = \"51\"").expect("signet configuration");
+
+        let (datadir, config_file, signet_challenge) =
+            resolve_data_paths(Some(tempdir.path()), Network::Signet, None, None);
+
+        assert_eq!(datadir, tempdir.path().join("signet-54d26fbd"));
+        assert_eq!(config_file, Some(config_path));
+        assert_eq!(signet_challenge, Some(ScriptBuf::from_bytes(vec![0x51])));
     }
 }
