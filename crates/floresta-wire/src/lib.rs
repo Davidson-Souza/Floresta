@@ -41,6 +41,7 @@ pub use p2p_wire::node_handle;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::node_interface;
 pub use p2p_wire::onion;
+pub use p2p_wire::signet_magic;
 pub use p2p_wire::transport::TransportProtocol;
 
 /// NodeHooks is a trait that defines the hooks that a node can use to interact with the network
