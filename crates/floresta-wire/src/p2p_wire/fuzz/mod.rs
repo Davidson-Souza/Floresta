@@ -54,8 +54,8 @@ where
 {
     let data = add_v1_handshake(data);
     let reader = BufReader::new(Cursor::new(data));
-    let reader = ReadTransport::V1(reader, Network::Regtest);
-    let writer = WriteTransport::V1(sink(), Network::Regtest);
+    let reader = ReadTransport::V1(reader, Network::Regtest.magic());
+    let writer = WriteTransport::V1(sink(), Network::Regtest.magic());
 
     run_peer(reader, writer, TransportProtocol::V1, mempool).await;
 }
