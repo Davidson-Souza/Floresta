@@ -16,7 +16,9 @@ mod json_rpc;
 #[cfg(feature = "zmq-server")]
 mod zmq;
 
+pub use config_file::read_signet_challenge;
 pub use florestad::AssumeUtreexoValue;
 pub use florestad::AssumeValidArg;
 pub use florestad::Config;
 pub use florestad::Florestad;
+pub use florestad::signet_data_dir_name;

@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 
 use bitcoin::Address;
 pub use bitcoin::Network;
+use bitcoin::Script;
 use bitcoin::ScriptBuf;
 pub use floresta_chain::AssumeUtreexoValue;
 pub use floresta_chain::AssumeValidArg;
@@ -45,6 +46,7 @@ use floresta_wire::address_man::AddressMan;
 use floresta_wire::address_man::ReachableNetworks;
 use floresta_wire::node::UtreexoNode;
 use floresta_wire::node::running_ctx::RunningNode;
+use floresta_wire::signet_magic;
 use rcgen::BasicConstraints;
 use rcgen::CertificateParams;
 use rcgen::IsCa;
@@ -78,6 +80,17 @@ use crate::zmq::ZMQServer;
 ///
 /// This is the same default as Bitcoin Core.
 const DEFAULT_MEMPOOL_MAX_SIZE_BYTES: usize = 300_000_000; // 300 MiB
+
+/// Returns the data-directory name for a signet challenge.
+pub fn signet_data_dir_name(challenge: Option<&Script>) -> String {
+    match challenge {
+        None => "signet".to_owned(),
+        Some(challenge) if challenge == ChainParams::default_signet_challenge() => {
+            "signet".to_owned()
+        }
+        Some(challenge) => format!("signet-{}", signet_magic(challenge)),
+    }
+}
 
 #[derive(Clone)]
 /// General configuration for the floresta daemon.
@@ -959,6 +972,19 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn signet_data_directories_are_challenge_specific() {
+        assert_eq!(signet_data_dir_name(None), "signet");
+        assert_eq!(
+            signet_data_dir_name(Some(ChainParams::default_signet_challenge())),
+            "signet"
+        );
+        assert_eq!(
+            signet_data_dir_name(Some(Script::from_bytes(&[0x51]))),
+            "signet-54d26fbd"
+        );
+    }
 
     #[test]
     fn config_file_sets_signet_challenge() {
