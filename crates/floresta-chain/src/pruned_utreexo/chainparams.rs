@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Network;
+use bitcoin::ScriptBuf;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::p2p::ServiceFlags;
@@ -31,6 +32,14 @@ use rustreexo::node_hash::BitcoinNodeHash;
 
 use crate::AssumeValidArg;
 use crate::prelude::*;
+
+const DEFAULT_SIGNET_CHALLENGE: &[u8] = &[
+    0x51, 0x21, 0x03, 0xad, 0x5e, 0x0e, 0xda, 0xd1, 0x8c, 0xb1, 0xf0, 0xfc, 0x0d, 0x28, 0xa3, 0xd4,
+    0xf1, 0xf3, 0xe4, 0x45, 0x64, 0x03, 0x37, 0x48, 0x9a, 0xbb, 0x10, 0x40, 0x4f, 0x2d, 0x1e, 0x08,
+    0x6b, 0xe4, 0x30, 0x21, 0x03, 0x59, 0xef, 0x50, 0x21, 0x96, 0x4f, 0xe2, 0x2d, 0x6f, 0x8e, 0x05,
+    0xb2, 0x46, 0x3c, 0x95, 0x40, 0xce, 0x96, 0x88, 0x3f, 0xe3, 0xb2, 0x78, 0x76, 0x0f, 0x04, 0x8f,
+    0x51, 0x89, 0xf2, 0xe6, 0xc4, 0x52, 0xae,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubsidyHalvingInterval {
@@ -81,6 +90,11 @@ pub struct ChainParams {
 
     /// The network this chain params is for
     pub network: Network,
+
+    /// The challenge script that signet blocks must satisfy.
+    ///
+    /// This is [`None`] for networks other than signet.
+    pub signet_challenge: Option<ScriptBuf>,
 
     /// Whether we should enforce BIP-094 "Testnet 4" rules
     pub enforce_bip94: bool,
@@ -322,6 +336,10 @@ impl From<Network> for ChainParams {
     fn from(network: Network) -> Self {
         let genesis = genesis_block(Params::new(network));
         let exceptions = get_exceptions();
+        let signet_challenge = match network {
+            Network::Signet => Some(ScriptBuf::from_bytes(DEFAULT_SIGNET_CHALLENGE.to_vec())),
+            _ => None,
+        };
 
         match network {
             Network::Bitcoin => Self {
@@ -334,6 +352,7 @@ impl From<Network> for ChainParams {
                 segwit_activation_height: 481_824,
                 csv_activation_height: 419_328,
                 exceptions,
+                signet_challenge,
                 enforce_bip94: false,
             },
             Network::Testnet => Self {
@@ -346,6 +365,7 @@ impl From<Network> for ChainParams {
                 segwit_activation_height: 834_624,
                 csv_activation_height: 770_112,
                 exceptions,
+                signet_challenge,
                 enforce_bip94: false,
             },
             Network::Testnet4 => Self {
@@ -358,6 +378,7 @@ impl From<Network> for ChainParams {
                 segwit_activation_height: 1,
                 csv_activation_height: 1,
                 exceptions,
+                signet_challenge,
                 enforce_bip94: true,
             },
             Network::Signet => Self {
@@ -370,6 +391,7 @@ impl From<Network> for ChainParams {
                 csv_activation_height: 1,
                 segwit_activation_height: 1,
                 exceptions,
+                signet_challenge,
                 enforce_bip94: false,
             },
             Network::Regtest => Self {
@@ -382,6 +404,7 @@ impl From<Network> for ChainParams {
                 csv_activation_height: 1,
                 segwit_activation_height: 0,
                 exceptions,
+                signet_challenge,
                 enforce_bip94: false,
             },
         }
@@ -492,5 +515,35 @@ pub fn buried_deployments_for(network: Network) -> &'static [(&'static str, u32)
         Network::Testnet4 => TESTNET4_BURIED,
         Network::Signet => SIGNET_BURIED,
         Network::Regtest => REGTEST_BURIED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_signet_challenge_matches_bitcoin_core() {
+        let params = ChainParams::from(Network::Signet);
+
+        assert_eq!(
+            params
+                .signet_challenge
+                .as_deref()
+                .map(|script| script.as_bytes()),
+            Some(DEFAULT_SIGNET_CHALLENGE)
+        );
+    }
+
+    #[test]
+    fn non_signet_networks_have_no_signet_challenge() {
+        for network in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Regtest,
+        ] {
+            assert!(ChainParams::from(network).signet_challenge.is_none());
+        }
     }
 }
