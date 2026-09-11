@@ -135,6 +135,7 @@ pub enum BlockValidationErrors {
     NotEnoughPow,
     BadMerkleRoot,
     BadWitnessCommitment,
+    InvalidSignetBlockSolution,
     NotEnoughMoney,
     FirstTxIsNotCoinbase,
     BadCoinbaseOutValue,
@@ -211,6 +212,9 @@ impl Display for BlockValidationErrors {
             }
             Self::BadMerkleRoot => write!(f, "Wrong merkle root"),
             Self::BadWitnessCommitment => write!(f, "Wrong witness commitment"),
+            Self::InvalidSignetBlockSolution => {
+                write!(f, "Block does not satisfy the signet challenge")
+            }
             Self::NotEnoughMoney => {
                 write!(f, "A transaction spends more than it should")
             }
