@@ -45,6 +45,8 @@ use super::udata;
 use crate::TransactionError;
 use crate::extensions::Bip30UnspendableExt;
 use crate::extensions::BlockExt;
+#[cfg(feature = "bitcoinkernel")]
+use crate::extensions::SignetBlockExt;
 use crate::extensions::TransactionExt;
 use crate::pruned_utreexo::utxo_data::UtxoData;
 use crate::swift_sync_agg::SipHashKeys;
@@ -704,6 +706,11 @@ impl Consensus {
         let txids = block.check_block_structure()?;
 
         self.check_bip34(block, height)?;
+
+        #[cfg(feature = "bitcoinkernel")]
+        if !block.check_signet_challenge(&self.parameters) {
+            Err(BlockValidationErrors::InvalidSignetBlockSolution)?;
+        }
 
         Ok(txids)
     }

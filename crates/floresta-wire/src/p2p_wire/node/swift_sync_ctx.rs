@@ -701,6 +701,7 @@ where
         match e {
             // Abort SwiftSync if the block is truly invalid
             BlockValidationErrors::InvalidCoinbase(_)
+            | BlockValidationErrors::InvalidSignetBlockSolution
             | BlockValidationErrors::UtxoNotFound(_)
             | BlockValidationErrors::ScriptValidationError(_)
             | BlockValidationErrors::NullPrevOut

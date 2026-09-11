@@ -674,6 +674,7 @@ where
             | BlockValidationErrors::BIP94TimeWarp
             | BlockValidationErrors::UnspendableUTXO
             | BlockValidationErrors::NonFinalTransaction
+            | BlockValidationErrors::InvalidSignetBlockSolution
             | BlockValidationErrors::CoinbaseNotMatured
             | BlockValidationErrors::UtxoNotFound(_)
             | BlockValidationErrors::BadRelativeLockTime => {
@@ -903,6 +904,7 @@ mod tests {
 
         match e {
             InvalidCoinbase(_)
+            | InvalidSignetBlockSolution
             | ScriptValidationError(_)
             | NullPrevOut
             | DuplicateInput
