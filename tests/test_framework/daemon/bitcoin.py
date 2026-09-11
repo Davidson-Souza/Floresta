@@ -24,6 +24,14 @@ class BitcoinDaemon(BaseDaemon):
         """
         Return the network configuration flags for the node.
         """
+        if any(
+            argument == "-chain"
+            or argument.startswith("-chain=")
+            or argument in ("-regtest", "-signet", "-testnet", "-testnet4")
+            for argument in self.extra_args
+        ):
+            return []
+
         return [
             "-chain=regtest",
         ]
