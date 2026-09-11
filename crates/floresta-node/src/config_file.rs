@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 
+use bitcoin::ScriptBuf;
 use serde::Deserialize;
 
 use crate::error::FlorestadError;
@@ -26,6 +27,8 @@ pub struct Rpc {
 
 #[derive(Default, Debug, Deserialize)]
 pub struct ConfigFile {
+    pub signet_challenge: Option<ScriptBuf>,
+
     #[serde(default)]
     pub wallet: Wallet,
     #[cfg(feature = "json-rpc")]
@@ -76,5 +79,28 @@ mod tests {
 
         assert_eq!(config.wallet.xpubs.as_ref().map(Vec::len), Some(1));
         assert!(config.rpc.user.is_none());
+    }
+}
+
+#[cfg(test)]
+mod signet_tests {
+    use super::*;
+
+    #[test]
+    fn parses_signet_challenge_as_hex_script() {
+        let config: ConfigFile =
+            toml::from_str("signet_challenge = \"51\"").expect("valid configuration");
+
+        assert_eq!(
+            config.signet_challenge,
+            Some(ScriptBuf::from_bytes(vec![0x51]))
+        );
+    }
+
+    #[test]
+    fn rejects_non_hex_signet_challenge() {
+        let result = toml::from_str::<ConfigFile>("signet_challenge = \"not-hex\"");
+
+        assert!(result.is_err());
     }
 }
