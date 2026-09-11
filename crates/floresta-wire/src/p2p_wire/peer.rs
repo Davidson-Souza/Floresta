@@ -978,7 +978,7 @@ mod tests {
         let peer = Peer {
             address,
             our_best_block: 0,
-            writer: WriteTransport::V1(Writer, Network::Regtest),
+            writer: WriteTransport::V1(Writer, Network::Regtest.magic()),
             state: State::Connected,
             kind: ConnectionKind::Manual,
             id: 0,
