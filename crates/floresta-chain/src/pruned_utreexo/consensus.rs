@@ -41,6 +41,8 @@ use super::error::BlockchainError;
 use super::udata;
 use crate::TransactionError;
 use crate::extensions::Bip30UnspendableExt;
+#[cfg(feature = "bitcoinkernel")]
+use crate::extensions::SignetBlockExt;
 use crate::pruned_utreexo::utxo_data::UtxoData;
 use crate::swift_sync_agg::SipHashKeys;
 use crate::swift_sync_agg::TxidHashMidstate;
@@ -570,6 +572,11 @@ impl Consensus {
 
         if !block.check_witness_commitment() {
             Err(BlockValidationErrors::BadWitnessCommitment)?;
+        }
+
+        #[cfg(feature = "bitcoinkernel")]
+        if !block.is_signet_challenge_valid(&self.parameters) {
+            Err(BlockValidationErrors::InvalidSignetBlockSolution)?;
         }
 
         if block.weight() > Weight::MAX_BLOCK {

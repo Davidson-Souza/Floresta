@@ -5,20 +5,69 @@ use core::fmt;
 use core::fmt::Display;
 use core::fmt::Formatter;
 
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::Amount;
 use bitcoin::Block;
 use bitcoin::BlockHash;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::Network;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::OutPoint;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::ScriptBuf;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::Sequence;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::Transaction;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::TxIn;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::TxOut;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::Witness;
 use bitcoin::Work;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::absolute;
 use bitcoin::block::Header;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::blockdata::opcodes::OP_0;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::blockdata::opcodes::Opcode;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::blockdata::opcodes::all::OP_RETURN;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::blockdata::script::Instruction;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::consensus::Decodable;
 use bitcoin::consensus::encode::serialize_hex;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::consensus::serialize;
 use bitcoin::hashes::Hash;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoin::transaction::Version;
 use floresta_common::bhash;
 use floresta_common::prelude::Box;
 use floresta_common::prelude::String;
 use floresta_common::prelude::Vec;
+#[cfg(feature = "bitcoinkernel")]
+use floresta_common::prelude::vec;
 
 use crate::BlockchainInterface;
+#[cfg(feature = "bitcoinkernel")]
+use crate::ChainParams;
+#[cfg(feature = "bitcoinkernel")]
+use crate::pruned_utreexo::merkle::ConsensusMerkle;
 
 const MEDIAN_TIME_PAST_BLOCK_COUNT: usize = 11;
+#[cfg(feature = "bitcoinkernel")]
+const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
+#[cfg(feature = "bitcoinkernel")]
+const SIGNET_VERIFY_FLAGS: bitcoinkernel::ScriptVerificationFlags = bitcoinkernel::VERIFY_P2SH
+    | bitcoinkernel::VERIFY_WITNESS
+    | bitcoinkernel::VERIFY_DERSIG
+    | bitcoinkernel::VERIFY_NULLDUMMY;
+#[cfg(feature = "bitcoinkernel")]
+const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
 pub trait Bip30UnspendableExt {
     /// Returns true if the coinbase output in this block is BIP-30 unspendable.
@@ -38,6 +87,176 @@ impl Bip30UnspendableExt for Block {
             _ => false,
         }
     }
+}
+
+#[cfg(feature = "bitcoinkernel")]
+/// Provides BIP-325 signet validation for [`Block`]s.
+pub trait SignetBlockExt {
+    /// Returns whether this block satisfies the signet challenge in `chain_params`.
+    ///
+    /// Genesis blocks and blocks for non-signet networks are always valid.
+    fn is_signet_challenge_valid(&self, chain_params: &ChainParams) -> bool;
+}
+
+#[cfg(feature = "bitcoinkernel")]
+impl SignetBlockExt for Block {
+    fn is_signet_challenge_valid(&self, chain_params: &ChainParams) -> bool {
+        if self.block_hash() == chain_params.genesis.block_hash() {
+            return true;
+        }
+
+        if chain_params.network != Network::Signet {
+            return true;
+        }
+
+        let Some(challenge) = chain_params.signet_challenge.as_ref() else {
+            return false;
+        };
+
+        let Some((to_spend, to_sign)) = create_signet_transactions(self, challenge) else {
+            return false;
+        };
+
+        let serialized = serialize(&to_sign);
+        let Ok(to_sign) = bitcoinkernel::Transaction::try_from(serialized.as_slice()) else {
+            return false;
+        };
+        let output = &to_spend.output[0];
+        let Ok(amount) = i64::try_from(output.value.to_sat()) else {
+            return false;
+        };
+        let Ok(challenge) = bitcoinkernel::ScriptPubkey::try_from(output.script_pubkey.as_bytes())
+        else {
+            return false;
+        };
+        let previous_output = bitcoinkernel::TxOut::new(&challenge, amount);
+        let Ok(tx_data) = bitcoinkernel::PrecomputedTransactionData::new(
+            &to_sign,
+            core::slice::from_ref(&previous_output),
+        ) else {
+            return false;
+        };
+
+        bitcoinkernel::verify(
+            &challenge,
+            Some(amount),
+            &to_sign,
+            0,
+            Some(SIGNET_VERIFY_FLAGS),
+            &tx_data,
+        )
+        .is_ok()
+    }
+}
+
+#[cfg(feature = "bitcoinkernel")]
+fn create_signet_transactions(
+    block: &Block,
+    challenge: &ScriptBuf,
+) -> Option<(Transaction, Transaction)> {
+    let mut coinbase = block.txdata.first()?.clone();
+    let commitment_index = coinbase.output.iter().rposition(|output| {
+        let script = output.script_pubkey.as_bytes();
+        script.len() >= 38 && script.starts_with(&WITNESS_COMMITMENT_HEADER)
+    })?;
+
+    let solution =
+        fetch_and_clear_signet_solution(&mut coinbase.output[commitment_index].script_pubkey);
+    let (script_sig, witness) = match solution {
+        Some(solution) => {
+            let mut reader = solution.as_slice();
+            let script_sig = ScriptBuf::consensus_decode(&mut reader).ok()?;
+            let witness = Witness::consensus_decode(&mut reader).ok()?;
+            if !reader.is_empty() {
+                return None;
+            }
+            (script_sig, witness)
+        }
+        None => (ScriptBuf::new(), Witness::new()),
+    };
+
+    let mut txids = Vec::with_capacity(block.txdata.len());
+    txids.push(coinbase.compute_txid());
+    txids.extend(block.txdata.iter().skip(1).map(Transaction::compute_txid));
+    let (signet_merkle_root, _) = ConsensusMerkle::calculate_root(&txids)?;
+
+    let mut block_data = [0; 72];
+    block_data[..4].copy_from_slice(&block.header.version.to_consensus().to_le_bytes());
+    block_data[4..36].copy_from_slice(&block.header.prev_blockhash.to_byte_array());
+    block_data[36..68].copy_from_slice(&signet_merkle_root.to_byte_array());
+    block_data[68..].copy_from_slice(&block.header.time.to_le_bytes());
+
+    let to_spend = Transaction {
+        version: Version(0),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::builder()
+                .push_opcode(OP_0)
+                .push_slice(block_data)
+                .into_script(),
+            sequence: Sequence::ZERO,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: challenge.clone(),
+        }],
+    };
+
+    let to_sign = Transaction {
+        version: Version(0),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(to_spend.compute_txid(), 0),
+            script_sig,
+            sequence: Sequence::ZERO,
+            witness,
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::builder().push_opcode(OP_RETURN).into_script(),
+        }],
+    };
+
+    Some((to_spend, to_sign))
+}
+
+#[cfg(feature = "bitcoinkernel")]
+fn fetch_and_clear_signet_solution(witness_commitment: &mut ScriptBuf) -> Option<Vec<u8>> {
+    let original = witness_commitment.as_bytes();
+    let mut replacement = ScriptBuf::new();
+    let mut solution = None;
+
+    for instruction in witness_commitment.instruction_indices() {
+        let Ok((index, instruction)) = instruction else {
+            break;
+        };
+
+        match instruction {
+            Instruction::PushBytes(bytes) if bytes.is_empty() => {
+                replacement.push_opcode(Opcode::from(original[index]));
+            }
+            Instruction::PushBytes(bytes) => {
+                if solution.is_none()
+                    && bytes.len() > SIGNET_HEADER.len()
+                    && bytes.as_bytes().starts_with(&SIGNET_HEADER)
+                {
+                    solution = Some(bytes.as_bytes()[SIGNET_HEADER.len()..].to_vec());
+                    replacement.push_slice(SIGNET_HEADER);
+                } else {
+                    replacement.push_slice(bytes);
+                }
+            }
+            Instruction::Op(opcode) => replacement.push_opcode(opcode),
+        }
+    }
+
+    if solution.is_some() {
+        *witness_commitment = replacement;
+    }
+
+    solution
 }
 
 /// Provides additional methods for working with [`Header`] objects,
@@ -312,6 +531,8 @@ mod tests {
 
     use bitcoin::Block;
     use bitcoin::BlockHash;
+    #[cfg(feature = "bitcoinkernel")]
+    use bitcoin::Network;
     use bitcoin::OutPoint;
     use bitcoin::Transaction;
     use bitcoin::Txid;
@@ -324,14 +545,31 @@ mod tests {
 
     use super::*;
     use crate::BlockConsumer;
+    #[cfg(feature = "bitcoinkernel")]
+    use crate::BlockValidationErrors;
     use crate::BlockchainError;
     use crate::UtxoData;
     use crate::pruned_utreexo::IBDState;
+    #[cfg(feature = "bitcoinkernel")]
+    use crate::pruned_utreexo::consensus::Consensus;
 
     const SAMPLE_WORK_BYTES: [u8; 32] = [
         0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0,
         0, 4,
     ];
+
+    #[cfg(feature = "bitcoinkernel")]
+    const SIGNET_BLOCK_ONE: &str = concat!(
+        "00000020f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000f575c832",
+        "35984e7dc4afc1f30944c170462e84437ab6f2d52e16878a79e4678bd1914d5fae77031eccf40700",
+        "01010000000001010000000000000000000000000000000000000000000000000000000000000000",
+        "ffffffff025151feffffff0200f2052a010000001600149243f727dd5343293eb83174324019ec16",
+        "c2630f0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c6906897999",
+        "62b48bebd836974e8cf94c4fecc7daa2490047304402205e423a8754336ca99dbe16509b877ef1bf",
+        "98d008836c725005b3c787c41ebe46022047246e4467ad7cc7f1ad98662afcaf14c115e0095a227c",
+        "7b05c5182591c23e7e01000120000000000000000000000000000000000000000000000000000000",
+        "000000000000000000",
+    );
 
     #[derive(Debug)]
     pub enum MockBlockchainError {
@@ -1006,5 +1244,67 @@ mod tests {
             work.to_string_hex(),
             "0000000300000001000000000000000200000000000000030000000000000004"
         );
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn default_signet_block_satisfies_challenge() {
+        let block: Block = deserialize_hex(SIGNET_BLOCK_ONE).expect("valid signet block");
+        let consensus = Consensus::from(Network::Signet);
+
+        assert!(block.is_signet_challenge_valid(&consensus.parameters));
+        consensus
+            .check_block(&block, 1)
+            .expect("valid signet block must pass contextual checks");
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn signet_parameters_require_a_challenge() {
+        let block: Block = deserialize_hex(SIGNET_BLOCK_ONE).expect("valid signet block");
+        let mut params = ChainParams::from(Network::Signet);
+        params.signet_challenge = None;
+
+        assert!(!block.is_signet_challenge_valid(&params));
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn modified_signet_solution_fails_consensus_validation() {
+        let mut block: Block = deserialize_hex(SIGNET_BLOCK_ONE).expect("valid signet block");
+        let script = &mut block.txdata[0].output[1].script_pubkey;
+        let header_position = script
+            .as_bytes()
+            .windows(SIGNET_HEADER.len())
+            .position(|window| window == SIGNET_HEADER)
+            .expect("signet header is present");
+        script.as_mut_bytes()[header_position + SIGNET_HEADER.len() + 10] ^= 1;
+        block.header.merkle_root = block.compute_merkle_root().expect("block is not empty");
+
+        let consensus = Consensus::from(Network::Signet);
+        let result = consensus.check_block(&block, 1);
+
+        assert!(matches!(
+            result,
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::InvalidSignetBlockSolution
+            ))
+        ));
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn empty_solution_satisfies_op_true_challenge() {
+        let mut block: Block = deserialize_hex(SIGNET_BLOCK_ONE).expect("valid signet block");
+        let script = &mut block.txdata[0].output[1].script_pubkey;
+        assert!(fetch_and_clear_signet_solution(script).is_some());
+        block.header.merkle_root = block.compute_merkle_root().expect("block is not empty");
+
+        let mut params = ChainParams::from(Network::Signet);
+        params.signet_challenge = Some(ScriptBuf::from_bytes(vec![0x51]));
+        assert!(block.is_signet_challenge_valid(&params));
+
+        params.signet_challenge = Some(ScriptBuf::from_bytes(vec![0x00]));
+        assert!(!block.is_signet_challenge_valid(&params));
     }
 }
