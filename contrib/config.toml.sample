@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Optional BIP-325 challenge for a custom signet, encoded as hex.
+# signet_challenge = "51"
+
 [wallet]
 xpubs = []
 descriptors = []

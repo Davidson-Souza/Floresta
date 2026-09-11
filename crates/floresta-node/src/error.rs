@@ -7,6 +7,7 @@ use core::fmt::Formatter;
 use core::net::AddrParseError;
 use std::path::PathBuf;
 
+use bitcoin::Network;
 use bitcoin::consensus::encode;
 use floresta_chain::BlockValidationErrors;
 use floresta_chain::BlockchainError;
@@ -45,6 +46,9 @@ pub enum FlorestadError {
 
     /// TOML parsing error.
     TomlParsing(toml::de::Error),
+
+    /// A signet challenge was configured for another network.
+    SignetChallengeOnNonSignet(Network),
 
     /// Parsing registered HD version bytes from slip132.
     WalletInput(DescriptorError),
@@ -139,6 +143,9 @@ impl Display for FlorestadError {
             Self::SerdeJson(err) => write!(f, "Error serializing object {err}"),
             Self::WalletInput(err) => write!(f, "Error while parsing user input {err:?}"),
             Self::TomlParsing(err) => write!(f, "Error deserializing toml file {err}"),
+            Self::SignetChallengeOnNonSignet(network) => {
+                write!(f, "A signet challenge cannot be used with {network}")
+            }
             Self::AddressParsing(err) => write!(f, "Invalid address {err}"),
             Self::Miniscript(err) => write!(f, "Miniscript error: {err}"),
             Self::BlockValidation(err) => {

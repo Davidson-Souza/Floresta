@@ -16,7 +16,6 @@ use core::fmt::Display;
 use core::fmt::Formatter;
 
 use bitcoin::BlockHash;
-use bitcoin::Network;
 use bitcoin::block::Header as BlockHeader;
 use rustreexo::stump::Stump;
 
@@ -77,7 +76,7 @@ pub struct ChainStateBuilder<PersistedState: ChainStore> {
     chain_params: Option<ChainParams>,
 
     /// The block hash that is assumed to be valid.
-    assume_valid: Option<BlockHash>,
+    assume_valid: Option<AssumeValidArg>,
 
     /// The current chain tip.
     tip: Option<(BlockHash, u32)>,
@@ -144,9 +143,8 @@ impl<T: ChainStore> ChainStateBuilder<T> {
 
     /// Sets the assume-valid argument, which can be `Disabled`, `Hardcoded` or `UserInput`. This
     /// option is used to skip script validation up to the specified block, speeding up IBD.
-    pub fn with_assume_valid(mut self, arg: AssumeValidArg, network: Network) -> Self {
-        // TODO: handle possible Err
-        self.assume_valid = ChainParams::get_assume_valid(network, arg);
+    pub fn with_assume_valid(mut self, arg: AssumeValidArg) -> Self {
+        self.assume_valid = Some(arg);
         self
     }
 
@@ -204,8 +202,12 @@ impl<T: ChainStore> ChainStateBuilder<T> {
     }
 
     /// Returns the block hash of the assume-valid option, if enabled.
-    pub(super) fn assume_valid(&self) -> Option<BlockHash> {
-        self.assume_valid
+    pub(super) fn assume_valid(&self) -> Result<Option<BlockHash>, BlockchainBuilderError> {
+        let Some(assume_valid) = self.assume_valid else {
+            return Ok(None);
+        };
+
+        Ok(self.chain_params()?.get_assume_valid(assume_valid))
     }
 
     /// Returns the inner [`IBDState`]
