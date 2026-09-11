@@ -274,10 +274,9 @@ where
         }
 
         try_and_log!(self.process_pending_blocks());
-        if !self.has_utreexo_peers() {
-            return LoopControl::Continue;
-        }
 
+        // Download blocks even without an Utreexo peer. Coinbase-only blocks need no proof,
+        // while blocks with spends remain pending until a proof peer becomes available.
         // Ask for missed blocks or proofs if they are no longer inflight or pending
         try_and_log!(self.ask_for_missed_blocks());
         try_and_log!(self.ask_for_missed_proofs());
