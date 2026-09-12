@@ -14,6 +14,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256d;
 use bitcoin::p2p::Magic;
 use floresta_chain::AssumeUtreexoValue;
+use floresta_chain::ChainParams;
 
 #[derive(Debug, Clone)]
 /// Configuration for the Utreexo node.
@@ -85,6 +86,22 @@ impl UtreexoNodeConfig {
             (Network::Signet, Some(challenge)) => signet_magic(challenge),
             _ => self.network.magic(),
         }
+    }
+
+    fn is_custom_signet(&self) -> bool {
+        self.network == Network::Signet
+            && self
+                .signet_challenge
+                .as_deref()
+                .is_some_and(|challenge| challenge != ChainParams::default_signet_challenge())
+    }
+
+    pub(crate) fn should_use_dns_seeds(&self) -> bool {
+        !self.disable_dns_seeds && !self.is_custom_signet()
+    }
+
+    pub(crate) fn should_use_fixed_seeds(&self) -> bool {
+        !self.is_custom_signet()
     }
 }
 
@@ -171,5 +188,25 @@ mod magic_tests {
             .expect("signet has a challenge");
 
         assert_eq!(signet_magic(challenge), Magic::SIGNET);
+    }
+
+    #[test]
+    fn custom_signet_disables_builtin_seeds() {
+        let mut config = UtreexoNodeConfig {
+            network: Network::Signet,
+            signet_challenge: Some(ScriptBuf::from_bytes(vec![0x51])),
+            ..Default::default()
+        };
+
+        assert!(!config.should_use_dns_seeds());
+        assert!(!config.should_use_fixed_seeds());
+
+        config.signet_challenge = Some(ChainParams::default_signet_challenge().to_owned());
+        assert!(config.should_use_dns_seeds());
+        assert!(config.should_use_fixed_seeds());
+
+        config.disable_dns_seeds = true;
+        assert!(!config.should_use_dns_seeds());
+        assert!(config.should_use_fixed_seeds());
     }
 }

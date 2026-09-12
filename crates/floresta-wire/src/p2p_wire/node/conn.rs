@@ -107,7 +107,8 @@ where
 
         // Load hardcoded addresses to the address manager if no fixed or manual peers exist.
         let Some((peer_id, peer_address)) = candidate_peer else {
-            if !matches!(conn_kind, ConnectionKind::Manual) {
+            if !matches!(conn_kind, ConnectionKind::Manual) && self.config.should_use_fixed_seeds()
+            {
                 let net = self.network;
                 self.address_man.add_fixed_addresses(net);
             }
@@ -405,7 +406,7 @@ where
 
         // Skip if address fetching from DNS seeds is disabled,
         // or if the [`AddressMan`] has enough addresses in its database.
-        if self.config.disable_dns_seeds || enough_addresses {
+        if !self.config.should_use_dns_seeds() || enough_addresses {
             return;
         }
 
@@ -430,7 +431,7 @@ where
     /// can't find a Utreexo peer in a context we need them. This function
     /// won't do anything if `--connect` was used
     fn maybe_use_hardcoded_addresses(&mut self) {
-        if self.has_fixed_peers() {
+        if self.has_fixed_peers() || !self.config.should_use_fixed_seeds() {
             return;
         }
 
@@ -458,7 +459,7 @@ where
         let anchors = self.common.address_man.start_addr_man(&self.common.datadir);
         let enough_addresses = self.common.address_man.enough_addresses();
 
-        if !self.config.disable_dns_seeds && !enough_addresses {
+        if self.config.should_use_dns_seeds() && !enough_addresses {
             self.get_peers_from_dns()?;
             self.last_dns_seed_call = Instant::now();
         }
