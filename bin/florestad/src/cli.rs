@@ -109,6 +109,13 @@ pub struct Cli {
     pub connect: Vec<String>,
 
     #[arg(long, value_name = "address[:<port>]")]
+    /// A node to use for peer address discovery. May be specified multiple times.
+    ///
+    /// Seed nodes are disconnected after returning peer addresses and do not disable other
+    /// discovery methods.
+    pub seednode: Vec<String>,
+
+    #[arg(long, value_name = "address[:<port>]")]
     /// The address where our json-rpc server should listen to, in the format `<address>[:<port>]`
     pub rpc_address: Option<String>,
 
@@ -287,6 +294,25 @@ mod tests {
         assert_eq!(
             cli.validate_signet_options(),
             Err("--signet-challenge requires --network signet")
+        );
+    }
+
+    #[test]
+    fn parses_repeated_seednodes() {
+        let cli = Cli::try_parse_from([
+            "florestad",
+            "--seednode",
+            "seed-one.example:38333",
+            "--seednode=seed-two.example:38333",
+        ])
+        .expect("valid seed nodes");
+
+        assert_eq!(
+            cli.seednode,
+            [
+                "seed-one.example:38333".to_owned(),
+                "seed-two.example:38333".to_owned()
+            ]
         );
     }
 }

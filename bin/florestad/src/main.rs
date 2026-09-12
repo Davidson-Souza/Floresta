@@ -75,6 +75,7 @@ fn main() {
         proxy: params.proxy,
         assume_utreexo: !params.no_assume_utreexo,
         connect: params.connect,
+        seednode: params.seednode,
         wallet_xpub: params.wallet_xpub,
         config_file,
         #[cfg(unix)]
