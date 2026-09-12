@@ -459,6 +459,10 @@ where
         let anchors = self.common.address_man.start_addr_man(&self.common.datadir);
         let enough_addresses = self.common.address_man.enough_addresses();
 
+        for address in core::mem::take(&mut self.seed_nodes) {
+            self.open_connection(ConnectionKind::Feeler, address, true)?;
+        }
+
         if self.config.should_use_dns_seeds() && !enough_addresses {
             self.get_peers_from_dns()?;
             self.last_dns_seed_call = Instant::now();

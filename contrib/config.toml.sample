@@ -3,6 +3,9 @@
 # Optional BIP-325 challenge for a custom signet, encoded as hex.
 # signet_challenge = "51"
 
+# Nodes used to bootstrap peer discovery.
+seednode = []
+
 [wallet]
 xpubs = []
 descriptors = []

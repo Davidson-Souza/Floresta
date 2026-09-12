@@ -282,6 +282,7 @@ pub struct NodeCommon<Chain: ChainBackend> {
     // 4. Networking Configuration
     pub(crate) socks5: Option<Socks5StreamBuilder>,
     pub(crate) fixed_peers: Vec<LocalAddress>,
+    pub(crate) seed_nodes: Vec<LocalAddress>,
 
     // 5. Time and Event Tracking
     pub(crate) inflight: HashMap<InflightRequests, (u32, Instant)>,
@@ -343,6 +344,22 @@ pub enum PeerStatus {
     Banned,
 }
 
+fn resolve_configured_peers(
+    addresses: &[String],
+    network: Network,
+    seen: &mut HashSet<BitcoinSocketAddr>,
+) -> Result<Vec<LocalAddress>, WireError> {
+    let mut peers = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let resolved = BitcoinSocketAddr::parse_address(address, Some(network), SystemResolver)?;
+        if seen.insert(resolved.clone()) {
+            peers.push(LocalAddress::from(resolved));
+        }
+    }
+
+    Ok(peers)
+}
+
 impl<T, Chain> UtreexoNode<Chain, T>
 where
     T: 'static + Default + NodeContext,
@@ -361,16 +378,10 @@ where
         let magic = config.network_magic();
         let socks5 = config.proxy.map(Socks5StreamBuilder::new);
 
-        // Dedup the resolved fixed peers so we don't open multiple connections to the same host.
+        // Resolve configured peers once and avoid opening the same address in both roles.
         let mut seen = HashSet::new();
-        let mut fixed_peers = Vec::with_capacity(config.fixed_peers.len());
-        for address in &config.fixed_peers {
-            let resolved =
-                BitcoinSocketAddr::parse_address(address, Some(config.network), SystemResolver)?;
-            if seen.insert(resolved.clone()) {
-                fixed_peers.push(LocalAddress::from(resolved));
-            }
-        }
+        let fixed_peers = resolve_configured_peers(&config.fixed_peers, config.network, &mut seen)?;
+        let seed_nodes = resolve_configured_peers(&config.seed_nodes, config.network, &mut seen)?;
 
         Ok(Self {
             common: NodeCommon {
@@ -406,6 +417,7 @@ where
                 max_banscore: config.max_banscore,
                 socks5,
                 fixed_peers,
+                seed_nodes,
                 config,
                 kill_signal,
                 added_peers: Vec::new(),
@@ -443,3 +455,26 @@ macro_rules! periodic_job {
 }
 
 pub(crate) use periodic_job;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_nodes_are_deduplicated_from_fixed_peers() {
+        let mut seen = HashSet::new();
+        let fixed_peers =
+            resolve_configured_peers(&["127.0.0.1:38333".to_owned()], Network::Signet, &mut seen)
+                .expect("valid fixed peer");
+        let seed_nodes = resolve_configured_peers(
+            &["127.0.0.1:38333".to_owned(), "127.0.0.1:38334".to_owned()],
+            Network::Signet,
+            &mut seen,
+        )
+        .expect("valid seed nodes");
+
+        assert_eq!(fixed_peers.len(), 1);
+        assert_eq!(seed_nodes.len(), 1);
+        assert_eq!(seed_nodes[0].get_port(), 38334);
+    }
+}

@@ -35,11 +35,18 @@ The challenge can instead be placed at the top level of `config.toml`:
 
 ```toml
 signet_challenge = "<hex-script>"
+seednode = ["seed.example.com:38333"]
 ```
 
 Use `--config-file <path>` to select any other configuration location. Without
 an explicit path, Floresta discovers a file-based custom challenge in the
 default `<base>/signet/config.toml` location.
+
+Custom signets do not use the default Signet DNS or fixed seeds. Bootstrap
+discovery with one or more `--seednode <address[:port]>` options, or configure
+the `seednode` array shown above. A seed node is disconnected after returning
+peer addresses. Use `--connect <address[:port]>` instead to remain pinned to a
+specific peer.
 
 The default signet stores data in `<base>/signet`. Each custom signet uses
 `<base>/signet-<magic>`, where `<magic>` is its challenge-derived P2P

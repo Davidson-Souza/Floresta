@@ -20,6 +20,9 @@ pub struct ConfigFile {
     pub signet_challenge: Option<ScriptBuf>,
 
     #[serde(default)]
+    pub seednode: Vec<String>,
+
+    #[serde(default)]
     pub wallet: Wallet,
 }
 
@@ -52,6 +55,15 @@ mod tests {
             config.signet_challenge,
             Some(ScriptBuf::from_bytes(vec![0x51]))
         );
+    }
+
+    #[test]
+    fn parses_seednodes() {
+        let config: ConfigFile =
+            toml::from_str("seednode = [\"seed.example:38333\", \"127.0.0.1:18444\"]")
+                .expect("valid configuration");
+
+        assert_eq!(config.seednode, ["seed.example:38333", "127.0.0.1:18444"]);
     }
 
     #[test]
