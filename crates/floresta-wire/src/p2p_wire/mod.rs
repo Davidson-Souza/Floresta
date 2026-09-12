@@ -43,6 +43,12 @@ pub struct UtreexoNodeConfig {
     /// Each entry is `host[:port]`, where `host` is an IPv4 address, a bracketed IPv6 address (`[::1]`), or a hostname;
     /// `port` is optional and defaults to the network's default port (for example, `"localhost"` or `"127.0.0.1:8333"`).
     pub fixed_peers: Vec<String>,
+
+    /// Peers used to bootstrap address discovery. Defaults to an empty list.
+    ///
+    /// Each entry is connected as a feeler and disconnected after it returns peer addresses.
+    pub seed_nodes: Vec<String>,
+
     /// Maximum ban score. Defaults to 100.
     ///
     /// If a peer misbehaves, we increase its ban score. If the ban score reaches this value,
@@ -125,6 +131,7 @@ impl Default for UtreexoNodeConfig {
             pow_fraud_proofs: false,
             compact_filters: false,
             fixed_peers: Vec::new(),
+            seed_nodes: Vec::new(),
             max_banscore: 100,
             datadir: ".floresta-node".into(),
             proxy: None,

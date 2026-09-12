@@ -183,6 +183,12 @@ pub struct Config {
     /// If non-empty, we'll connect **only** to these nodes.
     pub connect: Vec<String>,
 
+    /// Nodes used to bootstrap peer address discovery.
+    ///
+    /// Unlike `connect`, these peers are disconnected after returning addresses and do not
+    /// disable other discovery methods.
+    pub seednode: Vec<String>,
+
     #[cfg(feature = "json-rpc")]
     /// The address our json-rpc should listen to
     pub json_rpc_address: Option<String>,
@@ -299,6 +305,7 @@ impl Config {
             #[cfg(feature = "zmq-server")]
             zmq_address: None,
             connect: Vec::new(),
+            seednode: Vec::new(),
             #[cfg(feature = "json-rpc")]
             json_rpc_address: None,
             #[cfg(feature = "json-rpc")]
@@ -516,6 +523,7 @@ impl Florestad {
             proxy,
             datadir: datadir.into(),
             fixed_peers: self.config.connect.clone(),
+            seed_nodes: self.get_seednodes(),
             compact_filters: self.config.cfilters,
             assume_utreexo: self.config.assumeutreexo_value.clone().or(assume_utreexo),
             backfill: self.config.backfill,
@@ -1026,6 +1034,16 @@ impl Florestad {
             .collect()
     }
 
+    /// Returns seed nodes from explicit and file-based configuration.
+    fn get_seednodes(&self) -> Vec<String> {
+        self.config
+            .seednode
+            .iter()
+            .chain(self.get_config_file().seednode.iter())
+            .cloned()
+            .collect()
+    }
+
     /// Resolved cookie file path override; CLI wins over the config file.
     #[cfg(feature = "json-rpc")]
     fn get_rpc_cookie_file(&self) -> Option<PathBuf> {
@@ -1043,7 +1061,6 @@ impl Florestad {
     fn cookie_auth_disabled(&self) -> bool {
         self.config.no_rpc_cookie_file
     }
-
     /// Get the wallet descriptors from the config file
     fn get_descriptors(&self) -> Vec<String> {
         self.config
@@ -1243,5 +1260,25 @@ mod tests {
             florestad.chain_params(),
             Err(FlorestadError::SignetChallengeOnNonSignet(Network::Bitcoin))
         ));
+    }
+    #[test]
+    fn combines_explicit_and_file_seednodes() {
+        let tempdir = tempdir().expect("temporary directory");
+        let config_path = tempdir.path().join("config.toml");
+        std::fs::write(&config_path, "seednode = [\"file-seed.example:38333\"]")
+            .expect("write configuration");
+
+        let mut config = Config::new(Network::Signet, tempdir.path());
+        config.config_file = Some(config_path);
+        config.seednode = vec!["cli-seed.example:38333".to_owned()];
+        let florestad = Florestad::from(config);
+
+        assert_eq!(
+            florestad.get_seednodes(),
+            [
+                "cli-seed.example:38333".to_owned(),
+                "file-seed.example:38333".to_owned()
+            ]
+        );
     }
 }
