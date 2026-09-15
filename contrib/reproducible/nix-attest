@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Copyright (c) The Bitcoin Core developers
+# Copyright (c) 2026 The Floresta developers
+# Distributed under the MIT software license; see LICENSE-MIT.
+#
+# The manifest layout and detached-GPG-signature flow follow Bitcoin Core's
+# contrib/guix/guix-attest.
+
+set -o errexit -o nounset -o pipefail
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/libexec/common.sh"
+
+usage() {
+    cat <<'EOF'
+Create a Bitcoin Core-style attestation for local release output.
+
+Usage:
+  ATTESTATIONS_REPO=/path/to/floresta-attestations \
+  SIGNER=GPG_KEY[=DISPLAY_NAME] \
+    contrib/reproducible/nix-attest
+
+Environment variables:
+  OUTDIR_BASE=/path             release output from nix-build
+  VERSION=id                    attestation directory (default: tag or commit ID)
+  NO_SIGN=1                     write manifests without GPG signatures
+  GPG=/path/to/gpg              GPG executable (default: gpg)
+  FORCE_DIRTY_WORKTREE=1       permit a development-only dirty attestation
+EOF
+}
+
+differing_manifest_error() {
+    local path="$1"
+    cat >&2 <<EOF
+error: $path already exists and differs from this build
+Remove that signer's existing manifest and signature only if the earlier
+attestation was incomplete or incorrect.
+EOF
+    exit 1
+}
+
+write_manifest() {
+    local destination="$1"
+    shift
+    local temporary
+    temporary="$(mktemp)"
+    cat "$@" | sort -u | sort -k2 > "$temporary"
+    [[ -s "$temporary" ]] || die "refusing to write an empty manifest: $destination"
+
+    if [[ -e "$destination" ]]; then
+        cmp --silent "$destination" "$temporary" || differing_manifest_error "$destination"
+        rm "$temporary"
+        printf 'Manifest is current: %s\n' "$destination"
+    else
+        mv "$temporary" "$destination"
+        printf 'Wrote %s\n' "$destination"
+    fi
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+[[ $# -eq 0 ]] || { usage >&2; exit 1; }
+
+check_top_directory
+require_tools git cat cmp mkdir mktemp mv rm sort
+check_clean_worktree
+[[ -n "${ATTESTATIONS_REPO:-}" ]] || { usage >&2; die 'ATTESTATIONS_REPO is required'; }
+[[ -d "$ATTESTATIONS_REPO" ]] || die "attestations repository not found: $ATTESTATIONS_REPO"
+[[ -n "${SIGNER:-}" ]] || { usage >&2; die 'SIGNER is required'; }
+
+gpg="${GPG:-gpg}"
+if [[ -z "${NO_SIGN:-}" ]]; then
+    require_tools "$gpg"
+fi
+
+IFS='=' read -r gpg_key signer_name <<< "$SIGNER"
+signer_name="${signer_name:-$gpg_key}"
+[[ "$signer_name" != */* && "$signer_name" != '.' && "$signer_name" != '..' ]] \
+    || die 'the signer display name must be one path component'
+if [[ -z "${NO_SIGN:-}" ]]; then
+    "$gpg" --batch --list-secret-keys "$gpg_key" >/dev/null 2>&1 \
+        || die "GPG secret key not found: $gpg_key"
+fi
+
+outdir_base="$(output_base)"
+version="$(attestation_version)"
+shopt -s nullglob
+fragments=("$outdir_base"/*/SHA256SUMS.part)
+shopt -u nullglob
+unsigned_fragments=()
+codesigned_fragments=()
+for fragment in "${fragments[@]}"; do
+    case "$fragment" in
+        "$outdir_base"/*-codesigned/SHA256SUMS.part) codesigned_fragments+=("$fragment") ;;
+        *) unsigned_fragments+=("$fragment") ;;
+    esac
+done
+[[ ${#unsigned_fragments[@]} -gt 0 ]] \
+    || die "no unsigned SHA256SUMS.part files found under $outdir_base"
+
+attestation_dir="$ATTESTATIONS_REPO/$version/$signer_name"
+mkdir -p "$attestation_dir"
+noncodesigned_manifest="$attestation_dir/noncodesigned.SHA256SUMS"
+write_manifest "$noncodesigned_manifest" "${unsigned_fragments[@]}"
+
+manifests_to_sign=("$noncodesigned_manifest")
+if [[ ${#codesigned_fragments[@]} -gt 0 ]]; then
+    all_manifest="$attestation_dir/all.SHA256SUMS"
+    write_manifest "$all_manifest" "${unsigned_fragments[@]}" "${codesigned_fragments[@]}"
+    manifests_to_sign+=("$all_manifest")
+else
+    printf 'No codesigned outputs found; skipping all.SHA256SUMS\n'
+fi
+
+if [[ -n "${NO_SIGN:-}" ]]; then
+    printf 'NO_SIGN is set; manifests were not signed\n'
+    exit 0
+fi
+
+for manifest in "${manifests_to_sign[@]}"; do
+    signature="$manifest.asc"
+    if [[ -e "$signature" ]]; then
+        "$gpg" --batch --verify "$signature" "$manifest" >/dev/null 2>&1 \
+            || die "existing signature is invalid: $signature"
+        printf 'Signature is current: %s\n' "$signature"
+        continue
+    fi
+    "$gpg" \
+        --armor \
+        --detach-sign \
+        --digest-algo SHA256 \
+        --local-user "$gpg_key" \
+        --output "$signature" \
+        "$manifest"
+    printf 'Wrote %s\n' "$signature"
+done

@@ -1,11 +1,19 @@
 # Build outputs
 /target
 /builds
+/result*
 
 # Temporary files and generated data
-tmp/
-tmp-db/
-data/
+/testdata
+/data
+**/tmp
+**/tmp/**
+**/tmp-db
+**/tmp-db/**
+**/__pycache__
+**/__pycache__/**
+/.venv
+/.pytest_cache
 debug.log
 
 # Performance data and generated performance graphs

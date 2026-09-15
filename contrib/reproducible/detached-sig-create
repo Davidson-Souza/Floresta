@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Copyright (c) 2014-present The Bitcoin Core developers
+# Copyright (c) 2026 The Floresta developers
+# Distributed under the MIT software license; see LICENSE-MIT.
+#
+# This follows Bitcoin Core's detached-sig-create.sh workflow, using signapple
+# for macOS and osslsigncode for Windows.
+
+export LC_ALL=C
+export TZ=UTC
+set -o errexit -o nounset -o pipefail
+umask 0022
+
+usage() {
+    cat <<'EOF'
+Create detached platform signatures for an extracted Floresta codesigning archive.
+
+The archive contains a "target" file and an "unsigned" directory. Run this
+script from the archive root.
+
+Windows:
+  ./detached-sig-create <certificate.pem> <private-key.pem>
+
+macOS:
+  ./detached-sig-create <developer-id.p12> <app-store-key.p8> <issuer-id>
+
+Optional environment variables:
+  CODESIGN_PASSWORD           signing-key password (prompted when unset)
+  NOTARIZATION_PASSWORD       App Store Connect key password (macOS; prompted)
+  OSSLSIGNCODE                osslsigncode executable
+  SIGNAPPLE                   signapple executable
+  TIMESTAMP_SERVER            Authenticode timestamp URL
+  NO_TIMESTAMP=1              omit Authenticode timestamping (tests only)
+  SOURCE_DATE_EPOCH           signature archive timestamp (default: 1)
+EOF
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+read_secret() {
+    local variable_name="$1"
+    local prompt="$2"
+    local value
+
+    if [[ -n "${!variable_name:-}" ]]; then
+        return
+    fi
+    [[ -t 0 ]] || die "$variable_name must be set when stdin is not a terminal"
+    read -r -s -p "$prompt" value
+    printf '\n' >&2
+    printf -v "$variable_name" '%s' "$value"
+    export "${variable_name?}"
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+[[ -f target ]] || die 'run this script from an extracted codesigning archive root (missing target)'
+[[ -d unsigned ]] || die 'run this script from an extracted codesigning archive root (missing unsigned/)'
+target="$(<target)"
+source_date_epoch="${SOURCE_DATE_EPOCH:-1}"
+workdir="$(mktemp -d)"
+trap 'rm -rf -- "$workdir"' EXIT
+signature_root="$workdir/signatures/$target"
+mkdir -p "$signature_root"
+
+case "$target" in
+    windows-*)
+        [[ $# -eq 2 ]] || { usage >&2; exit 1; }
+        certificate="$1"
+        private_key="$2"
+        [[ -f "$certificate" ]] || die "certificate not found: $certificate"
+        [[ -f "$private_key" ]] || die "private key not found: $private_key"
+        read_secret CODESIGN_PASSWORD "Enter the passphrase for $private_key: "
+        osslsigncode="${OSSLSIGNCODE:-osslsigncode}"
+        timestamp_server="${TIMESTAMP_SERVER:-http://timestamp.comodoca.com}"
+        timestamp_args=(-t "$timestamp_server")
+        [[ -z "${NO_TIMESTAMP:-}" ]] || timestamp_args=()
+        command -v "$osslsigncode" >/dev/null || die "osslsigncode not found: $osslsigncode"
+
+        while IFS= read -r -d '' binary; do
+            relative="${binary#unsigned/}"
+            signed_binary="$workdir/signed/$relative"
+            signature="$signature_root/$relative.pem"
+            mkdir -p "$(dirname "$signed_binary")" "$(dirname "$signature")"
+            printf 'Signing %s\n' "$relative"
+            "$osslsigncode" sign \
+                -certs "$certificate" \
+                -key "$private_key" \
+                -pass "$CODESIGN_PASSWORD" \
+                "${timestamp_args[@]}" \
+                -h sha256 \
+                -in "$binary" \
+                -out "$signed_binary"
+            "$osslsigncode" extract-signature \
+                -pem \
+                -in "$signed_binary" \
+                -out "$signature"
+        done < <(find unsigned -type f -name '*.exe' -print0 | sort -z)
+        ;;
+    macos-*)
+        [[ $# -eq 3 ]] || { usage >&2; exit 1; }
+        signing_key="$1"
+        api_key="$2"
+        issuer_id="$3"
+        [[ -f "$signing_key" ]] || die "signing key not found: $signing_key"
+        [[ -f "$api_key" ]] || die "App Store Connect key not found: $api_key"
+        read_secret CODESIGN_PASSWORD "Enter the passphrase for $signing_key: "
+        read_secret NOTARIZATION_PASSWORD "Enter the passphrase for $api_key: "
+        signapple="${SIGNAPPLE:-signapple}"
+        command -v "$signapple" >/dev/null || die "signapple not found: $signapple"
+        case "$target" in
+            macos-aarch64) signature_arch=arm64 ;;
+            macos-x86_64) signature_arch=x86_64 ;;
+            *) die "unsupported macOS target: $target" ;;
+        esac
+
+        while IFS= read -r -d '' binary; do
+            relative="${binary#unsigned/}"
+            signature_dir="$signature_root/$(dirname "$relative")"
+            signed_binary="$workdir/signed/$relative"
+            mkdir -p "$signature_dir" "$(dirname "$signed_binary")"
+            printf 'Signing %s\n' "$relative"
+            signature="$signature_dir/$(basename "$binary").${signature_arch}sign"
+            "$signapple" sign \
+                -f \
+                --hardened-runtime \
+                --detach "$signature_dir" \
+                --passphrase "$CODESIGN_PASSWORD" \
+                "$signing_key" \
+                "$binary"
+            [[ -f "$signature" ]] \
+                || die "signapple did not create the expected detached signature for $relative"
+            cp "$binary" "$signed_binary"
+            "$signapple" apply \
+                "$signed_binary" \
+                "$signature"
+        done < <(find unsigned -type f -path '*/bin/*' -print0 | sort -z)
+
+        notarize_root="$(find "$workdir/signed" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+        [[ -n "$notarize_root" ]] || die 'no macOS binaries found to notarize'
+        "$signapple" notarize \
+            --passphrase "$NOTARIZATION_PASSWORD" \
+            "$api_key" \
+            "$issuer_id" \
+            "$notarize_root"
+        ;;
+    *)
+        die "unsupported codesigning target: $target"
+        ;;
+esac
+
+find "$workdir/signatures" -print0 \
+    | xargs -0r touch --no-dereference --date="@$source_date_epoch"
+output="signature-${target}.tar.gz"
+tar --create \
+    --sort=name \
+    --format=ustar \
+    --owner=0 \
+    --group=0 \
+    --numeric-owner \
+    --mtime="@$source_date_epoch" \
+    --mode='u+rw,go+r-w,a+X' \
+    --directory="$workdir/signatures" \
+    "$target" \
+  | gzip -9n > "$output"
+printf 'Created %s\n' "$output"

@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Copyright (c) The Bitcoin Core developers
+# Copyright (c) 2026 The Floresta developers
+# Distributed under the MIT software license; see LICENSE-MIT.
+#
+# The comparison model follows Bitcoin Core's contrib/guix/guix-verify.
+
+set -o errexit -o nounset -o pipefail
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/libexec/common.sh"
+
+usage() {
+    cat <<'EOF'
+Verify that independently signed build attestations are identical.
+
+Usage:
+  ATTESTATIONS_REPO=/path/to/floresta-attestations \
+    contrib/reproducible/nix-verify
+
+Environment variables:
+  VERSION=id               attestation directory (default: tag or commit ID)
+  SIGNER=name              preferred baseline signer
+  MIN_ATTESTATIONS=n       required signatures per present manifest type (default: 1)
+  GPG=/path/to/gpg          GPG executable (default: gpg)
+EOF
+}
+
+verify_set() {
+    local kind="$1"
+    shift
+    local manifests=("$@")
+    local baseline="${manifests[0]}"
+    local preferred
+    local -A signing_fingerprints=()
+
+    if [[ -n "${SIGNER:-}" ]]; then
+        preferred="$attestation_base/$SIGNER/$kind"
+        if [[ -f "$preferred" ]]; then
+            baseline="$preferred"
+        else
+            printf 'warning: preferred baseline does not exist: %s\n' "$preferred" >&2
+        fi
+    fi
+
+    local fingerprint gpg_status manifest marker signature status value
+    for manifest in "${manifests[@]}"; do
+        signature="$manifest.asc"
+        if [[ ! -f "$signature" ]]; then
+            print_error "missing detached signature: $signature"
+            failed=1
+            continue
+        fi
+        if ! gpg_status="$("$gpg" --status-fd=1 --quiet --batch --verify "$signature" "$manifest" 2>/dev/null)"; then
+            print_error "invalid GPG signature: $signature"
+            failed=1
+            continue
+        fi
+
+        fingerprint=
+        while read -r marker status value _; do
+            if [[ "$marker" == '[GNUPG:]' && "$status" == 'VALIDSIG' ]]; then
+                fingerprint="$value"
+                break
+            fi
+        done <<< "$gpg_status"
+        if [[ -z "$fingerprint" ]]; then
+            print_error "GPG did not report a valid signing fingerprint: $signature"
+            failed=1
+            continue
+        fi
+        if ! cmp --silent "$baseline" "$manifest"; then
+            print_error "attestation differs from baseline: $manifest"
+            diff -u "$baseline" "$manifest" || true
+            failed=1
+            continue
+        fi
+
+        signing_fingerprints["$fingerprint"]=1
+        printf 'Verified %s (%s)\n' "$manifest" "$fingerprint"
+    done
+
+    if (( ${#signing_fingerprints[@]} < min_attestations )); then
+        print_error "$kind has ${#signing_fingerprints[@]} distinct valid attestations; $min_attestations required"
+        failed=1
+    fi
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+[[ $# -eq 0 ]] || { usage >&2; exit 1; }
+
+check_top_directory
+require_tools git cmp comm diff sort
+[[ -n "${ATTESTATIONS_REPO:-}" ]] || { usage >&2; die 'ATTESTATIONS_REPO is required'; }
+[[ -d "$ATTESTATIONS_REPO" ]] || die "attestations repository not found: $ATTESTATIONS_REPO"
+
+gpg="${GPG:-gpg}"
+require_tools "$gpg"
+min_attestations="${MIN_ATTESTATIONS:-1}"
+[[ "$min_attestations" =~ ^[1-9][0-9]*$ ]] \
+    || die 'MIN_ATTESTATIONS must be a positive integer'
+version="$(attestation_version)"
+attestation_base="$ATTESTATIONS_REPO/$version"
+[[ -d "$attestation_base" ]] || die "no attestations found for $version"
+
+shopt -s nullglob
+noncodesigned=("$attestation_base"/*/noncodesigned.SHA256SUMS)
+all=("$attestation_base"/*/all.SHA256SUMS)
+shopt -u nullglob
+(( ${#noncodesigned[@]} > 0 )) || die "no noncodesigned attestations found for $version"
+
+failed=0
+verify_set noncodesigned.SHA256SUMS "${noncodesigned[@]}"
+if (( ${#all[@]} > 0 )); then
+    verify_set all.SHA256SUMS "${all[@]}"
+
+    baseline_noncodesigned="${noncodesigned[0]}"
+    baseline_all="${all[0]}"
+    if [[ -n "$(comm -23 <(sort "$baseline_noncodesigned") <(sort "$baseline_all"))" ]]; then
+        print_error 'all.SHA256SUMS does not contain every unsigned artifact'
+        failed=1
+    fi
+else
+    printf 'No codesigned attestations found; verified unsigned outputs only\n'
+fi
+
+(( failed == 0 )) || exit 1
+printf 'All available attestations agree for %s\n' "$version"

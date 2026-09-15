@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 The Floresta developers
+# Distributed under the MIT software license; see LICENSE-MIT.
+
+set -o errexit -o nounset -o pipefail
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/libexec/common.sh"
+
+usage() {
+    cat <<EOF
+Build deterministic release archives from one x86_64 Linux host.
+
+Usage:
+  contrib/reproducible/nix-build [target ...]
+
+Targets:
+  $DEFAULT_TARGETS
+
+With no targets, every target is built. Environment variables:
+  OUTDIR_BASE                  output directory
+  FORCE_DIRTY_WORKTREE=1       permit a non-release dirty build
+  ADDITIONAL_NIX_BUILD_FLAGS   extra whitespace-separated nix build flags
+  OUTPUT_UID / OUTPUT_GID      chown copied output (Docker convenience)
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+check_top_directory
+require_tools git nix cp mkdir sha256sum
+check_clean_worktree
+
+if [[ $# -eq 0 ]]; then
+    read -r -a targets <<< "$DEFAULT_TARGETS"
+else
+    targets=("$@")
+fi
+read -r -a additional_nix_flags <<< "${ADDITIONAL_NIX_BUILD_FLAGS:-}"
+outdir_base="$(output_base)"
+mkdir -p "$outdir_base"
+
+for target in "${targets[@]}"; do
+    validate_target "$target"
+    target_out="$outdir_base/$target"
+    [[ ! -e "$target_out" ]] \
+        || die "output already exists for $target: $target_out"
+
+    printf 'Building %s\n' "$target"
+    store_path="$(
+        nix --extra-experimental-features 'nix-command flakes' \
+            build \
+            --no-link \
+            --no-write-lock-file \
+            --print-build-logs \
+            --print-out-paths \
+            "${additional_nix_flags[@]}" \
+            ".#release-$target"
+    )"
+    [[ -n "$store_path" && "$store_path" != *$'\n'* && -d "$store_path" ]] \
+        || die "nix returned an invalid store path for $target: $store_path"
+
+    mkdir "$target_out"
+    cp -a "$store_path/." "$target_out/"
+    chmod -R u+w "$target_out"
+    (
+        cd "$target_out"
+        sha256sum --check SHA256SUMS.part
+    )
+    printf 'Wrote %s\n' "$target_out"
+done
+
+if [[ -n "${OUTPUT_UID:-}" ]]; then
+    output_gid="${OUTPUT_GID:-$OUTPUT_UID}"
+    [[ "$OUTPUT_UID" =~ ^[0-9]+$ && "$output_gid" =~ ^[0-9]+$ ]] \
+        || die 'OUTPUT_UID and OUTPUT_GID must be numeric'
+    require_tools chown
+    chown -R "$OUTPUT_UID:$output_gid" "$outdir_base"
+fi
+
+printf 'Build output: %s\n' "$outdir_base"

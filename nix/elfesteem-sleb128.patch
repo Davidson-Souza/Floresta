@@ -1,0 +1,28 @@
+diff --git a/elfesteem/macho/sections.py b/elfesteem/macho/sections.py
+index 614d870..df89953 100644
+--- a/elfesteem/macho/sections.py
++++ b/elfesteem/macho/sections.py
+@@ -344,18 +344,14 @@ class Sleb128(Uleb128):
+         if val & 0x40:
+             self.value |= (-1) << pos
+     def pack(self):
+-        if self.value == 0:
+-            return struct.pack("B", 0)
+         v = self.value
+         c = struct.pack("")
+-        while v:
+-            w = v & 0x7f
+-            if   v >  0x7f: c += struct.pack("B", w|0x80)
+-            elif v < -0x7f: c += struct.pack("B", w|0x80)
+-            else:           c += struct.pack("B", w)
++        while True:
++            byte = v & 0x7f
+             v >>= 7
+-            if v == -1: break
+-        return c
++            if (v == 0 and not byte & 0x40) or (v == -1 and byte & 0x40):
++                return c + struct.pack("B", byte)
++            c += struct.pack("B", byte | 0x80)
+ 
+ class DyldArrayGeneric(BaseSection,CArray):
+     _cls = None

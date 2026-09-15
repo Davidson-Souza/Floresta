@@ -144,10 +144,10 @@ pcc:
     just test-functional
     just check-flake
 
-# Run nix flake check if nix is available and flake files were modified
+# Run nix flake check if Nix configuration changed and nix is available
 check-flake:
-    @if command -v nix >/dev/null && git diff --name-only HEAD | grep -qE '^flake\.(nix|lock)$'; then \
-        echo "Flake files changed, running nix flake check..."; \
+    @if command -v nix >/dev/null && git diff --name-only HEAD | grep -qE '^(flake\.(nix|lock)|nix/)'; then \
+        echo "Nix configuration changed, running nix flake check..."; \
         nix flake check; \
     fi
 

@@ -11,7 +11,7 @@ use super::server::RpcImpl;
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     pub(super) fn get_memory_info(&self, mode: &str) -> Result<GetMemInfoRes, JsonRpcError> {
-        #[cfg(target_env = "gnu")]
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
         match mode {
             "stats" => {
                 let info = unsafe { libc::mallinfo() };
@@ -94,8 +94,8 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             _ => Err(JsonRpcError::InvalidMemInfoMode),
         }
 
-        #[cfg(not(any(target_env = "gnu", target_os = "macos")))]
-        // Just return zeroed stats for non-GNU and non-MacOS targets
+        #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
+        // Return zeroed stats on targets without a supported allocator API.
         match mode {
             "stats" => Ok(GetMemInfoRes::Stats(GetMemInfoStats::default())),
             "mallocinfo" => Ok(GetMemInfoRes::MallocInfo(String::new())),

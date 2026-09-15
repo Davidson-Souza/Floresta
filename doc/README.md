@@ -13,5 +13,6 @@ You can check the files below for guidance.
 - [Fuzzing](fuzzing.md)
 - [Benchmarking](benchmarking.md)
 - [Using Nix](nix.md)
+- [Reproducible cross-platform releases](reproducible-builds.md)
 - [Using Docker](docker.md)
 - [Monitoring and Metrics](metrics.md)

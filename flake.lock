@@ -1,5 +1,60 @@
 {
   "nodes": {
+    "certvalidator-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1643654359,
+        "narHash": "sha256-0yQGITuxvF75QOg+pY+k5tzKFvUeN3xpOmEUHfuZguM=",
+        "owner": "achow101",
+        "repo": "certvalidator",
+        "rev": "a145bf25eb75a9f014b3e7678826132efbba6213",
+        "type": "github"
+      },
+      "original": {
+        "owner": "achow101",
+        "repo": "certvalidator",
+        "rev": "a145bf25eb75a9f014b3e7678826132efbba6213",
+        "type": "github"
+      }
+    },
+    "elfesteem-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1656583847,
+        "narHash": "sha256-Jpfc5I7FmzVZymxeXNirVImKOc69TWGDRj8ESBm6ph8=",
+        "owner": "LRGH",
+        "repo": "elfesteem",
+        "rev": "2eb1e5384ff7a220fd1afacd4a0170acff54fe56",
+        "type": "github"
+      },
+      "original": {
+        "owner": "LRGH",
+        "repo": "elfesteem",
+        "rev": "2eb1e5384ff7a220fd1afacd4a0170acff54fe56",
+        "type": "github"
+      }
+    },
+    "fenix": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-analyzer-src": "rust-analyzer-src"
+      },
+      "locked": {
+        "lastModified": 1789388429,
+        "narHash": "sha256-DWlS3VxQTZZoeZXZFpTchRgNU/LgnrzQJK+EFPiq0Qc=",
+        "owner": "nix-community",
+        "repo": "fenix",
+        "rev": "4bb440a5be00604edd7a663f6813346f3901b5c1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "fenix",
+        "type": "github"
+      }
+    },
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": "nixpkgs-lib"
@@ -16,6 +71,19 @@
         "owner": "hercules-ci",
         "repo": "flake-parts",
         "type": "github"
+      }
+    },
+    "macos-sdk": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1620069411,
+        "narHash": "sha256-BoFWhRSHaD0j3dzDOFtGJ6DiRrdzMJhkjxztxCluFKo=",
+        "type": "tarball",
+        "url": "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz"
       }
     },
     "nixpkgs": {
@@ -67,9 +135,48 @@
     },
     "root": {
       "inputs": {
+        "certvalidator-src": "certvalidator-src",
+        "elfesteem-src": "elfesteem-src",
+        "fenix": "fenix",
         "flake-parts": "flake-parts",
+        "macos-sdk": "macos-sdk",
         "nixpkgs": "nixpkgs",
+        "signapple-src": "signapple-src",
         "treefmt-nix": "treefmt-nix"
+      }
+    },
+    "rust-analyzer-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789328305,
+        "narHash": "sha256-B6BFmC8FTRppbMpg/II53hGKB7shRv2IKi3E/HcJHaU=",
+        "owner": "rust-lang",
+        "repo": "rust-analyzer",
+        "rev": "682a84e95b5a52cf06e9822fcaa4f628738554bf",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rust-lang",
+        "ref": "nightly",
+        "repo": "rust-analyzer",
+        "type": "github"
+      }
+    },
+    "signapple-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1779818594,
+        "narHash": "sha256-97hfo4teriyaTPYWGFNAxqeApYspw7haOjyDohc6+WI=",
+        "owner": "achow101",
+        "repo": "signapple",
+        "rev": "3fab3bb57f227f0dd31007b417683035f5204838",
+        "type": "github"
+      },
+      "original": {
+        "owner": "achow101",
+        "repo": "signapple",
+        "rev": "3fab3bb57f227f0dd31007b417683035f5204838",
+        "type": "github"
       }
     },
     "treefmt-nix": {

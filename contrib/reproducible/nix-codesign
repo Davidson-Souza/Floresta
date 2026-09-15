@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Copyright (c) The Bitcoin Core developers
+# Copyright (c) 2026 The Floresta developers
+# Distributed under the MIT software license; see LICENSE-MIT.
+#
+# This follows Bitcoin Core's guix-codesign model: platform maintainers publish
+# detached signatures, and every builder applies the same signatures before
+# attesting to the final archives.
+
+set -o errexit -o nounset -o pipefail
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/libexec/common.sh"
+
+usage() {
+    cat <<EOF
+Apply detached Windows/macOS signatures and package deterministic final archives.
+
+Usage:
+  DETACHED_SIGS_REPO=/path/to/floresta-detached-sigs \\
+    contrib/reproducible/nix-codesign [target ...]
+
+Signable targets:
+  $SIGNABLE_TARGETS
+
+Environment variables:
+  OUTDIR_BASE                  output directory produced by nix-build
+  DETACHED_SIGS_REPO           clean detached-signature Git checkout (required)
+  CODESIGN_CA_FILE             CA bundle for Authenticode verification
+  FORCE_DIRTY_WORKTREE=1       permit dirty source/signature repositories
+EOF
+}
+
+package_signed_tree() {
+    local target="$1"
+    local release_root="$2"
+    local destination="$3"
+    local archive_base="$4"
+    local epoch="$5"
+
+    find "$release_root" -print0 \
+        | xargs -0r touch --no-dereference --date="@$epoch"
+    if [[ "$target" == windows-* ]]; then
+        (
+            cd "$(dirname "$release_root")"
+            find "$(basename "$release_root")" -print | sort \
+                | zip -X -9 "$destination/$archive_base.zip" -@
+        )
+    else
+        tar --create \
+            --sort=name \
+            --format=ustar \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --mtime="@$epoch" \
+            --mode='u+rw,go+r-w,a+X' \
+            --directory="$(dirname "$release_root")" \
+            "$(basename "$release_root")" \
+          | gzip -9n > "$destination/$archive_base.tar.gz"
+    fi
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+check_top_directory
+require_tools git nix realpath
+[[ -n "${DETACHED_SIGS_REPO:-}" ]] || { usage >&2; die 'DETACHED_SIGS_REPO is required'; }
+[[ -d "$DETACHED_SIGS_REPO/.git" ]] \
+    || die "detached-signature Git repository not found: $DETACHED_SIGS_REPO"
+
+if [[ -z "${FLORESTA_CODESIGN_ENV:-}" ]]; then
+    script="$(realpath "${BASH_SOURCE[0]}")"
+    exec nix --extra-experimental-features 'nix-command flakes' \
+        develop --no-write-lock-file .#codesign \
+        --command env FLORESTA_CODESIGN_ENV=1 "$script" "$@"
+fi
+
+require_tools cp find gzip mkdir mktemp mv osslsigncode sha256sum signapple sort tar touch xargs zip
+check_clean_worktree
+if [[ -z "${FORCE_DIRTY_WORKTREE:-}" \
+    && -n "$(git -C "$DETACHED_SIGS_REPO" status --porcelain --untracked-files=normal)" ]]; then
+    die 'the detached-signature repository is dirty; commit changes or set FORCE_DIRTY_WORKTREE=1'
+fi
+
+if [[ $# -eq 0 ]]; then
+    read -r -a targets <<< "$SIGNABLE_TARGETS"
+else
+    targets=("$@")
+fi
+outdir_base="$(output_base)"
+version="$(release_version)"
+epoch="$(source_date_epoch)"
+
+for target in "${targets[@]}"; do
+    validate_target "$target"
+    is_signable_target "$target" || die "target cannot be platform-signed: $target"
+    unsigned_out="$outdir_base/$target"
+    [[ -d "$unsigned_out" ]] || die "unsigned output not found: $unsigned_out"
+
+    mapfile -d '' -t codesigning_archives < <(
+        find "$unsigned_out" -maxdepth 1 -type f \
+            -name "floresta-*-$target-codesigning.tar.gz" -print0
+    )
+    [[ ${#codesigning_archives[@]} -eq 1 ]] \
+        || die "expected one codesigning archive in $unsigned_out"
+
+    signed_out="$outdir_base/$target-codesigned"
+    [[ ! -e "$signed_out" ]] || die "codesigned output already exists: $signed_out"
+    workdir="$(mktemp -d)"
+    trap 'rm -rf -- "$workdir"' EXIT
+    tar -xf "${codesigning_archives[0]}" -C "$workdir"
+
+    signing_root="$(find "$workdir" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    [[ -n "$signing_root" && -d "$signing_root/unsigned" ]] \
+        || die "invalid codesigning archive: ${codesigning_archives[0]}"
+    release_root="$(find "$signing_root/unsigned" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    [[ -n "$release_root" ]] || die 'codesigning archive has no release tree'
+    signed_root="$workdir/signed/$(basename "$release_root")"
+    mkdir -p "$(dirname "$signed_root")"
+    cp -R "$release_root" "$signed_root"
+
+    case "$target" in
+        windows-*)
+            ca_file="${CODESIGN_CA_FILE:-${NIX_SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}}"
+            [[ -f "$ca_file" ]] || die "CA bundle not found: $ca_file"
+            while IFS= read -r -d '' binary; do
+                relative="${binary#"$release_root"/}"
+                signature="$DETACHED_SIGS_REPO/$target/$(basename "$release_root")/$relative.pem"
+                [[ -f "$signature" ]] || die "detached signature not found: $signature"
+                signed_binary="$signed_root/$relative"
+                temporary_binary="$signed_binary.signed"
+                osslsigncode attach-signature \
+                    -in "$binary" \
+                    -out "$temporary_binary" \
+                    -sigin "$signature" \
+                    -CAfile "$ca_file"
+                mv "$temporary_binary" "$signed_binary"
+            done < <(find "$release_root" -type f -name '*.exe' -print0 | sort -z)
+            ;;
+        macos-*)
+            case "$target" in
+                macos-aarch64) signature_arch=arm64 ;;
+                macos-x86_64) signature_arch=x86_64 ;;
+            esac
+            while IFS= read -r -d '' binary; do
+                relative="${binary#"$release_root"/}"
+                signature="$DETACHED_SIGS_REPO/$target/$(basename "$release_root")/$relative.${signature_arch}sign"
+                [[ -f "$signature" ]] || die "detached signature not found: $signature"
+                signed_binary="$signed_root/$relative"
+                signapple apply "$signed_binary" "$signature"
+                signapple verify "$signed_binary"
+            done < <(find "$release_root" -type f -path '*/bin/*' -print0 | sort -z)
+            ;;
+    esac
+
+    mkdir "$signed_out"
+    package_signed_tree \
+        "$target" \
+        "$signed_root" \
+        "$signed_out" \
+        "floresta-$version-$target" \
+        "$epoch"
+    (
+        cd "$signed_out"
+        sha256sum floresta-* | sort -k2 > SHA256SUMS.part
+        sha256sum --check SHA256SUMS.part
+    )
+    rm -rf -- "$workdir"
+    trap - EXIT
+    printf 'Wrote %s\n' "$signed_out"
+done
