@@ -3,7 +3,6 @@
 use core::error;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -21,13 +20,13 @@ use floresta_common::get_hash_from_u8;
 use floresta_common::get_spk_hash;
 use floresta_common::spsc::Channel;
 use floresta_common::try_and_log;
-use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
-use floresta_compact_filters::network_filters::NetworkFilters;
+use floresta_compact_filters::filters_man::FilterManHandle;
+use floresta_compact_filters::filters_man::RescanRequest;
+use floresta_compact_filters::filters_man::RescanStatus;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::CachedTransaction;
 use floresta_watch_only::kv_database::KvDatabase;
 use floresta_wire::node_handle::NodeHandle;
-use floresta_wire::node_interface::ChainMethods;
 use floresta_wire::node_interface::MempoolMethods;
 use serde_json::Value;
 use serde_json::json;
@@ -207,13 +206,12 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
     /// clients when a new transaction is received.
     client_addresses: HashMap<sha256::Hash, Arc<Client>>,
 
-    /// A Arc-ed copy of the block filters backend that we can use to check if a
-    /// block contains a transaction that we are interested in.
-    block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
-
     /// An interface to a running node, used to broadcast transactions and request
     /// blocks.
     node_interface: NodeHandle,
+
+    /// Compact-filter service used for historical rescans.
+    filter_handle: Option<FilterManHandle>,
 
     /// A list of addresses that we've just learned about and need to rescan for
     /// transactions.
@@ -229,12 +227,12 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
     last_rebroadcast: Option<Instant>,
 }
 
-impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
+impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blockchain> {
     pub fn new(
         address_cache: Arc<AddressCache<KvDatabase>>,
         chain: Arc<Blockchain>,
-        block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
         node_interface: NodeHandle,
+        filter_handle: Option<FilterManHandle>,
     ) -> Result<Self, Box<dyn error::Error>> {
         let (tx, rx) = unbounded_channel();
 
@@ -242,8 +240,8 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             last_rebroadcast: None,
             chain,
             address_cache,
-            block_filters,
             node_interface,
+            filter_handle,
             clients: HashMap::new(),
             message_receiver: rx,
             message_transmitter: tx,
@@ -604,7 +602,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 self.last_rebroadcast = Some(Instant::now());
             }
 
-            // rescan for new addresses, if any
+            // Rescan for scripts learned through the scriptpubkey endpoints.
             if !self.addresses_to_scan.is_empty() {
                 if self.chain.is_in_ibd() {
                     continue;
@@ -614,77 +612,57 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                     self.address_cache.cache_address(address.clone());
                 });
 
-                info!("Catching up with addresses {:?}", self.addresses_to_scan);
-                let addresses: Vec<_> = mem::take(&mut self.addresses_to_scan);
-                self.rescan_for_addresses(addresses).await?;
+                let addresses = std::mem::take(&mut self.addresses_to_scan);
+                info!("Catching up with addresses {addresses:?}");
+                if let Err(error) = self.rescan_for_addresses(&addresses).await {
+                    error!(%error, "Electrum script rescan failed");
+                    if !matches!(error, super::error::Error::CompactFiltersDisabled) {
+                        self.addresses_to_scan.extend(addresses);
+                    }
+                }
             }
         }
     }
 
-    /// If a user adds a new address that we didn't have cached, this method
-    /// will look for historical transactions for it.
-    ///
-    /// Usually, we'll rely on compact block filters to speed things up. If
-    /// we don't have compact block filters, we may rescan using the older,
-    /// more bandwidth-intensive method of actually downloading blocks.
     async fn rescan_for_addresses(
         &mut self,
-        addresses: Vec<ScriptBuf>,
+        addresses: &[ScriptBuf],
     ) -> Result<(), super::error::Error> {
-        // If compact block filters are enabled, use them. Otherwise, fallback
-        // to the "old-school" rescaning.
-        if let Some(cfilters) = &self.block_filters {
-            self.rescan_with_block_filters(cfilters.clone(), None, None, addresses)
-                .await?;
+        let filters = self
+            .filter_handle
+            .clone()
+            .ok_or(super::error::Error::CompactFiltersDisabled)?;
+        let ticket = filters
+            .rescan(RescanRequest::new(addresses.to_vec()))
+            .await
+            .map_err(|error| super::error::Error::CompactFilters(error.to_string()))?;
+
+        loop {
+            let blocks = filters
+                .get_blocks(ticket)
+                .await
+                .map_err(|error| super::error::Error::CompactFilters(error.to_string()))?;
+            for block in blocks {
+                let height = self
+                    .chain
+                    .get_block_height(&block.block_hash())
+                    .map_err(|error| super::error::Error::Blockchain(Box::new(error)))?
+                    .ok_or(super::error::Error::InvalidParams)?;
+                self.handle_block(block, height);
+            }
+
+            match filters
+                .get_info(ticket)
+                .await
+                .map_err(|error| super::error::Error::CompactFilters(error.to_string()))?
+            {
+                RescanStatus::Finished => return Ok(()),
+                RescanStatus::Available => continue,
+                RescanStatus::Started | RescanStatus::Waiting => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
-
-        Ok(())
-    }
-
-    /// If we have compact block filters enabled, this method will use them to
-    /// find blocks of interest and download for our wallet to learn about new
-    /// transactions, once a new address is added by subscription.
-    async fn rescan_with_block_filters(
-        &mut self,
-        cfilters: Arc<NetworkFilters<FlatFiltersStore>>,
-        start_height: Option<u32>,
-        stop_height: Option<u32>,
-        addresses: Vec<ScriptBuf>,
-    ) -> Result<(), super::error::Error> {
-        // By default, we look from 1..tip
-        let mut _addresses = addresses
-            .iter()
-            .map(|address| address.as_bytes())
-            .collect::<Vec<_>>();
-
-        let Ok(blocks) =
-            cfilters.match_any(_addresses, start_height, stop_height, self.chain.clone())
-        else {
-            self.addresses_to_scan.extend(addresses); // push them back to get a retry
-            return Ok(());
-        };
-
-        info!("filters told us to scan blocks: {blocks:?}");
-
-        // Tells users about the transactions we found
-        for block in blocks {
-            let block = self.node_interface.get_block(block).await;
-            let Ok(Some(block)) = block else {
-                self.addresses_to_scan.extend(addresses); // push them back to get a retry
-                return Ok(());
-            };
-
-            let height = self
-                .chain
-                .get_block_height(&block.block_hash())
-                .ok()
-                .flatten()
-                .unwrap();
-
-            self.handle_block(block, height);
-        }
-
-        Ok(())
     }
 
     fn process_history(transactions: &[CachedTransaction]) -> Vec<Value> {
@@ -1119,7 +1097,6 @@ mod test {
                 u_config,
                 chain.clone(),
                 Arc::new(Mutex::new(Mempool::new(MEMPOOL_SIZE))),
-                None,
                 Arc::new(RwLock::new(false)),
                 AddressMan::new(None, &ReachableNetworks::SUPPORTED),
             )
@@ -1131,7 +1108,8 @@ mod test {
         let tls_acceptor = tls_config.map(TlsAcceptor::from);
 
         let electrum_server: ElectrumServer<ChainState<FlatChainStore>> =
-            ElectrumServer::new(wallet, chain, None, node_interface).unwrap();
+            ElectrumServer::new(wallet, chain, node_interface, None).unwrap();
+
         let non_tls_listener = Arc::new(TcpListener::bind(e_addr).await.unwrap());
         let assigned_port = non_tls_listener.local_addr().unwrap().port();
 

@@ -20,6 +20,11 @@ pub enum Error {
     Mempool(Box<dyn error::Error + Send + 'static>),
     /// The node is unresponsive.
     NodeHandle(oneshot::error::RecvError),
+    /// Compact-filter synchronization or rescan failed.
+    CompactFilters(String),
+
+    /// Historical rescans are unavailable because compact filters are disabled.
+    CompactFiltersDisabled,
 }
 
 impl fmt::Display for Error {
@@ -31,6 +36,8 @@ impl fmt::Display for Error {
             Self::Io(e) => write!(f, "IO error: {e}"),
             Self::Mempool(e) => writeln!(f, "Mempool error: {e}"),
             Self::NodeHandle(e) => write!(f, "The node is unresponsive: {e}"),
+            Self::CompactFilters(error) => write!(f, "Compact-filter error: {error}"),
+            Self::CompactFiltersDisabled => write!(f, "Compact filters are disabled"),
         }
     }
 }
@@ -44,6 +51,7 @@ impl error::Error for Error {
             Self::Io(e) => Some(e),
             Self::Mempool(e) => Some(e.as_ref()),
             Self::NodeHandle(e) => Some(e),
+            Self::CompactFilters(_) | Self::CompactFiltersDisabled => None,
         }
     }
 }

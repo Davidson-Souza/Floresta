@@ -86,6 +86,18 @@ class ElectrumClient(BaseClient):
         """
         return self.request("blockchain.scripthash.unsubscribe", [script_hash])
 
+    def get_scriptpubkey_balance(self, script: str):
+        """Return the confirmed and unconfirmed balance of a script."""
+        return self.request("blockchain.scriptpubkey.get_balance", [script])
+
+    def get_scriptpubkey_history(self, script: str):
+        """Return the confirmed and unconfirmed history of a script."""
+        return self.request("blockchain.scriptpubkey.get_history", [script])
+
+    def subscribe_scriptpubkey(self, script: str):
+        """Subscribe to a script and trigger a historical rescan."""
+        return self.request("blockchain.scriptpubkey.subscribe", [script])
+
     def broadcast(self, tx: str):
         """
         Broadcast a transaction to the network.
