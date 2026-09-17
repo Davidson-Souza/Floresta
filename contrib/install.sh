@@ -16,7 +16,6 @@ assume_valid=""
 assume_utreexo=false
 enable_tls=false
 enable_cfilters=false
-filters_start_height=""
 connect=""
 zeromq=""
 network="bitcoin"
@@ -74,11 +73,8 @@ show_usage() {
     echo "                                   (default: '')"
     echo "  -v  --assume-valid <BLOCK_HASH>  Pass --assume-valid=<BLOCK_HASH> onto built service"
     echo "                                   (default: '')"
-    echo "  -f, --filters <HEIGHT>           Pass --filters-start-height=<HEIGHT> onto"
-    echo "                                   built service. If the value is negative, it's relative"
-    echo "                                   to the current tip; e.g., if the current tip is 1000 and"
-    echo "                                   we set this value to -100, we will start downloading"
-    echo "                                   from height 900 (default: disabled)."
+    echo "  -f, --filters                    Enable compact-filter synchronization in the"
+    echo "                                   built service (default: disabled)."
     echo "  -u, --assume-utreexo             Pass --assume-utreexo onto built service"
     echo "                                   (default: disabled)."
     echo "  -s, --tls                        Enable TLS in Floresta Electrum server. This will create"
@@ -155,8 +151,7 @@ while true; do
     -f | --filters)
         check_interactive_mode
         enable_cfilters=true
-        filters_start_height="$2"
-        shift 2
+        shift
         ;;
     -t | --tag)
         check_interactive_mode
@@ -433,7 +428,7 @@ After=network-online.target time-set.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/florestad --daemon --network $network --data-dir $florestaDir --config-file $florestaLib/config.toml --pid-file $florestaRun/florestad.pid --log-to-file$([ -n "$proxy" ] && echo " --proxy $proxy ")$([ -n "$connect" ] && echo " --connect $connect ")$([ -n "$zeromq" ] && echo " --zmq-address $zeromq ")$([ -n "$assume_valid" ] && echo " --assume-valid $assume_valid ")$([ "$assume_utreexo" = true ] && echo " --assume-utreexo ")$([ "$enable_cfilters" = false ] && echo " --no-cfilters ")$([ -n "$filters_start_height" ] && echo " --filters-start-height \"$filters_start_height\" ")$([ "$enable_tls" == true ] && echo " --generate-cert --enable-electrum-tls")
+ExecStart=/usr/local/bin/florestad --daemon --network $network --data-dir $florestaDir --config-file $florestaLib/config.toml --pid-file $florestaRun/florestad.pid --log-to-file$([ -n "$proxy" ] && echo " --proxy $proxy ")$([ -n "$connect" ] && echo " --connect $connect ")$([ -n "$zeromq" ] && echo " --zmq-address $zeromq ")$([ -n "$assume_valid" ] && echo " --assume-valid $assume_valid ")$([ "$assume_utreexo" = true ] && echo " --assume-utreexo ")$([ "$enable_cfilters" = false ] && echo " --no-cfilters ")$([ "$enable_tls" == true ] && echo " --generate-cert --enable-electrum-tls")
 
 # Ensure that the service is ready after the MainPID exists
 Type=forking
@@ -1024,42 +1019,17 @@ interactive_zeromq() {
 
 # func: interactive_filters
 #
-# Ask if user want to use --no-cfilters or not
+# Ask whether the compact-filter manager should be enabled.
 interactive_filters() {
-    local filters_start_height_regex="^-?[0-9]+$"
+    if dialog --title "Floresta-Installer (Compact filters)" \
+        --yesno "Enable compact-filter synchronization for historical wallet rescans?" 10 60; then
+        enable_cfilters=true
+    else
+        enable_cfilters=false
+    fi
 
-    while true; do
-        # Prompt user for filters_start_height input
-        filters_start_height=$(dialog --title "Floresta-Installer (Set enable filters)" \
-            --inputbox $'Do you want to use \'cfilters\' and \'filters-start-height\'?\n\n"cfilters" let you query for chain data after IBD, like wallet rescan, finding a utxo, finding specific tx_ids. Will cause more disk usage.\n\n"filters-start-height" download block filters starting at this height. Negative numbers are relative to the current tip. For example, if the current tip is at height 1000, and we set this value to -100, we will start downloading filters from height 900.\n' \
-            20 60 \
-            3>&1 1>&2 2>&3)
-        result=$?
-
-        check_dialog_escape
-
-        # Check if user pressed Cancel or ESC
-        if [ "$result" -ne 0 ]; then
-            enable_cfilters=false
-            dialog --title "Floresta-Installer (Set enable filters)" --msgbox "❌ Enable filters input canceled. Returning to setup menu." 8 45
-            check_dialog_escape
-            interactive_advanced_setup
-            return 1
-        fi
-
-        # Validate filters format
-        if [[ "$filters_start_height" =~ $filters_start_height_regex ]]; then
-            enable_cfilters=true
-            dialog --title "Floresta-Installer (Set enable filters)" --msgbox "✅ Enable filters set successfully: $filters_start_height" 10 60
-            check_dialog_escape
-            interactive_advanced_setup
-            return 0
-        else
-            enable_cfilters=false
-            dialog --title "Invalid filter start height" --msgbox "❌ The filters start height you entered is invalid.\n\nIt should be in the format:\n- Positive number (1, 2, 3...)\n- Negative number (-1, -2, -3...)\n\nReturning to setup menu." 12 60
-            check_dialog_escape
-        fi
-    done
+    check_dialog_escape
+    interactive_advanced_setup
 }
 
 # func: interactive_ask_assume_valid
@@ -1363,7 +1333,7 @@ interactive_review() {
     review_message+="Proxy:              $([ -n "$proxy" ] && echo "$proxy" || echo "Not configured")\n"
     review_message+="ZeroMQ:             $([ -n "$zeromq" ] && echo "$zeromq" || echo "Not configured")\n"
     review_message+="Connect to:         $([ -n "$connect" ] && echo "$connect" || echo "Not configured")\n"
-    review_message+="Filters:            $([ -n "$filters_start_height" ] && echo "$filters_start_height" || echo "Not configured")\n"
+    review_message+="Compact filters:    $([ "$enable_cfilters" = true ] && echo "Enabled" || echo "Disabled")\n"
     review_message+="Assume valid:       $([ -n "$assume_valid" ] && echo "$assume_valid" || echo "Not configured")\n"
     review_message+="Assume utreexo:     $assume_utreexo\n"
     review_message+="Enable TLS:         $enable_tls\n"

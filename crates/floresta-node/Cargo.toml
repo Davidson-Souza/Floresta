@@ -28,7 +28,7 @@ time = { workspace = true }
 
 # Local dependencies
 floresta-chain = { workspace = true, features = ["bitcoinkernel"] }
-floresta-compact-filters = { workspace = true, optional = true }
+floresta-compact-filters = { workspace = true }
 floresta-common = { workspace = true }
 floresta-domain = { workspace = true }
 floresta-electrum = { workspace = true }
@@ -47,7 +47,7 @@ libc = { version = "=0.2.186" }
 libc = { version = "=0.2.186" }
 
 [features]
-compact-filters = ["dep:floresta-compact-filters"]
+compact-filters = []
 zmq-server = ["dep:zmq"]
 json-rpc = ["dep:axum", "dep:tower-http", "compact-filters"]
 default = ["json-rpc"]

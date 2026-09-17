@@ -13,26 +13,25 @@ use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(feature = "json-rpc")]
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use bitcoin::Address;
 pub use bitcoin::Network;
 use bitcoin::ScriptBuf;
 pub use floresta_chain::AssumeUtreexoValue;
 pub use floresta_chain::AssumeValidArg;
+use floresta_chain::BlockchainInterface;
 use floresta_chain::ChainParams;
 use floresta_chain::ChainState;
 use floresta_chain::FlatChainStore as ChainStore;
 use floresta_chain::FlatChainStoreConfig;
-#[cfg(feature = "zmq-server")]
-use floresta_chain::pruned_utreexo::BlockchainInterface;
+use floresta_chain::pruned_utreexo::IBDState;
 use floresta_chain::pruned_utreexo::merkle::ConsensusMerkle;
 #[cfg(feature = "json-rpc")]
 use floresta_common::NetworkExt;
 use floresta_common::try_and_log;
-#[cfg(feature = "compact-filters")]
-use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
-#[cfg(feature = "compact-filters")]
-use floresta_compact_filters::network_filters::NetworkFilters;
+use floresta_compact_filters::FlatFilterStore;
+use floresta_compact_filters::filters_man::FiltersMan;
 use floresta_domain::mempool::MempoolBase;
 use floresta_electrum::electrum_protocol::ElectrumServer;
 use floresta_electrum::electrum_protocol::client_accept_loop;
@@ -52,8 +51,7 @@ use rcgen::KeyPair;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task;
-#[cfg(feature = "metrics")]
-use tokio::time::Duration;
+use tokio::time::sleep;
 #[cfg(feature = "metrics")]
 use tokio::time::{self};
 use tokio_rustls::TlsAcceptor;
@@ -137,22 +135,10 @@ pub struct Config {
     /// The network we are running in, it may be one of: bitcoin, signet, regtest or testnet.
     pub network: Network,
 
-    /// Whether we should build and store compact block filters
+    /// Whether compact-filter headers should be synchronized for historical rescans.
     ///
-    /// Those filters are used for rescanning our wallet for historical transactions. If you don't
-    /// have this on, the only way to find historical transactions is to download all blocks, which
-    /// is very inefficient and resource/time consuming. But keep in mind that filters will take
-    /// up disk space.
+    /// Every filter header is persisted, while only a bounded number of full filters are cached.
     pub cfilters: bool,
-
-    /// If we are using block filters, we may not need to download the whole chain of filters, as
-    /// our wallets may not have been created at the beginning of the chain. With this option, we
-    /// can make a rough estimate of the block height we need to start downloading filters.
-    ///
-    /// If the value is negative, it's relative to the current tip. For example, if the current tip
-    /// is at height 1000, and we set this value to -100, we will start downloading filters from
-    /// height 900.
-    pub filters_start_height: Option<i32>,
 
     #[cfg(feature = "zmq-server")]
     /// The address to listen to for our ZMQ server
@@ -239,7 +225,6 @@ impl Config {
             proxy: None,
             network,
             cfilters: false,
-            filters_start_height: None,
             #[cfg(feature = "zmq-server")]
             zmq_address: None,
             connect: Vec::new(),
@@ -385,24 +370,6 @@ impl Florestad {
             self.config.assume_valid,
         )?);
 
-        #[cfg(feature = "compact-filters")]
-        let cfilters = if self.config.cfilters {
-            let filter_store = FlatFiltersStore::new(datadir.join("cfilters"));
-            let cfilters = Arc::new(NetworkFilters::new(filter_store));
-
-            let height = cfilters
-                .get_height()
-                .map_err(FlorestadError::CouldNotLoadCompactFiltersStore)?;
-
-            info!("Loaded compact filters store at height {height}");
-            Some(cfilters)
-        } else {
-            None
-        };
-
-        #[cfg(not(feature = "compact-filters"))]
-        let cfilters = None;
-
         // If this network already allows pow fraud proofs, we should use it instead of assumeutreexo
         let assume_utreexo = match self.config.assume_utreexo {
             true => Some(ChainParams::get_assume_utreexo(self.config.network)),
@@ -424,10 +391,8 @@ impl Florestad {
             proxy,
             datadir: datadir.into(),
             fixed_peers: self.config.connect.clone(),
-            compact_filters: self.config.cfilters,
             assume_utreexo: self.config.assumeutreexo_value.clone().or(assume_utreexo),
             backfill: self.config.backfill,
-            filter_start_height: self.config.filters_start_height,
             user_agent: self.config.user_agent.clone(),
             allow_v1_fallback: self.config.allow_v1_fallback,
             ..Default::default()
@@ -448,7 +413,6 @@ impl Florestad {
             config,
             blockchain_state.clone(),
             mempool,
-            cfilters.clone(),
             kill_signal.clone(),
             AddressMan::new(None, &ReachableNetworks::SUPPORTED),
         )
@@ -474,6 +438,30 @@ impl Florestad {
         info!("Starting server");
         let wallet = Arc::new(wallet);
 
+        let filter_handle = if self.config.cfilters {
+            let path = datadir.join("cfilter_headers.dat");
+            let store = FlatFilterStore::new(&path)
+                .map_err(FlorestadError::CouldNotLoadCompactFiltersStore)?;
+            let manager =
+                FiltersMan::new(store, chain_provider.get_handle(), blockchain_state.clone());
+            blockchain_state.subscribe(manager.block_consumer());
+            let handle = manager.get_handle();
+            let filter_chain = blockchain_state.clone();
+
+            task::spawn(async move {
+                while filter_chain.ibd_state() == IBDState::HeadersSync {
+                    sleep(Duration::from_secs(1)).await;
+                }
+                info!("Starting compact-filter synchronization");
+                if let Err(error) = manager.main_loop().await {
+                    error!(%error, "Compact-filter manager stopped");
+                }
+            });
+            Some(handle)
+        } else {
+            None
+        };
+
         // JSON-RPC
         #[cfg(feature = "json-rpc")]
         {
@@ -481,9 +469,9 @@ impl Florestad {
                 blockchain_state.clone(),
                 wallet.clone(),
                 chain_provider.get_handle(),
+                filter_handle.clone(),
                 self.stop_signal.clone(),
                 self.config.network,
-                cfilters.clone(),
                 self.config
                     .json_rpc_address
                     .as_ref()
@@ -506,8 +494,8 @@ impl Florestad {
         let electrum_server = ElectrumServer::new(
             wallet,
             blockchain_state,
-            cfilters,
             chain_provider.get_handle(),
+            filter_handle,
         )
         .map_err(FlorestadError::CouldNotCreateElectrumServer)?;
 

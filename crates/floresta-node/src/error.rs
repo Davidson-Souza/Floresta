@@ -10,8 +10,7 @@ use std::path::PathBuf;
 use bitcoin::consensus::encode;
 use floresta_chain::BlockValidationErrors;
 use floresta_chain::BlockchainError;
-#[cfg(feature = "compact-filters")]
-use floresta_compact_filters::IterableFilterStoreError;
+use floresta_compact_filters::FlatFilterStoreError;
 use floresta_watch_only::WatchOnlyError;
 use floresta_watch_only::descriptor::DescriptorError;
 use floresta_watch_only::kv_database::KvDatabaseError;
@@ -88,9 +87,8 @@ pub enum FlorestadError {
     /// Setting up the watch-only wallet.
     CouldNotSetupWallet(String),
 
-    #[cfg(feature = "compact-filters")]
-    /// Loading the compact filters store.
-    CouldNotLoadCompactFiltersStore(IterableFilterStoreError),
+    /// Invalid assumed valid value.
+    InvalidAssumeValid(bitcoin::hex::HexToArrayError),
 
     /// Failed to create a chain provider.
     CouldNotCreateChainProvider(String),
@@ -121,6 +119,9 @@ pub enum FlorestadError {
 
     /// Load a flat chain store error.
     CouldNotLoadFlatChainStore(BlockchainError),
+
+    /// Failed to open the compact filter-header store.
+    CouldNotLoadCompactFiltersStore(FlatFilterStoreError),
 }
 
 impl Display for FlorestadError {
@@ -185,12 +186,9 @@ impl Display for FlorestadError {
             Self::CouldNotSetupWallet(err) => {
                 write!(f, "Could not setup wallet: {err}")
             }
-
-            #[cfg(feature = "compact-filters")]
-            Self::CouldNotLoadCompactFiltersStore(err) => {
-                write!(f, "Could not load compact filters store: {err}")
+            Self::InvalidAssumeValid(error) => {
+                write!(f, "Invalid assumed valid value: {error}")
             }
-
             Self::CouldNotCreateChainProvider(err) => {
                 write!(f, "Could not create chain provider: {err}")
             }
@@ -224,6 +222,9 @@ impl Display for FlorestadError {
             }
             Self::CouldNotLoadFlatChainStore(err) => {
                 write!(f, "Failure while loading flat chainstore: {err:?}")
+            }
+            Self::CouldNotLoadCompactFiltersStore(error) => {
+                write!(f, "Could not load compact filter-header store: {error}")
             }
         }
     }

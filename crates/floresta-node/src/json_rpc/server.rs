@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use axum::Json;
@@ -37,13 +38,13 @@ use corepc_types::v31::RawTransactionInput;
 use corepc_types::v31::RawTransactionOutput;
 use floresta_chain::ThreadSafeChain;
 use floresta_common::NetworkExt;
-use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
-use floresta_compact_filters::network_filters::NetworkFilters;
+use floresta_compact_filters::filters_man::FilterManHandle;
+use floresta_compact_filters::filters_man::RescanRequest;
+use floresta_compact_filters::filters_man::RescanStatus;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::CachedTransaction;
 use floresta_watch_only::kv_database::KvDatabase;
 use floresta_wire::node_handle::NodeHandle;
-use floresta_wire::node_interface::ChainMethods;
 use floresta_wire::node_interface::MempoolMethods;
 use serde_json::Value;
 use serde_json::json;
@@ -83,11 +84,11 @@ pub trait RpcChain: ThreadSafeChain + Clone {}
 impl<T> RpcChain for T where T: ThreadSafeChain + Clone {}
 
 pub struct RpcImpl<Blockchain: RpcChain> {
-    pub(super) block_filter_storage: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
     pub(super) network: Network,
     pub(super) chain: Blockchain,
     pub(super) wallet: Arc<AddressCache<KvDatabase>>,
     pub(super) node: NodeHandle,
+    pub(super) filters: Option<FilterManHandle>,
     pub(super) kill_signal: Arc<RwLock<bool>>,
     pub(super) inflight: Arc<RwLock<HashMap<Value, InflightRpc>>>,
     pub(super) log_path: PathBuf,
@@ -124,19 +125,20 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         info!("Descriptor pushed: {descriptor}");
         debug!("Rescanning with block filters for addresses: {addresses:?}");
 
-        let addresses = self.wallet.get_cached_addresses();
-        let wallet = self.wallet.clone();
-        let cfilters = self
-            .block_filter_storage
-            .as_ref()
-            .ok_or(JsonRpcError::NoBlockFilters)?
-            .clone();
-        let node = self.node.clone();
-        let chain = self.chain.clone();
+        if addresses.is_empty() {
+            return Ok(true);
+        }
 
-        tokio::task::spawn(Self::rescan_with_block_filters(
-            addresses, chain, wallet, cfilters, node, None, None,
-        ));
+        let filters = self.filters.clone().ok_or(JsonRpcError::NoBlockFilters)?;
+        let chain = self.chain.clone();
+        let wallet = self.wallet.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                Self::rescan_with_block_filters(addresses, chain, wallet, filters, None, None).await
+            {
+                error!(?error, "descriptor rescan failed");
+            }
+        });
 
         Ok(true)
     }
@@ -151,43 +153,32 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let (start_height, stop_height) =
             self.get_rescan_interval(use_timestamp, start, stop, confidence)?;
 
-        if stop_height != 0 && start_height >= stop_height {
-            // When stop height is a non zero value it needs atleast to be greater than start_height.
+        if stop_height != 0 && start_height > stop_height {
             return Err(JsonRpcError::InvalidRescanVal);
         }
-
-        // if we are on ibd, we don't have any filters to rescan
         if self.chain.is_in_ibd() {
             return Err(JsonRpcError::InInitialBlockDownload);
         }
 
         let addresses = self.wallet.get_cached_addresses();
-
         if addresses.is_empty() {
             return Err(JsonRpcError::NoAddressesToRescan);
         }
 
-        let wallet = self.wallet.clone();
-
-        let cfilters = self
-            .block_filter_storage
-            .as_ref()
-            .ok_or(JsonRpcError::NoBlockFilters)?
-            .clone();
-
-        let node = self.node.clone();
-
+        let filters = self.filters.clone().ok_or(JsonRpcError::NoBlockFilters)?;
         let chain = self.chain.clone();
+        let wallet = self.wallet.clone();
+        tokio::spawn(async move {
+            let start = (start_height != 0).then_some(start_height);
+            let stop = (stop_height != 0).then_some(stop_height);
+            if let Err(error) =
+                Self::rescan_with_block_filters(addresses, chain, wallet, filters, start, stop)
+                    .await
+            {
+                error!(?error, "blockchain rescan failed");
+            }
+        });
 
-        tokio::task::spawn(Self::rescan_with_block_filters(
-            addresses,
-            chain,
-            wallet,
-            cfilters,
-            node,
-            (start_height != 0).then_some(start_height), // Its ugly but to maintain the API here its necessary to recast to a Option.
-            (stop_height != 0).then_some(stop_height),
-        ));
         Ok(true)
     }
 
@@ -502,38 +493,45 @@ async fn cannot_get(_state: State<Arc<RpcImpl<impl RpcChain>>>) -> Json<Value> {
 }
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
-    async fn rescan_with_block_filters(
+    pub(super) async fn rescan_with_block_filters(
         addresses: Vec<ScriptBuf>,
         chain: Blockchain,
         wallet: Arc<AddressCache<KvDatabase>>,
-        cfilters: Arc<NetworkFilters<FlatFiltersStore>>,
-        node: NodeHandle,
+        filters: FilterManHandle,
         start_height: Option<u32>,
         stop_height: Option<u32>,
     ) -> Result<()> {
-        let blocks = cfilters
-            .match_any(
-                addresses.iter().map(|a| a.as_bytes()).collect(),
-                start_height,
-                stop_height,
-                chain.clone(),
-            )
-            .map_err(|e| JsonRpcError::Filters(e.to_string()))?;
+        let request = RescanRequest::new(addresses).with_range(start_height, stop_height);
+        let ticket = filters
+            .rescan(request)
+            .await
+            .map_err(|error| JsonRpcError::Filters(error.to_string()))?;
 
-        info!("rescan filter hits: {blocks:?}");
-
-        for block in blocks {
-            if let Ok(Some(block)) = node.get_block(block).await {
+        loop {
+            for block in filters
+                .get_blocks(ticket)
+                .await
+                .map_err(|error| JsonRpcError::Filters(error.to_string()))?
+            {
                 let height = chain
                     .get_block_height(&block.block_hash())
                     .map_err(|_| JsonRpcError::Chain)?
                     .ok_or(JsonRpcError::BlockNotFound)?;
-
                 wallet.block_process(&block, height);
             }
-        }
 
-        Ok(())
+            match filters
+                .get_info(ticket)
+                .await
+                .map_err(|error| JsonRpcError::Filters(error.to_string()))?
+            {
+                RescanStatus::Finished => return Ok(()),
+                RescanStatus::Available => continue,
+                RescanStatus::Started | RescanStatus::Waiting => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
 
     fn make_vin(&self, input: TxIn, is_coinbase: bool) -> RawTransactionInput {
@@ -663,9 +661,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         chain: Blockchain,
         wallet: Arc<AddressCache<KvDatabase>>,
         node: NodeHandle,
+        filters: Option<FilterManHandle>,
         kill_signal: Arc<RwLock<bool>>,
         network: Network,
-        block_filter_storage: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
         address: Option<SocketAddr>,
         log_path: impl AsRef<Path>,
         user_agent: String,
@@ -705,9 +703,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 chain,
                 wallet,
                 node,
+                filters,
                 kill_signal,
                 network,
-                block_filter_storage,
                 inflight: Arc::new(RwLock::new(HashMap::new())),
                 log_path: log_path.as_ref().into(),
                 start_time: Instant::now(),

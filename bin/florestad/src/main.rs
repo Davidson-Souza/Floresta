@@ -84,7 +84,6 @@ fn main() {
         json_rpc_address: params.rpc_address,
         generate_cert: params.generate_cert,
         wallet_descriptor: params.wallet_descriptor,
-        filters_start_height: params.filters_start_height,
         user_agent: env!("USER_AGENT").to_owned(),
         assumeutreexo_value: None,
         electrum_address: params.electrum_address,

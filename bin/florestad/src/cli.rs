@@ -108,10 +108,6 @@ pub struct Cli {
     /// The address where our json-rpc server should listen to, in the format `<address>[:<port>]`
     pub rpc_address: Option<String>,
 
-    #[arg(long, value_name = "HEIGHT")]
-    /// Download block filters starting at this height. Negative numbers are relative to the current tip.
-    pub filters_start_height: Option<i32>,
-
     #[arg(long, default_value_t = false)]
     /// Whether assume utreexo should be disabled.
     ///
