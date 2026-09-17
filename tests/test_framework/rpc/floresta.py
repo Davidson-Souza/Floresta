@@ -40,3 +40,9 @@ class FlorestaRPC(BaseRPC):
         Load a script descriptor into the wallet.
         """
         return self.perform_request("loaddescriptor", params=[descriptor])
+
+    def find_tx_out(self, txid: str, vout: int, script: str, height: int):
+        """
+        Find an output by rescanning compact filters from the given height.
+        """
+        return self.perform_request("findtxout", params=[txid, vout, script, height])
