@@ -630,6 +630,7 @@ where
         blocks: &mpsc::Sender<Block>,
     ) -> Result<(), FilterManError> {
         let mut batch_start = start;
+        let mut matching_blocks = tracing::enabled!(tracing::Level::DEBUG).then(Vec::new);
         loop {
             let batch_end = batch_start.saturating_add(FILTER_BATCH_SIZE - 1).min(end);
             let filters = loop {
@@ -685,9 +686,20 @@ where
                     .send(block)
                     .await
                     .map_err(|_| FilterManError::ManagerStopped)?;
+                if let Some(matching_blocks) = &mut matching_blocks {
+                    matching_blocks.push(block_hash);
+                }
             }
 
             if batch_end == end {
+                if let Some(matching_blocks) = matching_blocks {
+                    debug!(
+                        start,
+                        end,
+                        ?matching_blocks,
+                        "compact-filter rescan finished"
+                    );
+                }
                 return Ok(());
             }
             batch_start = batch_end + 1;
