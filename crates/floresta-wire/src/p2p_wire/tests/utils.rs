@@ -327,7 +327,6 @@ pub async fn setup_node(
         config,
         chain.clone(),
         mempool,
-        None,
         kill_signal.clone(),
         AddressMan::new(None, &[]),
     )

@@ -202,6 +202,26 @@ where
 
                 return;
             }
+
+            UserRequest::GetCFilter { height, block_hash } => {
+                let request = NodeRequest::GetFilter((block_hash, height));
+                if let Ok(peer) = self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
+                    self.inflight_user_requests
+                        .insert(user_req, (peer, Instant::now(), responder));
+                }
+
+                return;
+            }
+
+            UserRequest::GetCFCheckpt { stop_hash } => {
+                let request = NodeRequest::GetCFCheckpt(stop_hash);
+                if let Ok(peer) = self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
+                    self.inflight_user_requests
+                        .insert(user_req, (peer, Instant::now(), responder));
+                }
+
+                return;
+            }
         };
 
         let peer = self.send_to_fast_peer(req, ServiceFlags::NONE);

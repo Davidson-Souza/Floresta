@@ -20,6 +20,8 @@ use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Transaction;
 use bitcoin::Txid;
+use bitcoin::bip158::BlockFilter;
+use bitcoin::p2p::message_filter::CFCheckpt;
 use bitcoin::p2p::message_filter::CFHeaders;
 use floresta_domain::mempool::MempoolError;
 use rustreexo::proof::Proof;
@@ -31,7 +33,6 @@ use super::UtreexoNodeConfig;
 use super::node::NodeNotification;
 use crate::address_man::ConnectionStats;
 use crate::bitcoin_socket_addr::BitcoinSocketAddr;
-use crate::node_interface::ChainMethods;
 use crate::node_interface::MempoolMethods;
 use crate::node_interface::NetworkMethods;
 use crate::node_interface::NodeConfigMethods;
@@ -106,6 +107,21 @@ pub enum UserRequest {
         /// The remote node will send min(height(stop_hash), 2_000) headers on each request.
         stop_hash: BlockHash,
     },
+
+    /// Request the basic compact block filter for one block.
+    GetCFilter {
+        /// The height of the requested block.
+        height: u32,
+
+        /// The hash of the requested block.
+        block_hash: BlockHash,
+    },
+
+    /// Request BIP157 filter-header checkpoints through a block.
+    GetCFCheckpt {
+        /// The final block in the checkpoint chain.
+        stop_hash: BlockHash,
+    },
 }
 
 #[derive(Debug)]
@@ -155,6 +171,12 @@ pub enum NodeResponse {
 
     /// Received compact block filter headers.
     CFilterHeaders(CFHeaders),
+
+    /// Received a basic compact block filter.
+    CFilter(BlockFilter),
+
+    /// Received BIP157 filter-header checkpoints.
+    CFCheckpt(CFCheckpt),
 }
 
 #[derive(Debug)]
@@ -196,7 +218,7 @@ impl NodeHandle {
     }
 }
 
-impl ChainMethods for NodeHandle {
+impl floresta_common::ChainMethods for NodeHandle {
     type Error = RecvError;
 
     async fn get_block(&self, block: BlockHash) -> Result<Option<Block>, Self::Error> {
@@ -219,6 +241,26 @@ impl ChainMethods for NodeHandle {
             .await?;
 
         extract_variant!(CFilterHeaders, val)
+    }
+
+    async fn get_cfilter(
+        &self,
+        height: u32,
+        block_hash: BlockHash,
+    ) -> Result<BlockFilter, Self::Error> {
+        let val = self
+            .send_request(UserRequest::GetCFilter { height, block_hash })
+            .await?;
+
+        extract_variant!(CFilter, val)
+    }
+
+    async fn get_cfcheckpt(&self, stop_hash: BlockHash) -> Result<CFCheckpt, Self::Error> {
+        let val = self
+            .send_request(UserRequest::GetCFCheckpt { stop_hash })
+            .await?;
+
+        extract_variant!(CFCheckpt, val)
     }
 }
 

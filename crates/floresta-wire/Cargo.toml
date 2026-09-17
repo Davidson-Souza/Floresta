@@ -36,7 +36,6 @@ tonic-prost = { workspace = true }
 
 # Local dependencies
 floresta-chain = { workspace = true, features = ["flat-chainstore"] }
-floresta-compact-filters = { workspace = true }
 floresta-common = { workspace = true }
 floresta-domain = { workspace = true }
 floresta-metrics = { workspace = true, optional = true }

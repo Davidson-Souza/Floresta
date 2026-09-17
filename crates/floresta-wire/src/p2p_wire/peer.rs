@@ -25,7 +25,9 @@ use bitcoin::p2p::address::AddrV2Message;
 use bitcoin::p2p::message::CommandString;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
+use bitcoin::p2p::message_filter::CFCheckpt;
 use bitcoin::p2p::message_filter::CFHeaders;
+use bitcoin::p2p::message_filter::GetCFCheckpt;
 use bitcoin::p2p::message_filter::GetCFHeaders;
 use bitcoin::p2p::message_network::VersionMessage;
 use floresta_common::impl_error_from;
@@ -456,6 +458,15 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 self.write(NetworkMessage::GetCFHeaders(get_cfheaders))
                     .await?;
             }
+
+            NodeRequest::GetCFCheckpt(stop_hash) => {
+                let request = GetCFCheckpt {
+                    filter_type: BASIC_FILTER_VERSION,
+                    stop_hash,
+                };
+
+                self.write(NetworkMessage::GetCFCheckpt(request)).await?;
+            }
         }
         Ok(())
     }
@@ -614,6 +625,19 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     self.send_to_node(PeerMessages::CFHeaders(cfheaders), time);
                 }
 
+                NetworkMessage::CFCheckpt(checkpoint) => {
+                    if checkpoint.filter_headers.len() > MAX_FILTERS_PER_MESSAGE {
+                        return Err(PeerError::MessageTooBig);
+                    }
+
+                    if checkpoint.filter_type != BASIC_FILTER_VERSION {
+                        warn!("Unknown filter checkpoint type {}", checkpoint.filter_type);
+                        return Err(PeerError::UnexpectedMessage);
+                    }
+
+                    self.send_to_node(PeerMessages::CFCheckpt(checkpoint), time);
+                }
+
                 // Explicitly ignore these messages, if something changes in the future
                 // this would cause a compile error.
                 NetworkMessage::Verack
@@ -622,7 +646,6 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 | NetworkMessage::Reject(_)
                 | NetworkMessage::Alert(_)
                 | NetworkMessage::BlockTxn(_)
-                | NetworkMessage::CFCheckpt(_)
                 | NetworkMessage::CmpctBlock(_)
                 | NetworkMessage::FilterAdd(_)
                 | NetworkMessage::FilterClear
@@ -909,6 +932,9 @@ pub enum PeerMessages {
 
     /// Remote peer sent us compact block filter headers
     CFHeaders(CFHeaders),
+
+    /// Remote peer sent us compact block filter checkpoints.
+    CFCheckpt(CFCheckpt),
 }
 
 #[cfg(test)]
@@ -918,10 +944,14 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
+    use bitcoin::BlockHash;
+    use bitcoin::FilterHeader;
     use bitcoin::Network;
+    use bitcoin::hashes::Hash;
     use bitcoin::p2p::ServiceFlags;
     use bitcoin::p2p::address::AddrV2;
     use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_filter::CFCheckpt;
     use floresta_mempool::Mempool;
     use tokio::sync::Mutex;
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -936,8 +966,10 @@ mod tests {
     use crate::node::ConnectionKind;
     use crate::node::NodeNotification;
     use crate::node::NodeRequest;
+    use crate::p2p_wire::peer::BASIC_FILTER_VERSION;
     use crate::p2p_wire::peer::Peer;
     use crate::p2p_wire::peer::PeerError;
+    use crate::p2p_wire::peer::PeerMessages;
     use crate::p2p_wire::peer::ReaderMessage;
     use crate::p2p_wire::peer::State;
     use crate::p2p_wire::peer::peer_utils;
@@ -1082,5 +1114,34 @@ mod tests {
 
         // Prevents those channels from being dropped, so we don't get a `Channel` error
         drop(node_receiver);
+    }
+
+    #[tokio::test]
+    async fn forwards_basic_filter_checkpoints_to_node() {
+        let SetupData {
+            mut peer,
+            mut node_receiver,
+            ..
+        } = create_peer();
+        let checkpoint = CFCheckpt {
+            filter_type: BASIC_FILTER_VERSION,
+            stop_hash: BlockHash::from_byte_array([1; 32]),
+            filter_headers: vec![FilterHeader::from_byte_array([2; 32])],
+        };
+
+        peer.handle_peer_message(
+            NetworkMessage::CFCheckpt(checkpoint.clone()),
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+
+        let NodeNotification::FromPeer(peer_id, PeerMessages::CFCheckpt(received), _) =
+            node_receiver.recv().await.unwrap()
+        else {
+            panic!("expected a compact-filter checkpoint notification");
+        };
+        assert_eq!(peer_id, 0);
+        assert_eq!(received, checkpoint);
     }
 }

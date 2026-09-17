@@ -31,8 +31,6 @@ use floresta_chain::ChainBackend;
 use floresta_common::Ema;
 use floresta_common::try_and_log;
 use floresta_common::try_and_warn;
-use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
-use floresta_compact_filters::network_filters::NetworkFilters;
 use floresta_domain::mempool::MempoolBase;
 pub use peer_man::AddedPeerInfo;
 use running_ctx::RunningNode;
@@ -118,6 +116,9 @@ pub enum NodeRequest {
         start_height: u32,
         stop_hash: BlockHash,
     },
+
+    /// Ask for compact filter-header checkpoints through a block.
+    GetCFCheckpt(BlockHash),
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -133,9 +134,6 @@ pub(crate) enum InflightRequests {
 
     /// We've opened a connection with a peer, and are waiting for them to complete the handshake.
     Connect(PeerId),
-
-    /// Requests the peer to send us the compact filters for blocks
-    GetFilters,
 
     /// Requests the peer to send us the utreexo proof for a given block
     UtreexoProof(BlockHash),
@@ -262,8 +260,6 @@ pub struct NodeCommon<Chain: ChainBackend> {
     pub(crate) chain: Chain,
     pub(crate) blocks: HashMap<BlockHash, InflightBlock>,
     pub(crate) mempool: Arc<tokio::sync::Mutex<dyn MempoolBase>>,
-    pub(crate) block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
-    pub(crate) last_filter: BlockHash,
 
     // 2. Peer Management
     pub(crate) peer_id_count: u32,
@@ -351,7 +347,6 @@ where
         config: UtreexoNodeConfig,
         chain: Chain,
         mempool: Arc<Mutex<dyn MempoolBase>>,
-        block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
         kill_signal: Arc<tokio::sync::RwLock<bool>>,
         address_man: AddressMan,
     ) -> Result<Self, WireError> {
@@ -375,8 +370,6 @@ where
                 startup_time: Instant::now(),
                 // The last 1k blocks account for 50% of the EMA weight, the last 2k for 75%, etc.
                 block_sync_avg: Ema::with_half_life_1000(),
-                last_filter: chain.get_block_hash(0).unwrap(),
-                block_filters,
                 inflight: HashMap::new(),
                 inflight_user_requests: HashMap::new(),
                 peer_id_count: 0,

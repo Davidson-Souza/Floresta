@@ -17,11 +17,8 @@
 //! testing other modules, and to allow people to reuse other crates without wire: simply
 //! re-implement the relevant parts of node interface and you are fine!
 
-use bitcoin::Block;
-use bitcoin::BlockHash;
 use bitcoin::Transaction;
 use bitcoin::Txid;
-use bitcoin::p2p::message_filter::CFHeaders;
 use floresta_domain::mempool::MempoolError;
 use serde::Serialize;
 
@@ -60,29 +57,7 @@ pub struct PeerInfo {
     pub transport_protocol: TransportProtocol,
 }
 
-/// These methods are used to request blocks from the network.
-///
-/// TODO(@davidson): Implement `get_proofs` and allow `get_block` to fetch inputs.
-pub trait ChainMethods {
-    type Error: core::error::Error;
-
-    /// Gets a block by its hash.
-    ///
-    /// This function will try to get a block from the network and return it. Note that we don't
-    /// keep a local copy of the blockchain, so this function will always make a network request.
-    fn get_block(
-        &self,
-        block: BlockHash,
-    ) -> impl Future<Output = Result<Option<Block>, Self::Error>>;
-
-    /// Returns a list of Compact Block Filters headers for the requested block range.
-    fn get_cfilters_headers(
-        &self,
-        start_height: u32,
-        stop_hash: BlockHash,
-    ) -> impl Future<Output = Result<CFHeaders, Self::Error>>;
-}
-
+pub use floresta_common::ChainMethods;
 /// Mempool-oriented methods.
 ///
 /// These methods allows users to fetch or update mempool transtactions to/from the network.
