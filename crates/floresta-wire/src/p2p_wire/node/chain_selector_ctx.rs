@@ -628,6 +628,7 @@ where
                 self.context.state = ChainSelectorState::LookingForForks(Instant::now());
                 self.context.done_peers.insert(peer);
             }
+
             ChainSelectorState::LookingForForks(_) => {
                 self.context.done_peers.insert(peer);
                 for peer in self.common.peer_ids.iter() {
@@ -637,39 +638,44 @@ where
                     }
                 }
 
-                if let Some(assume_utreexo) = self.common.config.assume_utreexo.as_ref() {
-                    self.context.state = ChainSelectorState::Done;
-                    // already assumed the chain
-                    if self.chain.get_validation_index().unwrap() >= assume_utreexo.height {
-                        return Ok(());
-                    }
-                    info!(
-                        "Assuming chain with height={} tip={}",
-                        assume_utreexo.height, assume_utreexo.block_hash
-                    );
-                    let acc = Stump {
-                        leaves: assume_utreexo.leaves,
-                        roots: assume_utreexo.roots.clone(),
-                    };
-                    self.chain
-                        .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
-                    return Ok(());
-                }
-
-                // TODO: Check for a nonempty archive peer list to avoid panicking after disconnection.
-                let has_peers = self
-                    .peer_by_service
-                    .contains_key(&service_flags::UTREEXO_ARCHIVE.into());
-
-                if self.config.pow_fraud_proofs && has_peers {
-                    self.check_tips().await?;
-                }
-
-                self.context.state = ChainSelectorState::Done;
+                self.finish_chain_selection().await?;
             }
             _ => {}
         }
 
+        Ok(())
+    }
+
+    async fn finish_chain_selection(&mut self) -> Result<(), WireError> {
+        if let Some(assume_utreexo) = self.common.config.assume_utreexo.as_ref() {
+            self.context.state = ChainSelectorState::Done;
+            // already assumed the chain
+            if self.chain.get_validation_index().unwrap() >= assume_utreexo.height {
+                return Ok(());
+            }
+            info!(
+                "Assuming chain with height={} tip={}",
+                assume_utreexo.height, assume_utreexo.block_hash
+            );
+            let acc = Stump {
+                leaves: assume_utreexo.leaves,
+                roots: assume_utreexo.roots.clone(),
+            };
+            self.chain
+                .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
+            return Ok(());
+        }
+
+        // TODO: Check for a nonempty archive peer list to avoid panicking after disconnection.
+        let has_peers = self
+            .peer_by_service
+            .contains_key(&service_flags::UTREEXO_ARCHIVE.into());
+
+        if self.config.pow_fraud_proofs && has_peers {
+            self.check_tips().await?;
+        }
+
+        self.context.state = ChainSelectorState::Done;
         Ok(())
     }
 
@@ -873,8 +879,8 @@ where
 
         if let ChainSelectorState::LookingForForks(start) = self.context.state {
             if start.elapsed().as_secs() > ChainSelector::REQUEST_TIMEOUT {
-                self.context.state = ChainSelectorState::LookingForForks(Instant::now());
-                self.poke_peers()?;
+                // Timeout to prevent waiting forever.
+                try_and_log!(self.finish_chain_selection().await);
             }
         }
 
