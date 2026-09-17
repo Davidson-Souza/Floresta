@@ -6,17 +6,25 @@ rust-version.workspace = true
 edition.workspace = true
 homepage = "https://github.com/davidson-souza/floresta"
 repository = "https://github.com/davidson-souza/floresta"
-description = """
-BIP158 compact filters for easy rescan of the blockchain in light clients.
-"""
 readme.workspace = true # Floresta/README.md
 license.workspace = true
+description = """
+BIP158 compact filters for easy rescan of the blockchain in
+light clients.
+"""
 
 [dependencies]
 bitcoin = { workspace = true }
 
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+
 # Local dependencies
 floresta-chain = { workspace = true }
+floresta-common = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

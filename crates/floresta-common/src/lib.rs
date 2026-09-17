@@ -36,6 +36,40 @@ pub mod spsc;
 pub use ema::Ema;
 pub use merkle::MerkleBackend;
 pub use spsc::Channel;
+#[cfg(feature = "std")]
+pub trait ChainMethods {
+    type Error: core::error::Error;
+
+    /// Gets a block by its hash.
+    fn get_block(
+        &self,
+        block: bitcoin::BlockHash,
+    ) -> impl core::future::Future<Output = Result<Option<bitcoin::Block>, Self::Error>> + Send;
+
+    /// Returns a list of Compact Block Filters headers for the requested block range.
+    fn get_cfilters_headers(
+        &self,
+        start_height: u32,
+        stop_hash: bitcoin::BlockHash,
+    ) -> impl core::future::Future<
+        Output = Result<bitcoin::p2p::message_filter::CFHeaders, Self::Error>,
+    > + Send;
+
+    /// Returns the basic compact block filter for `block_hash`.
+    fn get_cfilter(
+        &self,
+        height: u32,
+        block_hash: bitcoin::BlockHash,
+    ) -> impl core::future::Future<Output = Result<bitcoin::bip158::BlockFilter, Self::Error>> + Send;
+
+    /// Returns BIP157 filter-header checkpoints through `stop_hash`.
+    fn get_cfcheckpt(
+        &self,
+        stop_hash: bitcoin::BlockHash,
+    ) -> impl core::future::Future<
+        Output = Result<bitcoin::p2p::message_filter::CFCheckpt, Self::Error>,
+    > + Send;
+}
 
 /// Computes the SHA-256 digest of the byte slice data and returns a [Hash] from `bitcoin_hashes`.
 ///

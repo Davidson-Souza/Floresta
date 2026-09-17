@@ -1051,6 +1051,10 @@ version = "0.5.0"
 dependencies = [
  "bitcoin",
  "floresta-chain",
+ "floresta-common",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1091,9 +1095,11 @@ dependencies = [
  "arbitrary",
  "bitcoin",
  "floresta-chain",
+ "floresta-compact-filters",
  "floresta-wire",
  "libfuzzer-sys",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2976,6 +2982,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
