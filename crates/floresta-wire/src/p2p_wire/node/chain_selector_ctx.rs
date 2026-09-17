@@ -871,8 +871,8 @@ where
 
         if let ChainSelectorState::LookingForForks(start) = self.context.state {
             if start.elapsed().as_secs() > ChainSelector::REQUEST_TIMEOUT {
-                self.context.state = ChainSelectorState::LookingForForks(Instant::now());
-                self.poke_peers()?;
+                // Timeout to prevent waiting forever.
+                self.context.state = ChainSelectorState::Done;
             }
         }
 
