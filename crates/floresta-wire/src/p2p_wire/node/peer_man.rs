@@ -470,10 +470,14 @@ where
             PeerMessages::BlockFilter((block_hash, filter)) => {
                 let request = self.inflight_user_requests.iter().find_map(
                     |(request, (request_peer, _, _))| match request {
-                        UserRequest::GetCFilter {
-                            block_hash: requested_hash,
-                            ..
-                        } if *requested_hash == block_hash && *request_peer == peer => {
+                        UserRequest::GetCFilters { block_hashes, .. }
+                            if *request_peer == peer
+                                && self
+                                    .inflight_filter_batches
+                                    .get(request)
+                                    .and_then(|filters| block_hashes.get(filters.len()))
+                                    == Some(&block_hash) =>
+                        {
                             Some(request.clone())
                         }
                         _ => None,
@@ -481,8 +485,28 @@ where
                 );
 
                 if let Some(request) = request {
-                    if let Some((_, _, responder)) = self.inflight_user_requests.remove(&request) {
-                        let _ = responder.send(NodeResponse::CFilter(filter));
+                    let filters = self
+                        .inflight_filter_batches
+                        .get_mut(&request)
+                        .expect("filter batch exists for every in-flight filter request");
+                    filters.push(filter);
+                    let complete = match &request {
+                        UserRequest::GetCFilters { block_hashes, .. } => {
+                            filters.len() == block_hashes.len()
+                        }
+                        _ => unreachable!("matched request is a filter batch"),
+                    };
+
+                    if complete {
+                        let filters = self
+                            .inflight_filter_batches
+                            .remove(&request)
+                            .expect("completed filter batch exists");
+                        if let Some((_, _, responder)) =
+                            self.inflight_user_requests.remove(&request)
+                        {
+                            let _ = responder.send(NodeResponse::CFilters(filters));
+                        }
                     }
                 } else {
                     warn!("Peer {peer} sent us a cfilter we didn't request");
@@ -712,6 +736,7 @@ where
             let Some((peer, _, responder)) = self.inflight_user_requests.remove(&request) else {
                 continue;
             };
+            self.inflight_filter_batches.remove(&request);
             debug!("User request timed out: {request:?}");
             try_and_log!(self.increase_banscore(peer, 1));
             drop(responder);
@@ -880,10 +905,11 @@ where
                 .inflight_user_requests
                 .iter()
                 .find_map(|(request, (request_peer, sent_at, _))| match request {
-                    UserRequest::GetCFilter {
-                        block_hash: requested_hash,
-                        ..
-                    } if requested_hash == block_hash && *request_peer == peer => Some(*sent_at),
+                    UserRequest::GetCFilters { block_hashes, .. }
+                        if block_hashes.contains(block_hash) && *request_peer == peer =>
+                    {
+                        Some(*sent_at)
+                    }
                     _ => None,
                 })?,
 

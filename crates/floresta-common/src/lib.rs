@@ -55,12 +55,12 @@ pub trait ChainMethods {
         Output = Result<bitcoin::p2p::message_filter::CFHeaders, Self::Error>,
     > + Send;
 
-    /// Returns the basic compact block filter for `block_hash`.
+    /// Returns basic compact block filters for consecutive `block_hashes`.
     fn get_cfilter(
         &self,
-        height: u32,
-        block_hash: bitcoin::BlockHash,
-    ) -> impl core::future::Future<Output = Result<bitcoin::bip158::BlockFilter, Self::Error>> + Send;
+        start_height: u32,
+        block_hashes: Vec<bitcoin::BlockHash>,
+    ) -> impl core::future::Future<Output = Result<Vec<bitcoin::bip158::BlockFilter>, Self::Error>> + Send;
 
     /// Returns BIP157 filter-header checkpoints through `stop_hash`.
     fn get_cfcheckpt(

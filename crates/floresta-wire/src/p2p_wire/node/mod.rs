@@ -24,6 +24,7 @@ use std::time::Instant;
 use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::Txid;
+use bitcoin::bip158::BlockFilter;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::AddrV2Message;
 pub(crate) use blocks::InflightBlock;
@@ -282,6 +283,7 @@ pub struct NodeCommon<Chain: ChainBackend> {
     pub(crate) inflight: HashMap<InflightRequests, (u32, Instant)>,
     pub(crate) inflight_user_requests:
         HashMap<UserRequest, (u32, Instant, oneshot::Sender<NodeResponse>)>,
+    pub(crate) inflight_filter_batches: HashMap<UserRequest, Vec<BlockFilter>>,
     pub(crate) last_tip_update: Instant,
     pub(crate) last_connection: Instant,
     pub(crate) last_peer_db_dump: Instant,
@@ -372,6 +374,7 @@ where
                 block_sync_avg: Ema::with_half_life_1000(),
                 inflight: HashMap::new(),
                 inflight_user_requests: HashMap::new(),
+                inflight_filter_batches: HashMap::new(),
                 peer_id_count: 0,
                 peers: HashMap::new(),
                 last_block_request: chain.get_validation_index().expect("Invalid chain"),

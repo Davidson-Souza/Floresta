@@ -109,13 +109,16 @@ impl ChainMethods for MockNode {
 
     async fn get_cfilter(
         &self,
-        height: u32,
-        _block_hash: BlockHash,
-    ) -> Result<BlockFilter, Self::Error> {
-        if height != 0 {
+        start_height: u32,
+        block_hashes: Vec<BlockHash>,
+    ) -> Result<Vec<BlockFilter>, Self::Error> {
+        if start_height != 0 || block_hashes.len() != 1 {
             return Err(MockError);
         }
-        self.filter.clone().ok_or(MockError)
+        self.filter
+            .clone()
+            .map(|filter| vec![filter])
+            .ok_or(MockError)
     }
 
     async fn get_cfcheckpt(&self, _stop_hash: BlockHash) -> Result<CFCheckpt, Self::Error> {

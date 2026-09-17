@@ -203,9 +203,18 @@ where
                 return;
             }
 
-            UserRequest::GetCFilter { height, block_hash } => {
-                let request = NodeRequest::GetFilter((block_hash, height));
+            UserRequest::GetCFilters {
+                start_height,
+                ref block_hashes,
+            } => {
+                let Some(stop_hash) = block_hashes.last().copied() else {
+                    let _ = responder.send(NodeResponse::CFilters(Vec::new()));
+                    return;
+                };
+                let request = NodeRequest::GetFilter((stop_hash, start_height));
                 if let Ok(peer) = self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
+                    self.inflight_filter_batches
+                        .insert(user_req.clone(), Vec::with_capacity(block_hashes.len()));
                     self.inflight_user_requests
                         .insert(user_req, (peer, Instant::now(), responder));
                 }

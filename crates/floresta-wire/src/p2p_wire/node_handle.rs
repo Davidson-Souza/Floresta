@@ -108,13 +108,13 @@ pub enum UserRequest {
         stop_hash: BlockHash,
     },
 
-    /// Request the basic compact block filter for one block.
-    GetCFilter {
-        /// The height of the requested block.
-        height: u32,
+    /// Request basic compact block filters for consecutive blocks.
+    GetCFilters {
+        /// The height of the first requested block.
+        start_height: u32,
 
-        /// The hash of the requested block.
-        block_hash: BlockHash,
+        /// Ordered hashes of every requested block.
+        block_hashes: Vec<BlockHash>,
     },
 
     /// Request BIP157 filter-header checkpoints through a block.
@@ -172,8 +172,8 @@ pub enum NodeResponse {
     /// Received compact block filter headers.
     CFilterHeaders(CFHeaders),
 
-    /// Received a basic compact block filter.
-    CFilter(BlockFilter),
+    /// Received basic compact block filters.
+    CFilters(Vec<BlockFilter>),
 
     /// Received BIP157 filter-header checkpoints.
     CFCheckpt(CFCheckpt),
@@ -245,14 +245,21 @@ impl floresta_common::ChainMethods for NodeHandle {
 
     async fn get_cfilter(
         &self,
-        height: u32,
-        block_hash: BlockHash,
-    ) -> Result<BlockFilter, Self::Error> {
+        start_height: u32,
+        block_hashes: Vec<BlockHash>,
+    ) -> Result<Vec<BlockFilter>, Self::Error> {
+        if block_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let val = self
-            .send_request(UserRequest::GetCFilter { height, block_hash })
+            .send_request(UserRequest::GetCFilters {
+                start_height,
+                block_hashes,
+            })
             .await?;
 
-        extract_variant!(CFilter, val)
+        extract_variant!(CFilters, val)
     }
 
     async fn get_cfcheckpt(&self, stop_hash: BlockHash) -> Result<CFCheckpt, Self::Error> {
@@ -373,3 +380,44 @@ macro_rules! extract_variant {
 }
 
 use extract_variant;
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::hashes::Hash;
+    use floresta_common::ChainMethods;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn requests_compact_filters_as_one_batch() {
+        let (node_sender, mut node_receiver) = unbounded_channel();
+        let handle = NodeHandle::new(node_sender);
+        let block_hashes = vec![
+            BlockHash::from_byte_array([1; 32]),
+            BlockHash::from_byte_array([2; 32]),
+        ];
+        let expected_hashes = block_hashes.clone();
+        let request =
+            tokio::spawn(async move { handle.get_cfilter(42, block_hashes).await.unwrap() });
+
+        let NodeNotification::FromUser(user_request, responder) =
+            node_receiver.recv().await.unwrap()
+        else {
+            panic!("expected a user request");
+        };
+        assert_eq!(
+            user_request,
+            UserRequest::GetCFilters {
+                start_height: 42,
+                block_hashes: expected_hashes,
+            }
+        );
+
+        let filters = vec![BlockFilter::new(&[1]), BlockFilter::new(&[2])];
+        responder
+            .send(NodeResponse::CFilters(filters.clone()))
+            .unwrap();
+        assert_eq!(request.await.unwrap(), filters);
+    }
+}

@@ -41,11 +41,14 @@ use crate::FlatFilterStoreError;
 
 const BASIC_FILTER_TYPE: u8 = 0;
 const FILTER_HEADER_BATCH_SIZE: u32 = 1_000;
+const FILTER_BATCH_SIZE: u32 = 1_000;
+const FILTER_REQUEST_SIZE: usize = 100;
 const CHECKPOINT_INTERVAL: u32 = 1_000;
 const CONNECTED_BLOCK_BUFFER: usize = 16;
 const DEFAULT_RESCAN_PAGE_SIZE: usize = 50;
 const MAX_RESCAN_PAGE_SIZE: usize = 10_000;
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const RESCAN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Minimal blockchain view required by [`FiltersMan`].
 pub trait FilterChain: Clone + Send + Sync + 'static {
@@ -155,6 +158,8 @@ pub enum FilterManError {
 
     /// The node interface failed while fetching network data.
     Node(Box<dyn Error + Send + Sync>),
+    /// A concurrent filter request task failed.
+    Task(tokio::task::JoinError),
 
     /// Persistent filter-header storage failed.
     Store(FlatFilterStoreError),
@@ -167,9 +172,14 @@ pub enum FilterManError {
 
     /// A downloaded filter does not commit to the stored header.
     InvalidFilter(u32),
+    /// A peer returned a different number of filters than requested.
+    InvalidFilterCount {
+        /// Number of requested filters.
+        expected: usize,
 
-    /// The node did not return a requested block.
-    BlockNotFound(BlockHash),
+        /// Number of returned filters.
+        received: usize,
+    },
 
     /// A rescan request contained no scripts.
     EmptyRescan,
@@ -223,13 +233,17 @@ impl Display for FilterManError {
         match self {
             Self::Chain(error) => write!(f, "chain error: {error}"),
             Self::Node(error) => write!(f, "node error: {error}"),
+            Self::Task(error) => write!(f, "filter request task failed: {error}"),
             Self::Store(error) => write!(f, "filter store error: {error}"),
             Self::Bip158(error) => write!(f, "BIP158 error: {error}"),
             Self::InvalidHeaders(reason) => write!(f, "invalid filter headers: {reason}"),
             Self::InvalidFilter(height) => {
                 write!(f, "filter at height {height} does not match its header")
             }
-            Self::BlockNotFound(hash) => write!(f, "node did not return block {hash}"),
+            Self::InvalidFilterCount { expected, received } => write!(
+                f,
+                "peer returned {received} compact filters; expected {expected}"
+            ),
             Self::EmptyRescan => write!(f, "a rescan requires at least one script"),
             Self::InvalidRescanRange { start, end, tip } => write!(
                 f,
@@ -253,6 +267,7 @@ impl Error for FilterManError {
             Self::Chain(error) | Self::Node(error) => Some(error.as_ref()),
             Self::Store(error) => Some(error),
             Self::Bip158(error) => Some(error),
+            Self::Task(error) => Some(error),
             _ => None,
         }
     }
@@ -614,33 +629,69 @@ where
         end: u32,
         blocks: &mpsc::Sender<Block>,
     ) -> Result<(), FilterManError> {
-        for height in start..=end {
-            let block_hash = chain
-                .get_block_hash(height)
-                .map_err(FilterManError::chain)?;
-            let filter =
-                Self::fetch_filter(store.clone(), node.clone(), chain.clone(), height).await?;
-            let matches = filter.match_any(
-                &block_hash,
-                request.scripts.iter().map(|script| script.as_bytes()),
-            )?;
+        let mut batch_start = start;
+        loop {
+            let batch_end = batch_start.saturating_add(FILTER_BATCH_SIZE - 1).min(end);
+            let filters = loop {
+                if blocks.is_closed() {
+                    return Err(FilterManError::ManagerStopped);
+                }
 
-            if !matches {
-                continue;
+                match Self::fetch_filters(
+                    store.clone(),
+                    node.clone(),
+                    chain.clone(),
+                    batch_start,
+                    batch_end,
+                )
+                .await
+                {
+                    Ok(filters) => break filters,
+                    Err(FilterManError::Node(error)) => {
+                        warn!(
+                            %error,
+                            start = batch_start,
+                            end = batch_end,
+                            "compact-filter rescan batch failed; retrying"
+                        );
+                        tokio::time::sleep(RESCAN_RETRY_INTERVAL).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+
+            for (block_hash, filter) in filters {
+                let matches = filter.match_any(
+                    &block_hash,
+                    request.scripts.iter().map(|script| script.as_bytes()),
+                )?;
+                if !matches {
+                    continue;
+                }
+
+                let block = loop {
+                    match node.get_block(block_hash).await {
+                        Ok(Some(block)) => break block,
+                        Ok(None) => {
+                            warn!(%block_hash, "rescan block unavailable; retrying");
+                        }
+                        Err(error) => {
+                            warn!(%error, %block_hash, "rescan block request failed; retrying");
+                        }
+                    }
+                    tokio::time::sleep(RESCAN_RETRY_INTERVAL).await;
+                };
+                blocks
+                    .send(block)
+                    .await
+                    .map_err(|_| FilterManError::ManagerStopped)?;
             }
 
-            let block = node
-                .get_block(block_hash)
-                .await
-                .map_err(FilterManError::node)?
-                .ok_or(FilterManError::BlockNotFound(block_hash))?;
-            blocks
-                .send(block)
-                .await
-                .map_err(|_| FilterManError::ManagerStopped)?;
+            if batch_end == end {
+                return Ok(());
+            }
+            batch_start = batch_end + 1;
         }
-
-        Ok(())
     }
 
     async fn fetch_filter(
@@ -649,22 +700,85 @@ where
         chain: Chain,
         height: u32,
     ) -> Result<BlockFilter, FilterManError> {
-        if let Some(filter) = store.lock()?.get_filter(height)? {
-            return Ok(filter);
+        let mut filters = Self::fetch_filters(store, node, chain, height, height).await?;
+        Ok(filters
+            .pop()
+            .expect("a one-height filter range returns one filter")
+            .1)
+    }
+
+    async fn fetch_filters(
+        store: Arc<Mutex<Store>>,
+        node: Node,
+        chain: Chain,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<(BlockHash, BlockFilter)>, FilterManError> {
+        let heights = start..=end;
+        let mut block_hashes = Vec::with_capacity(heights.size_hint().0);
+        for height in heights.clone() {
+            block_hashes.push(
+                chain
+                    .get_block_hash(height)
+                    .map_err(FilterManError::chain)?,
+            );
         }
 
-        let block_hash = chain
-            .get_block_hash(height)
-            .map_err(FilterManError::chain)?;
-        let filter = node
-            .get_cfilter(height, block_hash)
-            .await
-            .map_err(FilterManError::node)?;
+        let mut filters = {
+            let store = store.lock()?;
+            heights
+                .clone()
+                .map(|height| store.get_filter(height))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut requests = tokio::task::JoinSet::new();
+        for first in (0..filters.len()).step_by(FILTER_REQUEST_SIZE) {
+            let last = (first + FILTER_REQUEST_SIZE).min(filters.len());
+            if filters[first..last].iter().all(Option::is_some) {
+                continue;
+            }
 
-        let mut store = store.lock()?;
-        Self::validate_filter(&mut *store, height, &filter)?;
-        store.put_filter(height, filter.clone())?;
-        Ok(filter)
+            let node = node.clone();
+            let requested_hashes = block_hashes[first..last].to_vec();
+            let request_height = start + first as u32;
+            requests.spawn(async move {
+                let expected = requested_hashes.len();
+                let filters = node.get_cfilter(request_height, requested_hashes).await?;
+                Ok::<_, Node::Error>((first, expected, filters))
+            });
+        }
+
+        while let Some(response) = requests.join_next().await {
+            let (first, expected, received_filters) = response
+                .map_err(FilterManError::Task)?
+                .map_err(FilterManError::node)?;
+            if received_filters.len() != expected {
+                return Err(FilterManError::InvalidFilterCount {
+                    expected,
+                    received: received_filters.len(),
+                });
+            }
+
+            let mut store = store.lock()?;
+            for (offset, filter) in received_filters.into_iter().enumerate() {
+                let index = first + offset;
+                let height = start + index as u32;
+                Self::validate_filter(&mut *store, height, &filter)?;
+                store.put_filter(height, filter.clone())?;
+                filters[index] = Some(filter);
+            }
+        }
+
+        Ok(block_hashes
+            .into_iter()
+            .zip(filters)
+            .map(|(block_hash, filter)| {
+                (
+                    block_hash,
+                    filter.expect("every requested compact filter is available"),
+                )
+            })
+            .collect())
     }
 
     fn validate_filter(
@@ -1048,6 +1162,9 @@ mod tests {
         checkpoint_responses: Arc<HashMap<BlockHash, CFCheckpt>>,
         block_requests: Arc<AtomicUsize>,
         filter_requests: Arc<AtomicUsize>,
+        filter_failures: Arc<AtomicUsize>,
+        active_filter_requests: Arc<AtomicUsize>,
+        max_filter_requests: Arc<AtomicUsize>,
         header_requests: Arc<AtomicUsize>,
         checkpoint_requests: Arc<AtomicUsize>,
     }
@@ -1065,6 +1182,9 @@ mod tests {
                 block_requests: Arc::new(AtomicUsize::new(0)),
                 filter_requests: Arc::new(AtomicUsize::new(0)),
                 header_requests: Arc::new(AtomicUsize::new(0)),
+                filter_failures: Arc::new(AtomicUsize::new(0)),
+                active_filter_requests: Arc::new(AtomicUsize::new(0)),
+                max_filter_requests: Arc::new(AtomicUsize::new(0)),
                 checkpoint_requests: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -1092,14 +1212,36 @@ mod tests {
 
         async fn get_cfilter(
             &self,
-            _height: u32,
-            block_hash: BlockHash,
-        ) -> Result<BlockFilter, Self::Error> {
+            _start_height: u32,
+            block_hashes: Vec<BlockHash>,
+        ) -> Result<Vec<BlockFilter>, Self::Error> {
             self.filter_requests.fetch_add(1, Ordering::Relaxed);
-            self.filters
-                .get(&block_hash)
-                .cloned()
-                .ok_or(MockError("unknown filter"))
+            let active = self.active_filter_requests.fetch_add(1, Ordering::Relaxed) + 1;
+            self.max_filter_requests
+                .fetch_max(active, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+
+            let result = if self
+                .filter_failures
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |failures| {
+                    failures.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err(MockError("filter request failed"))
+            } else {
+                block_hashes
+                    .into_iter()
+                    .map(|block_hash| {
+                        self.filters
+                            .get(&block_hash)
+                            .cloned()
+                            .ok_or(MockError("unknown filter"))
+                    })
+                    .collect()
+            };
+            self.active_filter_requests.fetch_sub(1, Ordering::Relaxed);
+            result
         }
 
         async fn get_cfcheckpt(&self, stop_hash: BlockHash) -> Result<CFCheckpt, Self::Error> {
@@ -1199,6 +1341,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rescan_fetches_filters_in_batches() {
+        let (_file, mut store, mut chain, mut node, block, first_filter) = setup();
+        let mut second_block = block.clone();
+        second_block.header.nonce = second_block.header.nonce.wrapping_add(1);
+        let second_hash = second_block.block_hash();
+        let second_filter = BlockFilter::new_script_filter(&second_block, |outpoint| {
+            Err::<ScriptBuf, _>(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+        })
+        .unwrap();
+        let first_header = first_filter.filter_header(&FilterHeader::all_zeros());
+        store
+            .put_filter_header(second_hash, second_filter.filter_header(&first_header))
+            .unwrap();
+        store.flush().unwrap();
+        Arc::make_mut(&mut chain.hashes).push(second_hash);
+        Arc::make_mut(&mut node.blocks).insert(second_hash, second_block);
+        Arc::make_mut(&mut node.filters).insert(second_hash, second_filter);
+        let filter_requests = node.filter_requests.clone();
+
+        let script = block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain);
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let _ = handle.get_blocks(ticket).await.unwrap();
+                if handle.get_info(ticket).await.unwrap() == RescanStatus::Finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn fetches_filter_chunks_concurrently() {
+        let file = NamedTempFile::new().unwrap();
+        let mut store = FlatFilterStore::new(file.path()).unwrap();
+        let count = FILTER_REQUEST_SIZE + 1;
+        let mut hashes = Vec::with_capacity(count);
+        let mut filters = HashMap::with_capacity(count);
+        let mut previous_header = FilterHeader::all_zeros();
+
+        for height in 0..count {
+            let height = height as u32;
+            let block_hash = mock_block_hash(height);
+            let filter = BlockFilter::new(&height.to_le_bytes());
+            previous_header = filter.filter_header(&previous_header);
+            store
+                .put_filter_header(block_hash, previous_header)
+                .unwrap();
+            hashes.push(block_hash);
+            filters.insert(block_hash, filter);
+        }
+        store.flush().unwrap();
+
+        let chain = MockChain {
+            hashes: Arc::new(hashes),
+        };
+        let node = MockNode::new(HashMap::new(), filters);
+        let filter_requests = node.filter_requests.clone();
+        let max_filter_requests = node.max_filter_requests.clone();
+        let received = FiltersMan::<FlatFilterStore, MockChain, MockNode>::fetch_filters(
+            Arc::new(Mutex::new(store)),
+            node,
+            chain,
+            0,
+            count as u32 - 1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(received.len(), count);
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(max_filter_requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn rescan_retries_filter_request_errors() {
+        let (_file, store, chain, node, block, _filter) = setup();
+        node.filter_failures.store(1, Ordering::Relaxed);
+        let filter_requests = node.filter_requests.clone();
+        let script = block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain);
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let _ = handle.get_blocks(ticket).await.unwrap();
+                if handle.get_info(ticket).await.unwrap() == RescanStatus::Finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn rejects_filter_that_does_not_match_header() {
         let (_file, mut store, chain, mut node, _block, _filter) = setup();
         let block_hash = chain.get_block_hash(0).unwrap();
@@ -1237,7 +1497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_missing_block_from_mock_node_rescan() {
+    async fn retries_missing_blocks_during_rescan() {
         let (_file, store, chain, mut node, block, _filter) = setup();
         Arc::make_mut(&mut node.blocks).clear();
         let block_requests = node.block_requests.clone();
@@ -1250,18 +1510,19 @@ mod tests {
             .await
             .unwrap();
 
-        let error = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match handle.get_info(ticket).await {
-                    Err(error) => break error,
-                    Ok(_) => tokio::task::yield_now().await,
-                }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while block_requests.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        assert!(matches!(error, FilterManError::RescanFailed(_)));
-        assert_eq!(block_requests.load(Ordering::Relaxed), 1);
+
+        assert!(matches!(
+            handle.get_info(ticket).await,
+            Ok(RescanStatus::Started | RescanStatus::Waiting)
+        ));
+        assert!(block_requests.load(Ordering::Relaxed) >= 2);
 
         task.abort();
     }
