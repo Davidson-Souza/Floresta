@@ -472,7 +472,18 @@ impl Consensus {
                 Some(flags),
                 &tx_data,
             )
-            .map_err(|e| tx_err!(txid, ScriptValidationError, e.to_string()))?;
+            .map_err(|error| {
+                let previous_output = transaction.input[input_index].previous_output;
+                let script_pubkey = &spent_utxos[input_index].txout.script_pubkey;
+                tx_err!(
+                    txid,
+                    ScriptValidationError,
+                    format!(
+                        "input {input_index} prevout {previous_output} amount {amount} \
+                         script_pubkey {script_pubkey:?}: {error}"
+                    )
+                )
+            })?;
         }
 
         Ok(())
@@ -629,6 +640,39 @@ impl Consensus {
             Self::verify_block_transactions_swiftsync(height, block, txids, unspent_indexes, salt)?;
 
         Ok((agg, amount, utreexo_adds))
+    }
+
+    /// Validates the contextual transaction rules for an indexed SwiftSync block.
+    ///
+    /// Indexing has already run [`Self::check_block`] and made every historical prevout
+    /// available. `previous_median_time_past` is the MTP of the block preceding `block`.
+    pub fn validate_indexed_swiftsync_block(
+        &self,
+        block: &Block,
+        height: u32,
+        previous_median_time_past: u32,
+        inputs: HashMap<OutPoint, UtxoData>,
+    ) -> Result<(), BlockchainError> {
+        let lock_time_cutoff = self.block_lock_time_cutoff(height, &block.header, || {
+            Ok::<u32, BlockchainError>(previous_median_time_past)
+        })?;
+        let subsidy = self.get_subsidy(height);
+        #[cfg(feature = "bitcoinkernel")]
+        let flags = self
+            .parameters
+            .get_validation_flags(height, block.block_hash());
+        #[cfg(not(feature = "bitcoinkernel"))]
+        let flags = 0;
+
+        Self::verify_block_transactions(
+            height,
+            lock_time_cutoff,
+            inputs,
+            &block.txdata,
+            subsidy,
+            true,
+            flags,
+        )
     }
 
     /// Removes and returns the UTXO spent by `input`.

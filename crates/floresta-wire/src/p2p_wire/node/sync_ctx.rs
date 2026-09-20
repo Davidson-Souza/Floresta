@@ -14,7 +14,6 @@ use floresta_common::try_and_log;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
 use tracing::debug;
-use tracing::error;
 use tracing::info;
 
 use crate::node::ConnectionKind;
@@ -322,7 +321,10 @@ where
             }
 
             NodeNotification::FromWorker(msg) => {
-                error!("Received a notification from the worker thread {msg:?}");
+                debug!("Ignoring stale SwiftSync indexing result: {msg:?}");
+            }
+            NodeNotification::FromValidationWorker(msg) => {
+                debug!("Ignoring stale SwiftSync validation result: {msg:?}");
             }
         }
 

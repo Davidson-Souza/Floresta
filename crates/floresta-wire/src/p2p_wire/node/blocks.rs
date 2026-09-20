@@ -87,15 +87,32 @@ where
     Chain: ChainBackend + 'static,
     WireError: From<Chain::Error>,
 {
-    /// Returns `true` only if we can request `BLOCKS_PER_GETDATA` without exceeding the maximum
-    /// unprocessed blocks allowed.
+    /// Returns whether another GETDATA batch fits the context's block or byte window.
     pub(crate) fn can_request_more_blocks(&self) -> bool {
-        let max_inflight_blocks = self.context.block_download_window();
+        let requested_blocks = self
+            .inflight
+            .keys()
+            .filter(|inflight| matches!(inflight, InflightRequests::Blocks(_)))
+            .count();
+        if requested_blocks.saturating_add(T::BLOCKS_PER_GETDATA) > T::MAX_INFLIGHT_REQUESTS {
+            return false;
+        }
+        if self
+            .unprocessed_blocks()
+            .saturating_add(T::BLOCKS_PER_GETDATA)
+            > self.context.block_download_window()
+        {
+            return false;
+        }
 
-        // If we do a GETDATA request, this will be the new unprocessed count
-        let next_unprocessed = self.unprocessed_blocks() + T::BLOCKS_PER_GETDATA;
-
-        next_unprocessed <= max_inflight_blocks
+        if let Some(max_bytes) = self.context.block_download_window_bytes() {
+            let batch_bytes = self
+                .context
+                .requested_block_bytes()
+                .saturating_mul(T::BLOCKS_PER_GETDATA);
+            return self.unprocessed_block_bytes().saturating_add(batch_bytes) <= max_bytes;
+        }
+        true
     }
 
     /// Returns the number of blocks awaiting processing (in memory or requested).
@@ -107,7 +124,30 @@ where
             .filter(|inflight| matches!(inflight, InflightRequests::Blocks(_)))
             .count();
 
-        blocks_in_mem + requested_blocks
+        blocks_in_mem + requested_blocks + self.context.retained_processing_blocks()
+    }
+
+    /// Returns downloaded bytes plus reservations for requested blocks.
+    pub(crate) fn unprocessed_block_bytes(&self) -> usize {
+        let downloaded_bytes = self
+            .context
+            .downloaded_processing_bytes()
+            .unwrap_or_else(|| {
+                self.blocks
+                    .values()
+                    .map(|block| block.block.total_size())
+                    .fold(
+                        self.context.retained_processing_bytes(),
+                        usize::saturating_add,
+                    )
+            });
+        let requested_blocks = self
+            .inflight
+            .keys()
+            .filter(|inflight| matches!(inflight, InflightRequests::Blocks(_)))
+            .count();
+        downloaded_bytes
+            .saturating_add(requested_blocks.saturating_mul(self.context.requested_block_bytes()))
     }
 
     pub(crate) fn request_blocks(&mut self, blocks: Vec<BlockHash>) -> Result<(), WireError> {

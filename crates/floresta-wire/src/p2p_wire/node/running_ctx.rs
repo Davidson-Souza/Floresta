@@ -881,7 +881,10 @@ where
             }
 
             NodeNotification::FromWorker(msg) => {
-                error!("Received a notification from the worker thread {msg:?}");
+                debug!("Ignoring stale SwiftSync indexing result: {msg:?}");
+            }
+            NodeNotification::FromValidationWorker(msg) => {
+                debug!("Ignoring stale SwiftSync validation result: {msg:?}");
             }
         }
         Ok(())

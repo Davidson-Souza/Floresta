@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Adapts SwiftSync's rolling cap on requested or downloaded blocks awaiting processing.
+//! Adapts SwiftSync's rolling byte cap on requested or downloaded blocks awaiting processing.
 //!
+//! The cap is maintained in MiB-sized units and defaults to one GiB. Requested blocks reserve
+//! their rolling estimated size; downloaded blocks are charged their actual serialized size.
 //! The caller records useful block bytes, periodically calls `update`, and reads the cap from
-//! `limit`. This module chooses the cap; it does not send requests or manage peers.
+//! `limit_bytes`. This module chooses the cap; it does not send requests or manage peers.
 //!
 //! Each cycle measures a baseline, tries a nearby cap, then keeps or reverts it before measuring
 //! a fresh baseline. Smaller windows win when speeds are similar; only useful throughput decides.
@@ -14,10 +16,14 @@
 use std::time::Duration;
 use std::time::Instant;
 
-// Window sizes, in blocks.
-const BLOCKS_PER_BATCH: usize = 5;
-const MIN_WINDOW: usize = BLOCKS_PER_BATCH;
-const MAX_WINDOW: usize = 2_000;
+// Window sizes, in MiB. The public admission cap is converted to bytes.
+const WINDOW_UNIT_BYTES: usize = 1 << 20;
+const MIN_WINDOW: usize = 64;
+const DEFAULT_WINDOW: usize = 1 << 10;
+const MAX_WINDOW: usize = 1 << 10;
+const INITIAL_BLOCK_RESERVATION_BYTES: usize = 1 << 20;
+const MIN_BLOCK_RESERVATION_BYTES: usize = 1 << 10;
+const MAX_BLOCK_RESERVATION_BYTES: usize = 4 << 20;
 
 // Throughput observation periods.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(30);
@@ -26,7 +32,7 @@ const STABLE_PROBE_INTERVAL: Duration = Duration::from_secs(180);
 
 /// A completed throughput measurement and its resulting decision, for logging.
 pub(super) struct WindowSample {
-    /// Cap during the measurement, before this decision changes it.
+    /// Cap during the measurement, in MiB, before this decision changes it.
     pub measured_limit: usize,
     /// Useful throughput during the observation period, excluding draining and settling.
     pub bytes_per_second: f64,
@@ -34,7 +40,7 @@ pub(super) struct WindowSample {
     pub sample_duration: Duration,
     /// Useful bytes counted during this observation.
     pub sample_bytes: u64,
-    /// Previous cap being compared against, only when this sample completes a trial.
+    /// Previous cap in MiB being compared against, only when this sample completes a trial.
     pub baseline_limit: Option<usize>,
     /// Baseline throughput for the completed trial, if any.
     pub baseline_bytes_per_second: Option<f64>,
@@ -42,10 +48,10 @@ pub(super) struct WindowSample {
     pub action: &'static str,
 }
 
-/// Finds a small download window that sustains throughput by trying nearby limits.
-/// This is a continuously refilled pending-block cap, not a fixed range of heights.
+/// Finds a small byte window that sustains throughput by trying nearby limits.
+/// This is a continuously refilled pending-byte cap, not a fixed range of heights.
 pub(super) struct DownloadWindow {
-    /// Current pending-block cap, always a whole number of GETDATA batches.
+    /// Current pending-byte cap in MiB.
     limit: usize,
     /// Useful throughput being measured at the current cap.
     measurement: Measurement,
@@ -61,6 +67,10 @@ pub(super) struct DownloadWindow {
     probe_after: Instant,
     /// Previous probing eligibility, used to detect when the baseline must reset.
     can_probe: bool,
+    /// Whether current worker pressure permits trials that enlarge the window.
+    growth_allowed: bool,
+    /// Rolling reservation for a requested block whose serialized size is not known yet.
+    estimated_block_bytes: usize,
 }
 
 impl Default for DownloadWindow {
@@ -70,10 +80,10 @@ impl Default for DownloadWindow {
 }
 
 impl DownloadWindow {
-    /// Starts at the maximum cap to download small early blocks aggressively.
+    /// Starts at the one-GiB default cap.
     fn new(now: Instant) -> Self {
         Self {
-            limit: MAX_WINDOW,
+            limit: DEFAULT_WINDOW,
             measurement: Measurement::new(now),
             waiting_for_drain: false,
             next_direction: Direction::Up,
@@ -81,12 +91,54 @@ impl DownloadWindow {
             rejected_probes: 0,
             probe_after: now,
             can_probe: true,
+            growth_allowed: true,
+            estimated_block_bytes: INITIAL_BLOCK_RESERVATION_BYTES,
         }
     }
 
-    /// Returns the cap on requested or downloaded blocks awaiting processing.
+    /// Returns the internal cap in MiB.
+    #[cfg(test)]
     pub(super) fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// Returns the admission cap in bytes.
+    pub(super) fn limit_bytes(&self) -> usize {
+        self.limit.saturating_mul(WINDOW_UNIT_BYTES)
+    }
+
+    /// Rounds a byte backlog up to the controller's whole-MiB units.
+    pub(super) fn units_for_bytes(bytes: usize) -> usize {
+        bytes.div_ceil(WINDOW_UNIT_BYTES)
+    }
+
+    /// Returns the current reservation for one requested block.
+    pub(super) fn estimated_block_bytes(&self) -> usize {
+        self.estimated_block_bytes
+    }
+
+    /// Updates the requested-block reservation from an accepted block's actual serialized size.
+    pub(super) fn observe_block_size(&mut self, bytes: usize) {
+        let bytes = bytes.clamp(MIN_BLOCK_RESERVATION_BYTES, MAX_BLOCK_RESERVATION_BYTES);
+        self.estimated_block_bytes = (self.estimated_block_bytes.saturating_mul(7) + bytes) / 8;
+    }
+
+    #[cfg(test)]
+    pub(super) fn probe_down_next(&mut self) {
+        self.next_direction = Direction::Down;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_limit_for_test(&mut self, limit_mib: usize) {
+        self.limit = limit_mib;
+    }
+
+    /// Prevents larger-window trials while validation workers already have queued work.
+    pub(super) fn set_growth_allowed(&mut self, allowed: bool) {
+        self.growth_allowed = allowed;
+        if !allowed {
+            self.next_direction = Direction::Down;
+        }
     }
 
     /// Describes the current observation state for diagnostic logs without advancing it.
@@ -118,14 +170,14 @@ impl DownloadWindow {
     ///
     /// `response_time` is the median peer latency and sets observation and settling times.
     /// `can_probe` is false while draining the download tail or lacking usable peers.
-    /// `waiting_blocks` counts requested or downloaded blocks still awaiting processing.
+    /// `waiting_window_units` is the requested/downloaded backlog rounded up to whole MiB.
     /// Returns `None` while draining, settling, or collecting a full observation period.
     pub(super) fn update(
         &mut self,
         now: Instant,
         response_time: Duration,
         can_probe: bool,
-        waiting_blocks: usize,
+        waiting_window_units: usize,
     ) -> Option<WindowSample> {
         if can_probe != self.can_probe {
             // A draining tail or a lack of peers cannot tell us the window's capacity.
@@ -134,13 +186,13 @@ impl DownloadWindow {
             self.probe = None;
             self.rejected_probes = 0;
             self.probe_after = now;
-            self.waiting_for_drain = can_probe && waiting_blocks > self.limit;
+            self.waiting_for_drain = can_probe && waiting_window_units > self.limit;
             self.measurement = Measurement::new(now);
         }
 
         let settling_time = response_time.clamp(Duration::from_secs(5), MAX_SAMPLE_PERIOD);
         if self.waiting_for_drain {
-            if waiting_blocks > self.limit {
+            if waiting_window_units > self.limit {
                 return None;
             }
             // Refilling can resume now. Preserve the comparison, but exclude the drain and settling.
@@ -170,7 +222,7 @@ impl DownloadWindow {
         };
 
         // Shrinking cannot cancel requests: wait for the cap to take effect before settling.
-        self.waiting_for_drain = self.limit < measured_limit && waiting_blocks > self.limit;
+        self.waiting_for_drain = self.limit < measured_limit && waiting_window_units > self.limit;
         let settle = if self.limit != measured_limit {
             settling_time
         } else {
@@ -191,7 +243,13 @@ impl DownloadWindow {
     /// Saves this baseline and starts a trial, reversing direction at a window bound.
     fn start_probe(&mut self, throughput: f64) -> &'static str {
         let mut direction = self.next_direction;
+        if !self.growth_allowed && matches!(direction, Direction::Up) {
+            direction = Direction::Down;
+        }
         if direction.candidate(self.limit) == self.limit {
+            if !self.growth_allowed {
+                return "stable";
+            }
             direction = direction.opposite();
         }
         self.probe = Some(Probe {
@@ -210,7 +268,7 @@ impl DownloadWindow {
     fn finish_probe(&mut self, probe: Probe, throughput: f64, now: Instant) -> &'static str {
         let keep = match probe.direction {
             // More pending blocks must improve useful throughput by over 3%.
-            Direction::Up => throughput > probe.baseline_throughput * 1.03,
+            Direction::Up => self.growth_allowed && throughput > probe.baseline_throughput * 1.03,
             // Fewer pending blocks may cost at most 3% of useful throughput.
             Direction::Down => throughput >= probe.baseline_throughput * 0.97,
         };
@@ -277,7 +335,7 @@ impl Measurement {
 
 /// Saves the baseline to compare against throughput at a trial window.
 struct Probe {
-    /// Cap to restore if the trial does not help, in blocks.
+    /// Cap in MiB to restore if the trial does not help.
     previous_limit: usize,
     /// Useful bytes per second measured before starting the trial.
     baseline_throughput: f64,
@@ -285,7 +343,7 @@ struct Probe {
     direction: Direction,
 }
 
-/// Whether a probe tries a larger or smaller pending-block cap.
+/// Whether a probe tries a larger or smaller pending-byte cap.
 #[derive(Clone, Copy)]
 enum Direction {
     Up,
@@ -301,18 +359,16 @@ impl Direction {
         }
     }
 
-    /// Proposes a new pending-block cap, measured in blocks.
+    /// Proposes a new pending-byte cap in whole MiB.
     fn candidate(self, current_window: usize) -> usize {
-        let batches = current_window / BLOCKS_PER_BATCH;
-
-        let next_batches = match self {
-            // Add 25%, adding at least one batch.
-            Self::Up => batches + (batches / 4).max(1),
+        let candidate = match self {
+            // Add 25%, adding at least one MiB.
+            Self::Up => current_window + (current_window / 4).max(1),
             // Keep 80%, rounding down.
-            Self::Down => batches * 4 / 5,
+            Self::Down => current_window * 4 / 5,
         };
 
-        (next_batches * BLOCKS_PER_BATCH).clamp(MIN_WINDOW, MAX_WINDOW)
+        candidate.clamp(MIN_WINDOW, MAX_WINDOW)
     }
 }
 
@@ -325,6 +381,24 @@ mod tests {
         let now = window.measurement.starts_at + SAMPLE_PERIOD;
         window.record_bytes(bytes_per_second * 30, now);
         window.update(now, Duration::from_secs(1), true, 0).unwrap()
+    }
+
+    #[test]
+    fn one_gib_window_reserves_more_early_blocks() {
+        let mut window = DownloadWindow::default();
+        assert_eq!(window.limit_bytes(), 1 << 30);
+        let initial_capacity = window.limit_bytes() / window.estimated_block_bytes();
+
+        for _ in 0..64 {
+            window.observe_block_size(1 << 10);
+        }
+        let early_capacity = window.limit_bytes() / window.estimated_block_bytes();
+        assert!(early_capacity > initial_capacity * 100);
+
+        for _ in 0..64 {
+            window.observe_block_size(4 << 20);
+        }
+        assert!(window.estimated_block_bytes() > 3 << 20);
     }
 
     #[test]
@@ -373,7 +447,7 @@ mod tests {
         assert_eq!(window.limit(), 625);
         // A fresh baseline follows each decision; it is not an all-time best score.
         assert_eq!(sample(&mut window, 80).action, "probe-up");
-        assert_eq!(window.limit(), 780);
+        assert_eq!(window.limit(), 781);
         assert_eq!(sample(&mut window, 81).action, "revert-up");
         assert_eq!(window.limit(), 625);
     }
@@ -395,6 +469,27 @@ mod tests {
             assert_eq!(sample(&mut window, throughput).action, action);
             assert_eq!(window.limit(), limit);
         }
+    }
+
+    #[test]
+    fn worker_pressure_forces_downward_probes_and_rejects_growth() {
+        let mut window = DownloadWindow {
+            limit: 500,
+            ..Default::default()
+        };
+        window.set_growth_allowed(false);
+        assert_eq!(sample(&mut window, 100).action, "probe-down");
+        assert_eq!(window.limit(), 400);
+
+        let mut window = DownloadWindow {
+            limit: 500,
+            ..Default::default()
+        };
+        assert_eq!(sample(&mut window, 100).action, "probe-up");
+        assert_eq!(window.limit(), 625);
+        window.set_growth_allowed(false);
+        assert_eq!(sample(&mut window, 120).action, "revert-up");
+        assert_eq!(window.limit(), 500);
     }
 
     #[test]
@@ -426,14 +521,14 @@ mod tests {
     }
 
     #[test]
-    fn probes_inward_at_bounds_and_preserves_batch_sizes() {
+    fn probes_inward_at_bounds_and_preserves_mib_units() {
         let mut window = DownloadWindow {
             limit: MIN_WINDOW,
             next_direction: Direction::Down,
             ..Default::default()
         };
         assert_eq!(sample(&mut window, 100).action, "probe-up");
-        assert_eq!(window.limit(), 10);
+        assert_eq!(window.limit(), Direction::Up.candidate(MIN_WINDOW));
         window = DownloadWindow {
             limit: MAX_WINDOW,
             ..Default::default()
@@ -441,11 +536,10 @@ mod tests {
         assert_eq!(sample(&mut window, 100).action, "probe-down");
         assert_eq!(window.limit(), Direction::Down.candidate(MAX_WINDOW));
 
-        for limit in (MIN_WINDOW..=MAX_WINDOW).step_by(BLOCKS_PER_BATCH) {
+        for limit in MIN_WINDOW..=MAX_WINDOW {
             for direction in [Direction::Up, Direction::Down] {
                 let candidate = direction.candidate(limit);
                 assert!((MIN_WINDOW..=MAX_WINDOW).contains(&candidate));
-                assert_eq!(candidate % BLOCKS_PER_BATCH, 0);
             }
         }
     }
@@ -454,20 +548,21 @@ mod tests {
     fn does_not_probe_without_progress_and_reverts_a_stalled_trial() {
         let mut window = DownloadWindow::default();
         assert_eq!(sample(&mut window, 0).action, "idle");
-        assert_eq!(window.limit(), MAX_WINDOW);
+        assert_eq!(window.limit(), DEFAULT_WINDOW);
         assert_eq!(sample(&mut window, 100).action, "probe-down");
         assert_eq!(sample(&mut window, 0).action, "revert-down");
-        assert_eq!(window.limit(), MAX_WINDOW);
+        assert_eq!(window.limit(), DEFAULT_WINDOW);
     }
 
     #[test]
-    fn starts_at_the_maximum_and_probes_down_for_a_smaller_window() {
+    fn starts_at_one_gib_and_probes_down() {
         let mut window = DownloadWindow::default();
-        assert_eq!(window.limit(), MAX_WINDOW);
+        assert_eq!(window.limit(), DEFAULT_WINDOW);
+        assert_eq!(window.limit_bytes(), 1 << 30);
         assert_eq!(sample(&mut window, 100).action, "probe-down");
-        assert_eq!(window.limit(), Direction::Down.candidate(MAX_WINDOW));
+        assert_eq!(window.limit(), Direction::Down.candidate(DEFAULT_WINDOW));
         assert_eq!(sample(&mut window, 100).action, "keep-down");
-        assert_eq!(window.limit(), Direction::Down.candidate(MAX_WINDOW));
+        assert_eq!(window.limit(), Direction::Down.candidate(DEFAULT_WINDOW));
     }
 
     #[test]
@@ -489,7 +584,10 @@ mod tests {
                 .is_none()
         );
         let sample = sample(&mut window, 100);
-        assert_eq!(sample.measured_limit, Direction::Down.candidate(MAX_WINDOW));
+        assert_eq!(
+            sample.measured_limit,
+            Direction::Down.candidate(DEFAULT_WINDOW)
+        );
         assert_eq!(sample.bytes_per_second, 100.0);
 
         window = DownloadWindow::new(start);
@@ -523,7 +621,10 @@ mod tests {
     #[test]
     fn downward_probe_waits_for_drain_without_losing_its_baseline() {
         let start = Instant::now();
-        let mut window = DownloadWindow::new(start);
+        let mut window = DownloadWindow {
+            limit: MAX_WINDOW,
+            ..DownloadWindow::new(start)
+        };
         let now = start + SAMPLE_PERIOD;
         window.record_bytes(3_000, now);
         let result = window
@@ -614,7 +715,10 @@ mod tests {
     #[test]
     fn entering_the_download_tail_cancels_the_drain_wait() {
         let start = Instant::now();
-        let mut window = DownloadWindow::new(start);
+        let mut window = DownloadWindow {
+            limit: MAX_WINDOW,
+            ..DownloadWindow::new(start)
+        };
         let now = start + SAMPLE_PERIOD;
         window.record_bytes(3_000, now);
         window.update(now, Duration::ZERO, true, MAX_WINDOW);
@@ -669,14 +773,14 @@ mod tests {
         assert_eq!(window.measurement.starts_at, now);
         assert_eq!(window.measurement.bytes, 0);
         assert!(window.probe.is_none());
-        assert_eq!(window.limit(), Direction::Down.candidate(MAX_WINDOW));
+        assert_eq!(window.limit(), Direction::Down.candidate(DEFAULT_WINDOW));
 
         // A full observation while probing is disabled still leaves the cap unchanged.
         let result = window
             .update(now + SAMPLE_PERIOD, Duration::ZERO, false, 0)
             .unwrap();
         assert_eq!(result.action, "hold");
-        assert_eq!(window.limit(), Direction::Down.candidate(MAX_WINDOW));
+        assert_eq!(window.limit(), Direction::Down.candidate(DEFAULT_WINDOW));
     }
 
     #[test]
@@ -784,7 +888,10 @@ mod tests {
 
     #[test]
     fn repeated_rejections_at_a_window_bound_also_pause_probing() {
-        let mut window = DownloadWindow::default();
+        let mut window = DownloadWindow {
+            limit: MAX_WINDOW,
+            ..Default::default()
+        };
         // At the maximum, reversing direction still leads to another downward trial.
         for _ in 0..2 {
             assert_eq!(sample(&mut window, 100).action, "probe-down");

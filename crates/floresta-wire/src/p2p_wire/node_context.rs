@@ -39,6 +39,11 @@ pub trait NodeContext {
     /// Whether an overdue block request increases its peer's banscore.
     const PENALIZE_BLOCK_TIMEOUT: bool = true;
 
+    /// Timeout for block requests, optionally derived from ready peers' average response time.
+    fn block_request_timeout(&self, _average_peer_time: Option<Duration>) -> Duration {
+        Duration::from_secs(Self::REQUEST_TIMEOUT)
+    }
+
     /// Max number of simultaneous connections we initiates we are willing to hold
     const MAX_OUTGOING_PEERS: usize = 10;
 
@@ -94,6 +99,31 @@ pub trait NodeContext {
     /// Maximum number of requested or downloaded blocks awaiting processing.
     fn block_download_window(&self) -> usize {
         Self::BLOCKS_PER_GETDATA * Self::MAX_CONCURRENT_GETDATA
+    }
+
+    /// Optional byte-based cap for requested and downloaded blocks awaiting processing.
+    fn block_download_window_bytes(&self) -> Option<usize> {
+        None
+    }
+
+    /// Reservation for a requested block whose serialized size is not known yet.
+    fn requested_block_bytes(&self) -> usize {
+        0
+    }
+
+    /// Blocks retained by a context after leaving the common download queue.
+    fn retained_processing_blocks(&self) -> usize {
+        0
+    }
+
+    /// Serialized bytes retained after leaving the common download queue.
+    fn retained_processing_bytes(&self) -> usize {
+        0
+    }
+
+    /// Cached serialized bytes for all downloaded blocks, if maintained by this context.
+    fn downloaded_processing_bytes(&self) -> Option<usize> {
+        None
     }
 
     fn get_required_services(&self) -> ServiceFlags {

@@ -1054,6 +1054,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "floresta-db"
+version = "0.1.0"
+source = "git+https://github.com/Davidson-Souza/floresta-db?branch=ss-branch#a6fbbc261e1c3bae03d6b90be3c6c99603b92d20"
+
+[[package]]
 name = "floresta-domain"
 version = "0.1.0"
 dependencies = [
@@ -1194,6 +1199,7 @@ dependencies = [
  "floresta-chain",
  "floresta-common",
  "floresta-compact-filters",
+ "floresta-db",
  "floresta-domain",
  "floresta-mempool",
  "floresta-metrics",

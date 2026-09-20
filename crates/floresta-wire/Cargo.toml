@@ -20,6 +20,7 @@ categories = ["cryptography::cryptocurrencies", "network-programming"]
 bip324 = { version = "=0.11.0", features = [ "tokio" ] }
 bitcoin = { workspace = true, features = ["serde"] }
 dns-lookup = { workspace = true }
+floresta-db = { workspace = true }
 hintsfile = "0.1.1"
 rand = { workspace = true }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
@@ -36,7 +37,7 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 
 # Local dependencies
-floresta-chain = { workspace = true, features = ["flat-chainstore"] }
+floresta-chain = { workspace = true, features = ["bitcoinkernel", "flat-chainstore"] }
 floresta-compact-filters = { workspace = true }
 floresta-common = { workspace = true }
 floresta-domain = { workspace = true }
