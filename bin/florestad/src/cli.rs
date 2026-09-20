@@ -82,12 +82,12 @@ pub struct Cli {
     /// may not be discovered. Use the JSON-RPC `rescanblockchain` to pick them up.
     pub wallet_descriptor: Option<Vec<String>>,
 
-    #[arg(long, value_name = "BLOCK_HASH|0", default_value = "hardcoded", value_parser = parse_assume_valid)]
+    #[arg(long, value_name = "BLOCK_HASH|0", default_value = "0", value_parser = parse_assume_valid)]
     /// Assume that all blocks prior to and including this block have valid scripts.
     ///
-    /// - default: use the hardcoded assume-valid value, reviewed by the Floresta developers
+    /// - default: disable assume-valid and verify all scripts from genesis
+    /// - `--assume-valid hardcoded`: use the reviewed Floresta checkpoint
     /// - `--assume-valid <BLOCK_HASH>`: override with your own hash
-    /// - `--assume-valid 0`: disable assume-valid and verify all scripts from genesis
     pub assume_valid: AssumeValidArg,
 
     #[arg(long, short, value_name = "address[:<port>]")]

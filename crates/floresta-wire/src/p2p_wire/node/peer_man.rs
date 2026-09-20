@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::time::Duration;
 use std::collections::HashMap;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -78,6 +78,17 @@ where
             .collect::<Vec<_>>();
         times.sort_by(f64::total_cmp);
         times.get(times.len() / 2).copied()
+    }
+
+    /// Returns the arithmetic mean response time among eligible peers.
+    pub(crate) fn average_peer_latency(&self, service: ServiceFlags) -> Option<Duration> {
+        let (total_ms, peers) = self
+            .ready_peers(service)
+            .filter_map(|(_, peer)| peer.message_times.value())
+            .fold((0.0, 0_u32), |(total, count), latency| {
+                (total + latency, count + 1)
+            });
+        (peers != 0).then(|| Duration::from_secs_f64(total_ms / f64::from(peers) / 1_000.0))
     }
 
     /// Picks a ready peer, weighted by inverse general response latency.
@@ -607,17 +618,21 @@ where
     /// penalty, and resend the request to a peer.
     pub(crate) fn check_for_timeout(&mut self) -> Result<(), WireError> {
         let now = Instant::now();
+        let average_peer_time = self.average_peer_latency(ServiceFlags::NETWORK);
+        let block_timeout = self.context.block_request_timeout(average_peer_time);
 
-        let timed_out_fn = |req: &InflightRequests, time: &Instant| match req {
-            InflightRequests::Connect(_)
-                if now.duration_since(*time).as_secs() > T::CONNECTION_TIMEOUT =>
-            {
-                Some(req.clone())
+        let timed_out_fn = |req: &InflightRequests, time: &Instant| {
+            let age = now.duration_since(*time);
+            match req {
+                InflightRequests::Connect(_)
+                    if age > Duration::from_secs(T::CONNECTION_TIMEOUT) =>
+                {
+                    Some(req.clone())
+                }
+                InflightRequests::Blocks(_) if age > block_timeout => Some(req.clone()),
+                _ if age > Duration::from_secs(T::REQUEST_TIMEOUT) => Some(req.clone()),
+                _ => None,
             }
-
-            _ if now.duration_since(*time).as_secs() > T::REQUEST_TIMEOUT => Some(req.clone()),
-
-            _ => None,
         };
 
         let timed_out = self
@@ -661,7 +676,6 @@ where
                 self.peers.remove(&peer);
                 continue;
             }
-
             debug!("Request timed out: {req:?}");
             if matches!(
                 req,
@@ -672,11 +686,29 @@ where
             ) && let Some(peer) = self.peers.get_mut(&peer)
             {
                 // Silence is at least this slow; score it now even if no response ever arrives.
-                peer.message_times.add(T::REQUEST_TIMEOUT as f64 * 1_000.0);
+                let timeout = if matches!(req, InflightRequests::Blocks(_)) {
+                    block_timeout
+                } else {
+                    Duration::from_secs(T::REQUEST_TIMEOUT)
+                };
+                peer.message_times.add(timeout.as_secs_f64() * 1_000.0);
             }
             // Adaptive download probing may delay honest block responses.
             if T::PENALIZE_BLOCK_TIMEOUT || !matches!(req, InflightRequests::Blocks(_)) {
                 try_and_log!(self.increase_banscore(peer, 1));
+            }
+
+            let exclude_timed_out_peer =
+                !T::PENALIZE_BLOCK_TIMEOUT && matches!(req, InflightRequests::Blocks(_));
+            if exclude_timed_out_peer {
+                // SwiftSync retries are latency probes, not peer punishments. Exclude this
+                // assignment before selecting a replacement; disconnect cleanup runs later.
+                let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
+                if let Some(peer) = self.peers.get_mut(&peer) {
+                    peer.state = PeerStatus::Awaiting;
+                }
+            } else {
+                self.send_to_peer(peer, NodeRequest::Shutdown)?;
             }
 
             if let Err(e) = self.redo_inflight_request(&req) {
@@ -701,7 +733,10 @@ where
             info!(
                 "Block request timeouts: blocks={block_timeouts} other_requests={other_timeouts} \
                  retry_failures={retry_failures} oldest_age_secs={oldest_timeout_secs} \
-                 block_timeouts_by_peer={block_timeouts_by_peer:?}"
+                 dynamic_timeout_ms={:.1} average_peer_ms={:?} \
+                 block_timeouts_by_peer={block_timeouts_by_peer:?}",
+                block_timeout.as_secs_f64() * 1_000.0,
+                average_peer_time.map(|time| time.as_secs_f64() * 1_000.0),
             );
         }
 

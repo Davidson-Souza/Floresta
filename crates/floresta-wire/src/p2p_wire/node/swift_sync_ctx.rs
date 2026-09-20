@@ -4,9 +4,14 @@
 //! needed to validate the UTXO set with the SwiftSync method.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::fmt;
+use std::fs;
 use std::fs::File;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -14,16 +19,33 @@ use std::time::Instant;
 use bitcoin::Amount;
 use bitcoin::BlockHash;
 use bitcoin::Network;
+use bitcoin::OutPoint;
+use bitcoin::TxIn;
+use bitcoin::TxOut;
 use bitcoin::block::Header as BlockHeader;
+use bitcoin::consensus::deserialize;
+use bitcoin::consensus::serialize;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::sha256;
 use bitcoin::p2p::ServiceFlags;
 use floresta_chain::BlockValidationErrors;
 use floresta_chain::BlockchainError;
+use floresta_chain::CompactLeafData;
+use floresta_chain::DatabaseError;
+use floresta_chain::ScriptPubKeyKind;
 use floresta_chain::ThreadSafeChain;
+use floresta_chain::extensions::Bip30UnspendableExt;
+use floresta_chain::extensions::HeaderExt;
+use floresta_chain::proof_util;
 use floresta_chain::pruned_utreexo::IBDState;
 use floresta_chain::pruned_utreexo::consensus::Consensus;
+use floresta_chain::pruned_utreexo::utxo_data::UtxoData;
 use floresta_chain::swift_sync_agg::SipHashKeys;
 use floresta_chain::swift_sync_agg::SwiftSyncAgg;
 use floresta_common::service_flags;
+use floresta_db::Config as DatabaseConfig;
+use floresta_db::Database;
+use floresta_db::Mode;
 use hintsfile::Hintsfile;
 use rand::Rng;
 use rustreexo::node_hash::BitcoinNodeHash;
@@ -36,13 +58,14 @@ use tracing::info;
 use tracing::warn;
 
 use crate::node::ConnectionKind;
+use crate::node::IndexWorkerResult;
 use crate::node::InflightBlock;
 use crate::node::InflightRequests;
 use crate::node::NodeNotification;
 use crate::node::PeerStatus;
 use crate::node::UtreexoNode;
+use crate::node::ValidationTimings;
 use crate::node::WitnessMode;
-use crate::node::WorkerResult;
 use crate::node::download_window::DownloadWindow;
 use crate::node::oneshot::error::TryRecvError;
 use crate::node::periodic_job;
@@ -56,6 +79,371 @@ use crate::p2p_wire::stump_updater::SparseUtreexoAdds;
 use crate::p2p_wire::stump_updater::StumpUpdater;
 use crate::p2p_wire::stump_updater::StumpUpdaterHandle;
 
+#[derive(Debug)]
+struct SwiftSyncDatabaseError(String);
+
+impl fmt::Display for SwiftSyncDatabaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl DatabaseError for SwiftSyncDatabaseError {}
+
+struct SwiftSyncUtxoDb {
+    database: Option<Database>,
+    path: PathBuf,
+}
+
+const UTXO_KEY_SIZE: usize = 16;
+const SCRIPT_COMMITMENT_SIZE: usize = 12;
+const UTXO_METADATA_SIZE: usize = 16;
+const RECLAIM_WATERMARK: usize = 16 * 1024;
+const PACKED_AMOUNT_BITS: u32 = 37;
+const PACKED_AMOUNT_MASK: u64 = (1 << PACKED_AMOUNT_BITS) - 1;
+const PACKED_SPK_SHIFT: u32 = PACKED_AMOUNT_BITS;
+const PACKED_COINBASE_SHIFT: u32 = PACKED_SPK_SHIFT + 3;
+const PACKED_HEIGHT_SHIFT: u32 = PACKED_COINBASE_SHIFT + 1;
+const PACKED_HEIGHT_MAX: u32 = (1 << 23) - 1;
+
+struct LoadedInputs {
+    utxos: HashMap<OutPoint, UtxoData>,
+}
+
+impl SwiftSyncUtxoDb {
+    fn create(datadir: &Path) -> Result<Arc<Self>, BlockchainError> {
+        let path = datadir.join(format!(".swiftsync-utxos-{}", rand::rng().next_u64()));
+        let mut config = DatabaseConfig::new(Mode::Map, 1 << 25);
+        // Sparse mappings: these are address-space maxima, not eager disk allocations.
+        config.body_capacity = 256 << 30;
+        config.blob_capacity = 256 << 30;
+        let database = Database::create(&path, config)
+            .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?;
+        Ok(Arc::new(Self {
+            database: Some(database),
+            path,
+        }))
+    }
+
+    /// Packs the 96 least-significant txid bits and 32-bit vout into one 128-bit key.
+    fn outpoint_key(outpoint: OutPoint) -> [u8; UTXO_KEY_SIZE] {
+        let txid = outpoint.txid.to_byte_array();
+        let mut key = [0_u8; UTXO_KEY_SIZE];
+        // Txid's internal byte order is the reverse of its display order, so this prefix is the
+        // numeric least-significant end.
+        key[..12].copy_from_slice(&txid[..12]);
+        key[12..].copy_from_slice(&outpoint.vout.to_le_bytes());
+        key
+    }
+
+    fn encode_utxo(utxo: &UtxoData) -> Vec<u8> {
+        let script_kind = proof_util::get_script_type(&utxo.txout.script_pubkey);
+        let amount = utxo.txout.value.to_sat();
+        if let Some(encoded_kind) = Self::packed_script_kind(&script_kind)
+            && utxo.creation_height <= PACKED_HEIGHT_MAX
+            && amount <= PACKED_AMOUNT_MASK
+        {
+            let packed = amount
+                | encoded_kind << PACKED_SPK_SHIFT
+                | u64::from(utxo.is_coinbase) << PACKED_COINBASE_SHIFT
+                | u64::from(utxo.creation_height) << PACKED_HEIGHT_SHIFT;
+            return packed.to_le_bytes().to_vec();
+        }
+
+        let header_code = (utxo.creation_height << 1) | u32::from(utxo.is_coinbase);
+        let encoded_kind = serialize(&script_kind);
+        let reconstructable = !matches!(&script_kind, ScriptPubKeyKind::Other(_));
+        let mut value = Vec::with_capacity(
+            UTXO_METADATA_SIZE
+                + encoded_kind.len()
+                + usize::from(reconstructable) * SCRIPT_COMMITMENT_SIZE,
+        );
+        value.extend_from_slice(&header_code.to_le_bytes());
+        value.extend_from_slice(&utxo.creation_time.to_le_bytes());
+        value.extend_from_slice(&amount.to_le_bytes());
+        value.extend_from_slice(&encoded_kind);
+        if reconstructable {
+            let commitment = sha256::Hash::hash(utxo.txout.script_pubkey.as_bytes());
+            value.extend_from_slice(&commitment.to_byte_array()[..SCRIPT_COMMITMENT_SIZE]);
+        }
+        value
+    }
+
+    fn packed_script_kind(script_kind: &ScriptPubKeyKind) -> Option<u64> {
+        match script_kind {
+            ScriptPubKeyKind::PubKeyHash => Some(1),
+            ScriptPubKeyKind::WitnessV0PubKeyHash => Some(2),
+            ScriptPubKeyKind::ScriptHash => Some(3),
+            ScriptPubKeyKind::WitnessV0ScriptHash => Some(4),
+            ScriptPubKeyKind::Other(_) => None,
+        }
+    }
+
+    fn unpacked_script_kind(encoded: u64) -> Result<ScriptPubKeyKind, BlockchainError> {
+        match encoded {
+            1 => Ok(ScriptPubKeyKind::PubKeyHash),
+            2 => Ok(ScriptPubKeyKind::WitnessV0PubKeyHash),
+            3 => Ok(ScriptPubKeyKind::ScriptHash),
+            4 => Ok(ScriptPubKeyKind::WitnessV0ScriptHash),
+            _ => Err(SwiftSyncDatabaseError("invalid packed script type".to_owned()).into()),
+        }
+    }
+
+    fn decode_utxo(value: &[u8], input: &TxIn) -> Result<UtxoData, BlockchainError> {
+        let (header_code, creation_time, amount, script_kind, commitment) = if let Ok(packed) =
+            <[u8; 8]>::try_from(value)
+        {
+            let packed = u64::from_le_bytes(packed);
+            let amount = packed & PACKED_AMOUNT_MASK;
+            let encoded_kind = (packed >> PACKED_SPK_SHIFT) & 0b111;
+            let is_coinbase = (packed >> PACKED_COINBASE_SHIFT) & 1;
+            let height = packed >> PACKED_HEIGHT_SHIFT;
+            (
+                (u32::try_from(height)
+                    .map_err(|_| SwiftSyncDatabaseError("packed height overflow".to_owned()))?
+                    << 1)
+                    | u32::try_from(is_coinbase).map_err(|_| {
+                        SwiftSyncDatabaseError("packed coinbase flag overflow".to_owned())
+                    })?,
+                0,
+                amount,
+                Self::unpacked_script_kind(encoded_kind)?,
+                None,
+            )
+        } else {
+            if value.len() <= UTXO_METADATA_SIZE {
+                return Err(SwiftSyncDatabaseError("truncated SwiftSync UTXO".to_owned()).into());
+            }
+            let header_code =
+                u32::from_le_bytes(value[..4].try_into().expect("four-byte header code"));
+            let creation_time =
+                u32::from_le_bytes(value[4..8].try_into().expect("four-byte creation time"));
+            let amount = u64::from_le_bytes(value[8..16].try_into().expect("eight-byte amount"));
+            let encoded_script = &value[UTXO_METADATA_SIZE..];
+            let script_kind: ScriptPubKeyKind = if encoded_script[0] == 0 {
+                deserialize(encoded_script)
+                    .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?
+            } else {
+                if encoded_script.len() != 1 + SCRIPT_COMMITMENT_SIZE {
+                    return Err(SwiftSyncDatabaseError(
+                        "invalid reconstructable script encoding".to_owned(),
+                    )
+                    .into());
+                }
+                deserialize(&encoded_script[..1])
+                    .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?
+            };
+            let commitment = if encoded_script[0] == 0 {
+                None
+            } else {
+                Some(&encoded_script[1..1 + SCRIPT_COMMITMENT_SIZE])
+            };
+            (header_code, creation_time, amount, script_kind, commitment)
+        };
+        let leaf = CompactLeafData {
+            header_code,
+            amount,
+            spk_ty: script_kind,
+        };
+        let script_pubkey = proof_util::reconstruct_script_pubkey(&leaf, input).map_err(|err| {
+            BlockValidationErrors::ScriptValidationError(format!(
+                "could not reconstruct prevout script: {err:?}"
+            ))
+        })?;
+        if let Some(expected_commitment) = commitment {
+            let commitment = sha256::Hash::hash(script_pubkey.as_bytes()).to_byte_array();
+            if commitment[..SCRIPT_COMMITMENT_SIZE] != *expected_commitment {
+                return Err(BlockValidationErrors::ScriptValidationError(
+                    "reconstructed prevout script does not match its indexed commitment".to_owned(),
+                )
+                .into());
+            }
+        }
+        Ok(UtxoData {
+            txout: TxOut {
+                value: Amount::from_sat(amount),
+                script_pubkey,
+            },
+            is_coinbase: header_code & 1 != 0,
+            creation_height: header_code >> 1,
+            creation_time,
+        })
+    }
+
+    fn index_block(
+        &self,
+        block: &bitcoin::Block,
+        height: u32,
+        unspent_indexes: &HashSet<u32>,
+        creation_time: u32,
+    ) -> Result<(), BlockchainError> {
+        let mut output_index = 0_u32;
+        let mut entries = Vec::new();
+        let spent_in_block: HashSet<OutPoint> = block
+            .txdata
+            .iter()
+            .skip(1)
+            .flat_map(|transaction| transaction.input.iter())
+            .map(|input| input.previous_output)
+            .collect();
+
+        for (transaction_index, transaction) in block.txdata.iter().enumerate() {
+            if transaction_index == 0 && block.is_bip30_unspendable(height) {
+                continue;
+            }
+            let txid = transaction.compute_txid();
+            for (vout, txout) in transaction.output.iter().enumerate() {
+                if Consensus::is_unspendable(&txout.script_pubkey) {
+                    continue;
+                }
+                let is_unspent = unspent_indexes.contains(&output_index);
+                output_index += 1;
+                if is_unspent {
+                    continue;
+                }
+                let outpoint = OutPoint::new(txid, vout as u32);
+                if spent_in_block.contains(&outpoint) {
+                    continue;
+                }
+                let key = Self::outpoint_key(outpoint);
+                let value = Self::encode_utxo(&UtxoData {
+                    txout: txout.clone(),
+                    is_coinbase: transaction_index == 0,
+                    creation_height: height,
+                    creation_time,
+                });
+                entries.push((key, value));
+            }
+        }
+
+        let writer = self
+            .database
+            .as_ref()
+            .expect("database exists until drop")
+            .write_only()
+            .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?;
+        writer
+            .put_batch(
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.as_slice(), value.as_slice())),
+            )
+            .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?;
+        Ok(())
+    }
+
+    fn load_inputs(
+        &self,
+        block: &bitcoin::Block,
+        height: u32,
+        creation_time: u32,
+    ) -> Result<LoadedInputs, BlockchainError> {
+        let txids: Vec<_> = block
+            .txdata
+            .iter()
+            .map(|transaction| transaction.compute_txid())
+            .collect();
+        let block_outputs: HashSet<OutPoint> = block
+            .txdata
+            .iter()
+            .zip(&txids)
+            .flat_map(|(transaction, txid)| {
+                transaction
+                    .output
+                    .iter()
+                    .enumerate()
+                    .map(move |(vout, _)| OutPoint::new(*txid, vout as u32))
+            })
+            .collect();
+        let spent_in_block: HashSet<OutPoint> = block
+            .txdata
+            .iter()
+            .skip(1)
+            .flat_map(|transaction| transaction.input.iter())
+            .map(|input| input.previous_output)
+            .filter(|outpoint| block_outputs.contains(outpoint))
+            .collect();
+
+        let mut local_outputs = HashMap::with_capacity(spent_in_block.len());
+        let mut inputs = HashMap::new();
+        let mut external_inputs = Vec::new();
+        let mut seen_inputs = HashSet::new();
+        for (transaction_index, (transaction, txid)) in block.txdata.iter().zip(txids).enumerate() {
+            if transaction_index != 0 {
+                for input in &transaction.input {
+                    let outpoint = input.previous_output;
+                    if !seen_inputs.insert(outpoint) {
+                        return Err(BlockValidationErrors::UtxoNotFound(outpoint).into());
+                    }
+                    if let Some(utxo) = local_outputs.remove(&outpoint) {
+                        inputs.insert(outpoint, utxo);
+                    } else if block_outputs.contains(&outpoint) {
+                        // The referenced output belongs to this block but has not been created yet,
+                        // or was already consumed by an earlier transaction.
+                        return Err(BlockValidationErrors::UtxoNotFound(outpoint).into());
+                    } else {
+                        external_inputs.push((outpoint, input));
+                    }
+                }
+            }
+
+            for (vout, txout) in transaction.output.iter().enumerate() {
+                let outpoint = OutPoint::new(txid, vout as u32);
+                if spent_in_block.contains(&outpoint) {
+                    local_outputs.insert(
+                        outpoint,
+                        UtxoData {
+                            txout: txout.clone(),
+                            is_coinbase: transaction_index == 0,
+                            creation_height: height,
+                            creation_time,
+                        },
+                    );
+                }
+            }
+        }
+
+        let keys: Vec<(OutPoint, [u8; UTXO_KEY_SIZE])> = external_inputs
+            .iter()
+            .map(|(outpoint, _)| (*outpoint, Self::outpoint_key(*outpoint)))
+            .collect();
+        let values = self.pop_inputs(&keys)?;
+        inputs.reserve(external_inputs.len());
+        for ((outpoint, input), value) in external_inputs.into_iter().zip(values) {
+            inputs.insert(outpoint, Self::decode_utxo(&value, input)?);
+        }
+        Ok(LoadedInputs { utxos: inputs })
+    }
+
+    /// Destructively loads inputs in bounded batches so body and blob reclamation never retains
+    /// more than [`RECLAIM_WATERMARK`] detached entries at once.
+    fn pop_inputs(
+        &self,
+        keys: &[(OutPoint, [u8; UTXO_KEY_SIZE])],
+    ) -> Result<Vec<Vec<u8>>, BlockchainError> {
+        let database = self.database.as_ref().expect("database exists until drop");
+        let mut values = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(RECLAIM_WATERMARK) {
+            let popped = database
+                .batch_pop(chunk.iter().map(|(_, key)| key.as_slice()))
+                .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?;
+            for ((outpoint, _), value) in chunk.iter().zip(popped) {
+                values.push(value.ok_or(BlockValidationErrors::UtxoNotFound(*outpoint))?);
+            }
+        }
+        Ok(values)
+    }
+}
+
+impl Drop for SwiftSyncUtxoDb {
+    fn drop(&mut self) {
+        drop(self.database.take());
+        if let Err(err) = fs::remove_dir_all(&self.path) {
+            warn!("Failed to remove temporary SwiftSync UTXO index: {err}");
+        }
+    }
+}
+
 /// [`SwiftSync`] is a node that downloads and validates the blockchain but skips utreexo
 /// proofs by using SwiftSync.
 ///
@@ -64,9 +452,27 @@ use crate::p2p_wire::stump_updater::StumpUpdaterHandle;
 ///     - `UtreexoNode<SwiftSync, Chain>`
 #[derive(Default)]
 pub struct SwiftSync {
+    /// Temporary historical prevout index shared by indexing and validation workers.
+    utxo_db: Option<Arc<SwiftSyncUtxoDb>>,
+
+    /// Indexed blocks retained until contextual validation completes.
+    indexed_blocks: BTreeMap<u32, InflightBlock>,
+
+    /// Serialized bytes held by all downloaded blocks until validation completes.
+    downloaded_block_bytes: usize,
+
+    /// Indexed heights whose predecessors have all been indexed.
+    validation_queue: VecDeque<u32>,
+
+    /// Heights currently undergoing contextual validation.
+    validating: HashSet<u32>,
+
+    /// Highest contiguous indexed height.
+    indexed_prefix: u32,
+
     stump_updater: Option<StumpUpdaterHandle>,
 
-    /// Rolling limit for requested and not-yet-processed blocks; freed slots are refilled immediately.
+    /// Rolling byte limit for requested and not-yet-processed blocks.
     download_window: DownloadWindow,
 
     /// Interval counters for logging only; never used to select peers or adjust the window.
@@ -98,18 +504,51 @@ pub struct SwiftSync {
     abort_height: Option<u32>,
 }
 
+const BLOCK_TIMEOUT_MULTIPLIER: u32 = 10;
+const BLOCK_TIMEOUT_SAFETY_MARGIN: Duration = Duration::from_secs(2);
+const MIN_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const FALLBACK_PEER_RESPONSE_TIME: Duration = Duration::from_secs(2);
+
 impl NodeContext for SwiftSync {
     fn get_required_services(&self) -> bitcoin::p2p::ServiceFlags {
         ServiceFlags::WITNESS | service_flags::UTREEXO.into() | ServiceFlags::NETWORK
     }
 
     fn block_download_window(&self) -> usize {
-        self.download_window.limit()
+        MAX_BUFFERED_BLOCKS
+    }
+
+    fn block_download_window_bytes(&self) -> Option<usize> {
+        Some(self.download_window.limit_bytes())
+    }
+
+    fn requested_block_bytes(&self) -> usize {
+        self.download_window.estimated_block_bytes()
+    }
+
+    fn retained_processing_blocks(&self) -> usize {
+        self.indexed_blocks.len()
+    }
+
+    fn downloaded_processing_bytes(&self) -> Option<usize> {
+        Some(self.downloaded_block_bytes)
+    }
+
+    fn block_request_timeout(&self, average_peer_time: Option<Duration>) -> Duration {
+        average_peer_time
+            .unwrap_or(FALLBACK_PEER_RESPONSE_TIME)
+            .saturating_mul(BLOCK_TIMEOUT_MULTIPLIER)
+            .saturating_add(BLOCK_TIMEOUT_SAFETY_MARGIN)
+            .clamp(
+                MIN_BLOCK_REQUEST_TIMEOUT,
+                MAX_BLOCK_REQUEST_TIMEOUT.min(Duration::from_secs(Self::REQUEST_TIMEOUT)),
+            )
     }
 
     const TRY_NEW_CONNECTION: u64 = 15; // We want to be well-connected early on
     const NEW_CONNECTIONS_BATCH_SIZE: usize = 12;
-    const REQUEST_TIMEOUT: u64 = 2 * 60; // 2 minutes (5 blocks should reach us much faster)
+    const REQUEST_TIMEOUT: u64 = 2 * 60; // Upper bound and timeout for non-block requests
     const MAX_INFLIGHT_REQUESTS: usize = 100; // double the default
     const MAX_OUTGOING_PEERS: usize = 30;
     // Probing download capacity can produce late responses without peer misbehavior.
@@ -121,7 +560,8 @@ impl NodeContext for SwiftSync {
 }
 
 // This is more than enough to avoid CPU from ever becoming a bottleneck
-const MAX_PARALLEL_WORKERS: usize = 6;
+const MAX_PARALLEL_WORKERS: usize = 16;
+const MAX_BUFFERED_BLOCKS: usize = 2_000;
 
 /// Slot peaks and time with all slots occupied while a downloaded block awaits dispatch.
 /// Slots include dispatch/result-queue delay and inline processing, not just CPU execution.
@@ -203,6 +643,10 @@ struct DownloadDiagnostics {
     worker_results: u64,
     worker_turnaround: Duration,
     max_worker_turnaround: Duration,
+    validation_results: u64,
+    prevout_fetch_time: Duration,
+    prevout_delete_time: Duration,
+    consensus_validation_time: Duration,
 }
 
 impl Default for DownloadDiagnostics {
@@ -216,6 +660,10 @@ impl Default for DownloadDiagnostics {
             worker_results: 0,
             worker_turnaround: Duration::ZERO,
             max_worker_turnaround: Duration::ZERO,
+            validation_results: 0,
+            prevout_fetch_time: Duration::ZERO,
+            prevout_delete_time: Duration::ZERO,
+            consensus_validation_time: Duration::ZERO,
         }
     }
 }
@@ -242,6 +690,40 @@ impl DownloadDiagnostics {
         }
         self.max_message_delay = self.max_message_delay.max(message_delay);
     }
+}
+
+#[derive(Default)]
+struct ProcessMemory {
+    rss_kib: u64,
+    anonymous_kib: u64,
+    file_kib: u64,
+    swap_kib: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory() -> ProcessMemory {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return ProcessMemory::default();
+    };
+    let value = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    };
+    ProcessMemory {
+        rss_kib: value("VmRSS:"),
+        anonymous_kib: value("RssAnon:"),
+        file_kib: value("RssFile:"),
+        swap_kib: value("VmSwap:"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memory() -> ProcessMemory {
+    ProcessMemory::default()
 }
 
 /// Node methods for a [`UtreexoNode`] where its Context is [`SwiftSync`].
@@ -326,102 +808,192 @@ where
         self.maybe_open_connection(ServiceFlags::NETWORK)
     }
 
-    /// Slots stay occupied until the node handles their results, even if execution has finished.
-    fn busy_workers(&self) -> usize {
+    fn indexing_workers(&self) -> usize {
         self.blocks
             .values()
-            .filter(|b| b.processing_since.is_some())
+            .filter(|block| block.processing_since.is_some())
             .count()
+    }
+
+    /// Slots stay occupied until the node handles their results, even if execution has finished.
+    fn busy_workers(&self) -> usize {
+        self.indexing_workers() + self.context.validating.len()
     }
 
     /// Call after each queue/slot change, including completion before any recursive inline work.
     fn record_worker_occupancy(&mut self) {
         let occupied = self.busy_workers();
-        let queued = self.blocks.len() - occupied;
+        let queued_indexing = self.blocks.len().saturating_sub(self.indexing_workers());
+        let queued = queued_indexing + self.context.validation_queue.len();
         self.context
             .worker_occupancy
             .record(Instant::now(), occupied, queued);
     }
 
-    /// Starts SwiftSync processing for up to `MAX_PARALLEL_WORKERS` pending blocks.
+    /// Starts eligible validation first, then fills remaining slots with unordered indexing work.
     fn pump_swiftsync(&mut self, hints: &mut Hintsfile) -> Result<(), WireError> {
-        let free = MAX_PARALLEL_WORKERS.saturating_sub(self.busy_workers());
-        if free == 0 {
-            return Ok(());
+        while self.busy_workers() < MAX_PARALLEL_WORKERS {
+            let Some(height) = self.context.validation_queue.pop_front() else {
+                break;
+            };
+            if let Err(error) = self.start_validating_swiftsync(height) {
+                error!(
+                    "Aborting SwiftSync: failed to start validation at height {height}: {error}"
+                );
+                self.context.abort_height = Some(height);
+                self.record_worker_occupancy();
+                return Ok(());
+            }
         }
 
-        // Collect hashes first (can't mutate the map while iterating it)
-        let to_process: Vec<BlockHash> = self
+        let free = MAX_PARALLEL_WORKERS.saturating_sub(self.busy_workers());
+        let to_index: Vec<BlockHash> = self
             .blocks
             .iter()
-            .filter(|(_, b)| b.processing_since.is_none())
-            .take(free) // We don't exceed MAX_PARALLEL_WORKERS
-            .map(|(h, _)| *h)
+            .filter(|(_, block)| block.processing_since.is_none())
+            .take(free)
+            .map(|(hash, _)| *hash)
             .collect();
 
-        for hash in to_process {
-            // Prefer storing height in the entry to avoid repeated chain lookups
-            let height = self
-                .chain
-                .get_block_height(&hash)?
-                // NOTE: if a previous block was invalid, we will get this error
-                .ok_or(BlockchainError::OrphanOrInvalidBlock)?;
-
-            self.start_processing_swiftsync(hash, height, hints)?;
+        for hash in to_index {
+            let height = match self.chain.get_block_height(&hash) {
+                Ok(Some(height)) => height,
+                Ok(None) => {
+                    let abort_height = self.context.indexed_prefix.saturating_add(1);
+                    error!(
+                        "Aborting SwiftSync: downloaded block {hash} is orphaned or marked invalid \
+                         in the header index; indexed_prefix={} abort_height={abort_height}",
+                        self.context.indexed_prefix
+                    );
+                    self.context.abort_height = Some(abort_height);
+                    break;
+                }
+                Err(error) => {
+                    let abort_height = self.context.indexed_prefix.saturating_add(1);
+                    error!(
+                        "Aborting SwiftSync: failed to look up downloaded block {hash} in the \
+                         header index: {error}; indexed_prefix={} abort_height={abort_height}",
+                        self.context.indexed_prefix
+                    );
+                    self.context.abort_height = Some(abort_height);
+                    break;
+                }
+            };
+            if let Err(error) = self.start_processing_swiftsync(hash, height, hints) {
+                error!(
+                    "Aborting SwiftSync: failed to start indexing block {hash} at height \
+                     {height}: {error}"
+                );
+                self.context.abort_height = Some(height);
+                break;
+            }
         }
-
+        self.record_worker_occupancy();
         Ok(())
     }
 
-    /// Spawns a blocking task to process a block with the provided SwiftSync hints.
+    fn previous_median_time_past(&self, header: &BlockHeader) -> Result<u32, Chain::Error> {
+        let previous = self.chain.get_block_header(&header.prev_blockhash)?;
+        previous
+            .median_time_past_with(|current| self.chain.get_block_header(&current.prev_blockhash))
+    }
+
+    /// Spawns an unordered indexing task for a downloaded block.
     fn start_processing_swiftsync(
         &mut self,
         block_hash: BlockHash,
         block_height: u32,
         hints: &mut Hintsfile,
     ) -> Result<(), WireError> {
-        debug!("processing block {block_hash}");
+        debug!("indexing block {block_hash}");
         let entry = self
             .blocks
             .get_mut(&block_hash)
             .ok_or(WireError::BlockNotFound)?;
-
         if entry.processing_since.is_some() {
-            return Ok(()); // already being processed
+            return Ok(());
         }
-
         let Some(block_hints) = hints.indices_at_height(block_height) else {
-            error!("We tried processing block {block_height} but its hints are missing");
+            error!("We tried indexing block {block_height} but its hints are missing");
             return Ok(());
         };
         let unspent_indexes: HashSet<u32> = block_hints.into_iter().collect();
-
-        // Start the processing timer
         entry.processing_since = Some(Instant::now());
 
         let block = Arc::clone(&entry.block);
-        self.record_worker_occupancy();
+        let creation_time = self.previous_median_time_past(&block.header)?;
         let consensus = Consensus::from(self.network);
         let salt = Arc::clone(&self.context.salt);
-
-        // If we find a very cheap block (e.g., ~10μs), it's faster to process it directly
-        if block.txdata.len() == 1 {
-            let result =
-                consensus.process_block_swiftsync(&block, block_height, &unspent_indexes, &salt);
-
-            self.handle_worker_notification(result, block_hash, block_height, hints)?;
-            return Ok(());
-        }
-
+        let database = Arc::clone(self.context.utxo_db.as_ref().expect("initialized"));
         let node_sender = self.node_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let result =
-                consensus.process_block_swiftsync(&block, block_height, &unspent_indexes, &salt);
-
-            let notification = NodeNotification::FromWorker((result, block_hash, block_height));
-            let _ = node_sender.send(notification);
+            let result = consensus
+                .process_block_swiftsync(&block, block_height, &unspent_indexes, &salt)
+                .and_then(|result| {
+                    database
+                        .index_block(&block, block_height, &unspent_indexes, creation_time)
+                        .map(|()| result)
+                });
+            let _ = node_sender.send(NodeNotification::FromWorker((
+                result,
+                block_hash,
+                block_height,
+            )));
         });
+        Ok(())
+    }
 
+    fn start_validating_swiftsync(&mut self, height: u32) -> Result<(), WireError> {
+        let block = Arc::clone(
+            &self
+                .context
+                .indexed_blocks
+                .get(&height)
+                .ok_or(WireError::BlockNotFound)?
+                .block,
+        );
+        let block_hash = block.block_hash();
+        let previous_median_time_past = self.previous_median_time_past(&block.header)?;
+        let database = Arc::clone(self.context.utxo_db.as_ref().expect("initialized"));
+        let consensus = Consensus::from(self.network);
+        let node_sender = self.node_tx.clone();
+        assert!(self.context.validating.insert(height));
+
+        tokio::task::spawn_blocking(move || {
+            let pop_started = Instant::now();
+            let loaded = database.load_inputs(&block, height, previous_median_time_past);
+            let prevout_pop_time = pop_started.elapsed();
+            let (result, timings) = match loaded {
+                Ok(LoadedInputs { utxos }) => {
+                    let validation_started = Instant::now();
+                    let result = consensus.validate_indexed_swiftsync_block(
+                        &block,
+                        height,
+                        previous_median_time_past,
+                        utxos,
+                    );
+                    (
+                        result,
+                        ValidationTimings {
+                            prevout_fetch: prevout_pop_time,
+                            prevout_delete: Duration::ZERO,
+                            consensus: validation_started.elapsed(),
+                        },
+                    )
+                }
+                Err(error) => (
+                    Err(error),
+                    ValidationTimings {
+                        prevout_fetch: prevout_pop_time,
+                        prevout_delete: Duration::ZERO,
+                        consensus: Duration::ZERO,
+                    },
+                ),
+            };
+            let _ = node_sender.send(NodeNotification::FromValidationWorker((
+                result, block_hash, height, timings,
+            )));
+        });
         Ok(())
     }
 
@@ -444,7 +1016,8 @@ where
             return self;
         }
 
-        self.witness_mode = WitnessMode::Witnessless; // enable witnessless sync
+        // Full witnesses are required for non-assumevalid script execution.
+        self.witness_mode = WitnessMode::Full;
         self.context.stop_height = hints.stop_height();
 
         assert_eq!(
@@ -453,6 +1026,19 @@ where
         );
         self.last_block_request = 0;
         self.context.processed_blocks = 0;
+        self.context.indexed_prefix = 0;
+        self.context.indexed_blocks.clear();
+        self.context.downloaded_block_bytes = 0;
+        self.context.validation_queue.clear();
+        self.context.validating.clear();
+        self.context.utxo_db = match SwiftSyncUtxoDb::create(&self.datadir) {
+            Ok(database) => Some(database),
+            Err(err) => {
+                error!("Failed to create SwiftSync UTXO index: {err}");
+                self.context.abort_height = Some(0);
+                return self;
+            }
+        };
         self.context.download_window = DownloadWindow::default();
         // Existing connections may have header-sync traffic; start a fresh socket-read interval.
         self.socket_reads.set_observing(true);
@@ -472,9 +1058,9 @@ where
         self.context.salt = Self::generate_salt();
 
         info!(
-            "Performing SwiftSync up to height {}, download window={} blocks",
+            "Performing SwiftSync up to height {}, download window={} MiB",
             hints.stop_height(),
-            self.context.download_window.limit(),
+            self.context.download_window.limit_bytes() / (1 << 20),
         );
 
         let mut ticker = time::interval(SwiftSync::MAINTENANCE_TICK);
@@ -527,9 +1113,9 @@ where
         }
 
         if let Some(invalid_h) = self.context.abort_height {
-            // All our progress is lost since the hints refer to an invalid chain, and we don't
-            // know if the current UTXO set is correct. We need to start from genesis.
-            error!("Aborting SwiftSync: the most PoW chain is invalid at height {invalid_h}");
+            // A prior diagnostic names the specific validation, indexing, or chain lookup error.
+            // The temporary UTXO state cannot be trusted after any such failure.
+            error!("Aborting SwiftSync after failure at height {invalid_h}");
             return LoopControl::Break;
         }
 
@@ -589,17 +1175,28 @@ where
         let response_ms = response_ms
             .unwrap_or(1_000.0)
             .clamp(0.0, SwiftSync::REQUEST_TIMEOUT as f64 * 1_000.0);
-        let waiting_blocks = self.unprocessed_blocks();
+        let queued_blocks = self.blocks.len().saturating_sub(self.indexing_workers())
+            + self.context.validation_queue.len();
+        let growth_allowed = self.busy_workers() < MAX_PARALLEL_WORKERS || queued_blocks == 0;
+        self.context
+            .download_window
+            .set_growth_allowed(growth_allowed);
+        let waiting_bytes = self.unprocessed_block_bytes();
+        let waiting_window_units = DownloadWindow::units_for_bytes(waiting_bytes);
         if let Some(sample) = self.context.download_window.update(
             now,
             Duration::from_secs_f64(response_ms / 1_000.0),
             can_probe,
-            waiting_blocks,
+            waiting_window_units,
         ) {
             info!(
-                "SwiftSync download: window_blocks={} waiting_blocks={} connected_peers={} sampled_window_blocks={} useful_throughput={:.2} Mbps action={} sample_secs={:.3} sample_bytes={} baseline_window_blocks={:?} baseline_mbps={:?} median_response_ms={:.1}",
-                self.context.download_window.limit(),
-                waiting_blocks,
+                "SwiftSync download: window_mib={} waiting_mib={} waiting_blocks={} max_buffered_blocks={} growth_allowed={} estimated_block_bytes={} connected_peers={} sampled_window_mib={} useful_throughput={:.2} Mbps action={} sample_secs={:.3} sample_bytes={} baseline_window_mib={:?} baseline_mbps={:?} median_response_ms={:.1}",
+                self.context.download_window.limit_bytes() / (1 << 20),
+                waiting_window_units,
+                self.unprocessed_blocks(),
+                MAX_BUFFERED_BLOCKS,
+                growth_allowed,
+                self.context.download_window.estimated_block_bytes(),
                 self.connected_peers(),
                 sample.measured_limit,
                 sample.bytes_per_second * 8.0 / 1_000_000.0,
@@ -618,7 +1215,8 @@ where
     /// Logs slot peaks and the percentage of wall time queued blocks had no free worker slot.
     fn log_worker_occupancy(&mut self, finished: bool) {
         let occupied = self.busy_workers();
-        let queued = self.blocks.len() - occupied;
+        let queued = self.blocks.len().saturating_sub(self.indexing_workers())
+            + self.context.validation_queue.len();
         if let Some((interval, peak, all_busy_with_queue_time)) = self
             .context
             .worker_occupancy
@@ -692,7 +1290,8 @@ where
         let oldest_worker = self
             .blocks
             .values()
-            .filter_map(|b| b.processing_since)
+            .chain(self.context.indexed_blocks.values())
+            .filter_map(|block| block.processing_since)
             .map(|start| now.saturating_duration_since(start))
             .max()
             .unwrap_or_default();
@@ -705,15 +1304,24 @@ where
             .values()
             .map(|p| p.other_peer_replies)
             .sum();
-        let window = self.context.download_window.limit();
-        let pending = inflight_blocks + self.blocks.len();
+        let window_bytes = self.context.download_window.limit_bytes();
+        let pending_bytes = self.unprocessed_block_bytes();
+        let pending_blocks =
+            inflight_blocks + self.blocks.len() + self.context.indexed_blocks.len();
+        let memory = process_memory();
 
         info!(
-            "SwiftSync diagnostics: interval_secs={:.3} phase={} window_blocks={} headroom_blocks={} processed_total={} requested_height={} received_block_mbps={:.2} processed_block_mbps={:.2} ignored_block_mbps={:.2} received_blocks={} processed_blocks={} ignored_blocks={} other_peer_replies={} avg_received_block_bytes={} inflight_blocks={} buffered_blocks={} queued_blocks={} busy_workers={} oldest_worker_secs={:.3} avg_worker_turnaround_ms={:.3} max_worker_turnaround_ms={:.3} node_queue_messages={} max_block_message_delay_ms={:.3} eligible_peers={} inflight_peers={} delivering_peers={} max_peer_inflight={} median_request_age_secs={:.1} oldest_request_age_secs={:.1} requests_age_ge_10s={} requests_age_ge_30s={} requests_age_ge_120s={} socket_read_mbps={:.2} socket_read_peers={}",
+            "SwiftSync diagnostics: interval_secs={:.3} phase={} window_mib={} headroom_mib={} pending_mib={} pending_blocks={} rss_mib={} rss_anon_mib={} rss_file_mib={} swap_mib={} processed_total={} requested_height={} received_block_mbps={:.2} processed_block_mbps={:.2} ignored_block_mbps={:.2} received_blocks={} processed_blocks={} ignored_blocks={} other_peer_replies={} avg_received_block_bytes={} estimated_block_bytes={} inflight_blocks={} buffered_blocks={} queued_blocks={} busy_workers={} oldest_worker_secs={:.3} avg_worker_turnaround_ms={:.3} max_worker_turnaround_ms={:.3} validated_blocks={} avg_prevout_fetch_ms={:.3} avg_prevout_delete_ms={:.3} avg_consensus_validation_ms={:.3} node_queue_messages={} max_block_message_delay_ms={:.3} eligible_peers={} inflight_peers={} delivering_peers={} max_peer_inflight={} median_request_age_secs={:.1} oldest_request_age_secs={:.1} requests_age_ge_10s={} requests_age_ge_30s={} requests_age_ge_120s={} socket_read_mbps={:.2} socket_read_peers={}",
             elapsed,
             self.context.download_window.phase(now),
-            window,
-            window.saturating_sub(pending),
+            window_bytes / (1 << 20),
+            window_bytes.saturating_sub(pending_bytes) / (1 << 20),
+            DownloadWindow::units_for_bytes(pending_bytes),
+            pending_blocks,
+            memory.rss_kib / 1_024,
+            memory.anonymous_kib / 1_024,
+            memory.file_kib / 1_024,
+            memory.swap_kib / 1_024,
             self.context.processed_blocks,
             self.last_block_request,
             mbps(received_bytes),
@@ -724,14 +1332,23 @@ where
             ignored_blocks,
             other_peer_replies,
             received_bytes.checked_div(received_blocks).unwrap_or(0),
+            self.context.download_window.estimated_block_bytes(),
             inflight_blocks,
-            self.blocks.len(),
-            self.blocks.len() - busy_workers,
+            self.blocks.len() + self.context.indexed_blocks.len(),
+            self.blocks.len().saturating_sub(self.indexing_workers())
+                + self.context.validation_queue.len(),
             busy_workers,
             oldest_worker.as_secs_f64(),
             diagnostics.worker_turnaround.as_secs_f64() * 1_000.0
                 / diagnostics.worker_results.max(1) as f64,
             diagnostics.max_worker_turnaround.as_secs_f64() * 1_000.0,
+            diagnostics.validation_results,
+            diagnostics.prevout_fetch_time.as_secs_f64() * 1_000.0
+                / diagnostics.validation_results.max(1) as f64,
+            diagnostics.prevout_delete_time.as_secs_f64() * 1_000.0
+                / diagnostics.validation_results.max(1) as f64,
+            diagnostics.consensus_validation_time.as_secs_f64() * 1_000.0
+                / diagnostics.validation_results.max(1) as f64,
             self.node_rx.len(),
             diagnostics.max_message_delay.as_secs_f64() * 1_000.0,
             eligible_peers,
@@ -872,6 +1489,7 @@ where
                 match unhandled {
                     PeerMessages::Block(block) => {
                         let hash = block.block_hash();
+                        let block_size = block.total_size();
                         let already_buffered = self.blocks.contains_key(&hash);
                         let assigned_peer = self
                             .inflight
@@ -879,7 +1497,7 @@ where
                             .map(|(peer, _)| *peer);
                         self.context.diagnostics.received_block(
                             peer,
-                            block.total_size(),
+                            block_size,
                             already_buffered || assigned_peer.is_none(),
                             assigned_peer.is_some_and(|assigned| assigned != peer),
                             Instant::now().saturating_duration_since(time),
@@ -901,12 +1519,16 @@ where
                         let Some(block) = self.check_is_user_block_and_reply(block)? else {
                             return Ok(());
                         };
+                        self.context.download_window.observe_block_size(block_size);
+                        self.context.downloaded_block_bytes = self
+                            .context
+                            .downloaded_block_bytes
+                            .saturating_add(block_size);
 
                         let inflight_block = InflightBlock {
                             peer,
                             block: Arc::new(block),
-                            // Since this is AV-SwiftSync, we don't need proofs nor leaves (UTXOs)
-                            // TODO: once we implement full validation we'll need the spent UTXOs
+                            // SwiftSync obtains prevouts from its temporary UTXO index.
                             aux_data: None,
                             processing_since: None,
                         };
@@ -939,6 +1561,10 @@ where
             NodeNotification::FromWorker((result, block_hash, height)) => {
                 self.handle_worker_notification(result, block_hash, height, hints)?;
             }
+
+            NodeNotification::FromValidationWorker((result, block_hash, height, timings)) => {
+                self.handle_validation_notification(result, block_hash, height, hints, timings)?;
+            }
         }
 
         Ok(())
@@ -946,64 +1572,106 @@ where
 
     fn handle_worker_notification(
         &mut self,
-        result: WorkerResult,
+        result: IndexWorkerResult,
         block_hash: BlockHash,
         height: u32,
         hints: &mut Hintsfile,
     ) -> Result<(), WireError> {
-        // This block has already been processed: open space for a new worker
         let block = self
             .blocks
             .remove(&block_hash)
             .ok_or(WireError::BlockNotFound)?;
-        self.record_worker_occupancy();
 
+        match result {
+            Ok((agg_re, unspent_amount, utreexo_adds)) => {
+                self.context.agg += agg_re;
+                self.context.supply += unspent_amount;
+                self.pump_utreexo_adds(height, utreexo_adds);
+                hints.take_indices(height);
+                // Moving into `indexed_blocks` retains the existing byte charge.
+                assert!(self.context.indexed_blocks.insert(height, block).is_none());
+
+                while self
+                    .context
+                    .indexed_blocks
+                    .contains_key(&(self.context.indexed_prefix + 1))
+                {
+                    self.context.indexed_prefix += 1;
+                    self.context
+                        .validation_queue
+                        .push_back(self.context.indexed_prefix);
+                }
+                self.pump_swiftsync(hints)?;
+                self.get_blocks_to_download();
+            }
+            Err(error) => {
+                self.context.downloaded_block_bytes = self
+                    .context
+                    .downloaded_block_bytes
+                    .checked_sub(block.block.total_size())
+                    .expect("downloaded byte accounting includes indexing workers");
+                self.handle_invalid_block(error, block.block.header, height, block.peer)?;
+            }
+        }
+        self.record_worker_occupancy();
+        Ok(())
+    }
+
+    fn handle_validation_notification(
+        &mut self,
+        result: Result<(), BlockchainError>,
+        block_hash: BlockHash,
+        height: u32,
+        hints: &mut Hintsfile,
+        timings: ValidationTimings,
+    ) -> Result<(), WireError> {
+        assert!(self.context.validating.remove(&height));
+        let block = self
+            .context
+            .indexed_blocks
+            .remove(&height)
+            .ok_or(WireError::BlockNotFound)?;
+        self.context.downloaded_block_bytes = self
+            .context
+            .downloaded_block_bytes
+            .checked_sub(block.block.total_size())
+            .expect("downloaded byte accounting includes indexed blocks");
+        debug_assert_eq!(block.block.block_hash(), block_hash);
         if let Some(start) = block.processing_since {
-            // Includes worker dispatch/execution and result-queue delay, not pure CPU time.
             let elapsed = start.elapsed();
             let diagnostics = &mut self.context.diagnostics;
             diagnostics.worker_results += 1;
             diagnostics.worker_turnaround += elapsed;
             diagnostics.max_worker_turnaround = diagnostics.max_worker_turnaround.max(elapsed);
         }
-
-        // Immediately replace the finished worker with a new one
-        self.pump_swiftsync(hints)?;
+        self.context.diagnostics.validation_results += 1;
+        self.context.diagnostics.prevout_fetch_time += timings.prevout_fetch;
+        self.context.diagnostics.prevout_delete_time += timings.prevout_delete;
+        self.context.diagnostics.consensus_validation_time += timings.consensus;
 
         match result {
-            Ok((agg_re, unspent_amount, utreexo_adds)) => {
-                // Only successful first copies count toward useful download throughput.
+            Ok(()) => {
                 let bytes = block.block.total_size();
                 self.context
                     .download_window
                     .record_bytes(bytes, Instant::now());
                 self.context.diagnostics.processed_blocks += 1;
                 self.context.diagnostics.processed_bytes += bytes as u64;
-                self.context.agg += agg_re;
-                self.context.supply += unspent_amount;
-                self.pump_utreexo_adds(height, utreexo_adds);
-
-                // Block is valid and not mutated, we can drop these hints from memory
-                hints.take_indices(height);
                 self.handle_valid_worker_block(block_hash, height, block);
-
                 assert!(self.context.processed_blocks < self.context.stop_height);
                 self.context.processed_blocks += 1;
-
-                // Expose the current SwiftSync progress through the FFI API
                 self.chain.update_ibd(IBDState::SwiftSync {
                     processed_blocks: self.context.processed_blocks,
                     total_blocks: self.context.stop_height,
                 });
-
-                // Refill freed slots without waiting for another block or the maintenance tick
+                self.pump_swiftsync(hints)?;
                 self.get_blocks_to_download();
             }
-            Err(e) => {
-                let header = block.block.header;
-                self.handle_invalid_block(e, header, height, block.peer)?;
+            Err(error) => {
+                self.handle_invalid_block(error, block.block.header, height, block.peer)?;
             }
-        };
+        }
+        self.record_worker_occupancy();
         Ok(())
     }
 
@@ -1028,8 +1696,9 @@ where
         error!("Invalid block {header:?} received by peer {peer} reason: {chain_err:?}");
         let block_hash = header.block_hash();
 
-        // Return early if the error is not from block validation (e.g., a database error)
+        // Local storage failures are not peer faults, but continuing cannot make progress.
         let Some(e) = Self::block_validation_err(chain_err) else {
+            self.context.abort_height = Some(height);
             return Ok(());
         };
 
@@ -1141,6 +1810,218 @@ mod tests {
     use crate::p2p_wire::tests::utils::setup_node;
 
     #[test]
+    fn compact_outpoint_key_uses_txid_lsb_and_vout() {
+        let mut txid_bytes = [0_u8; 32];
+        for (byte, value) in txid_bytes.iter_mut().zip(0_u8..) {
+            *byte = value;
+        }
+        let outpoint = OutPoint::new(bitcoin::Txid::from_byte_array(txid_bytes), 0x4433_2211);
+        let key = SwiftSyncUtxoDb::outpoint_key(outpoint);
+        assert_eq!(&key[..12], &txid_bytes[..12]);
+        assert_eq!(&key[12..], &0x4433_2211_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn reconstructable_utxo_packs_into_inline_value() {
+        let public_key = [2_u8; 33];
+        let pubkey_hash = bitcoin::WPubkeyHash::hash(&public_key);
+        let utxo = UtxoData {
+            txout: TxOut {
+                value: Amount::from_sat(42_000),
+                script_pubkey: bitcoin::ScriptBuf::new_p2wpkh(&pubkey_hash),
+            },
+            is_coinbase: true,
+            creation_height: 840_000,
+            creation_time: 1_700_000_000,
+        };
+        let input = TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::from_slice(&[public_key]),
+        };
+
+        let encoded = SwiftSyncUtxoDb::encode_utxo(&utxo);
+        assert_eq!(encoded.len(), 8);
+        let packed = u64::from_le_bytes(encoded.clone().try_into().unwrap());
+        assert_eq!(packed & PACKED_AMOUNT_MASK, 42_000);
+        assert_eq!((packed >> PACKED_SPK_SHIFT) & 0b111, 2);
+        assert_eq!((packed >> PACKED_COINBASE_SHIFT) & 1, 1);
+        assert_eq!(packed >> PACKED_HEIGHT_SHIFT, 840_000);
+        assert_eq!(packed >> 63, 0);
+        assert_eq!(
+            SwiftSyncUtxoDb::decode_utxo(&encoded, &input).unwrap(),
+            UtxoData {
+                creation_time: 0,
+                ..utxo.clone()
+            }
+        );
+
+        let fallback = UtxoData {
+            txout: TxOut {
+                value: Amount::from_sat(PACKED_AMOUNT_MASK + 1),
+                ..utxo.txout.clone()
+            },
+            ..utxo
+        };
+        let encoded = SwiftSyncUtxoDb::encode_utxo(&fallback);
+        assert_eq!(
+            encoded.len(),
+            UTXO_METADATA_SIZE + 1 + SCRIPT_COMMITMENT_SIZE
+        );
+        let mut wrong_input = input;
+        wrong_input.witness = bitcoin::Witness::from_slice(&[[3_u8; 33]]);
+        assert!(SwiftSyncUtxoDb::decode_utxo(&encoded, &wrong_input).is_err());
+    }
+
+    #[test]
+    fn non_reconstructable_fallback_decodes_without_commitment() {
+        let utxo = UtxoData {
+            txout: TxOut {
+                value: Amount::from_sat(42_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            },
+            is_coinbase: false,
+            creation_height: 840_000,
+            creation_time: 1_700_000_000,
+        };
+        let input = TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        };
+
+        let encoded = SwiftSyncUtxoDb::encode_utxo(&utxo);
+        assert!(encoded.len() > UTXO_METADATA_SIZE);
+        assert_eq!(
+            SwiftSyncUtxoDb::decode_utxo(&encoded, &input).unwrap(),
+            utxo
+        );
+    }
+
+    fn transaction_spending(previous_output: OutPoint) -> bitcoin::Transaction {
+        bitcoin::Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn block_with_transactions(transactions: Vec<bitcoin::Transaction>) -> Block {
+        let mut block: Block = deserialize_hex(
+            include_str!("../../../../floresta-chain/testdata/mainnet_blocks.txt")
+                .lines()
+                .nth(1)
+                .unwrap(),
+        )
+        .unwrap();
+        block.txdata = transactions;
+        block
+    }
+
+    #[test]
+    fn same_block_spends_bypass_the_database() {
+        let database = SwiftSyncUtxoDb::create(&std::env::temp_dir()).unwrap();
+        let coinbase = transaction_spending(OutPoint::null());
+        let coinbase_outpoint = OutPoint::new(coinbase.compute_txid(), 0);
+        let spender = transaction_spending(coinbase_outpoint);
+        let block = block_with_transactions(vec![coinbase.clone(), spender]);
+
+        database
+            .index_block(&block, 1, &HashSet::new(), 123)
+            .unwrap();
+        let key = SwiftSyncUtxoDb::outpoint_key(coinbase_outpoint);
+        assert_eq!(
+            database
+                .database
+                .as_ref()
+                .unwrap()
+                .batch_fetch([key.as_slice()])
+                .unwrap(),
+            vec![None]
+        );
+
+        let loaded = database.load_inputs(&block, 1, 123).unwrap();
+        assert_eq!(
+            loaded.utxos[&coinbase_outpoint],
+            UtxoData {
+                txout: coinbase.output[0].clone(),
+                is_coinbase: true,
+                creation_height: 1,
+                creation_time: 123,
+            }
+        );
+    }
+
+    #[test]
+    fn same_block_overlay_rejects_backward_and_duplicate_spends() {
+        let database = SwiftSyncUtxoDb::create(&std::env::temp_dir()).unwrap();
+        let coinbase = transaction_spending(OutPoint::null());
+        let external = OutPoint::new(bitcoin::Txid::from_byte_array([9_u8; 32]), 0);
+        let creator = transaction_spending(external);
+        let creator_outpoint = OutPoint::new(creator.compute_txid(), 0);
+        let backward_spender = transaction_spending(creator_outpoint);
+        let backward = block_with_transactions(vec![coinbase.clone(), backward_spender, creator]);
+        assert!(matches!(
+            database.load_inputs(&backward, 1, 123),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::UtxoNotFound(outpoint)
+            )) if outpoint == creator_outpoint
+        ));
+
+        let first_spender = transaction_spending(external);
+        let second_spender = transaction_spending(external);
+        let duplicate = block_with_transactions(vec![coinbase, first_spender, second_spender]);
+        assert!(matches!(
+            database.load_inputs(&duplicate, 1, 123),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::UtxoNotFound(outpoint)
+            )) if outpoint == external
+        ));
+    }
+
+    #[tokio::test]
+    async fn pop_inputs_returns_and_reclaims_each_indexed_prevout_once() {
+        let node = node();
+        let database = node.context.utxo_db.as_ref().unwrap();
+        let outpoint = OutPoint::new(bitcoin::Txid::from_byte_array([7_u8; 32]), 3);
+        let key = SwiftSyncUtxoDb::outpoint_key(outpoint);
+        database
+            .database
+            .as_ref()
+            .unwrap()
+            .write_only()
+            .unwrap()
+            .put_batch([(key.as_slice(), b"prevout".as_slice())])
+            .unwrap();
+
+        assert_eq!(
+            database.pop_inputs(&[(outpoint, key)]).unwrap(),
+            vec![b"prevout".to_vec()]
+        );
+        assert_eq!(
+            database
+                .database
+                .as_ref()
+                .unwrap()
+                .batch_fetch([key.as_slice()])
+                .unwrap(),
+            vec![None]
+        );
+        assert!(database.pop_inputs(&[(outpoint, key)]).is_err());
+    }
+
+    #[test]
     fn worker_peak_retains_brief_full_occupancy_and_carries_over_busy_slots() {
         let mut usage = WorkerOccupancy::default();
         let start = usage.since;
@@ -1191,16 +2072,25 @@ mod tests {
         let mut usage = WorkerOccupancy::default();
         let start = usage.since;
         // Neither full occupancy alone nor a queue with a free slot counts.
-        usage.record(start, 6, 0);
-        usage.record(start + Duration::from_secs(5), 5, 1);
-        usage.record(start + Duration::from_secs(10), 6, 2);
-        usage.record(start + Duration::from_secs(13), 6, 1);
-        usage.record(start + Duration::from_secs(19), 5, 1);
-        usage.record(start + Duration::from_secs(20), 6, 0);
+        usage.record(start, MAX_PARALLEL_WORKERS, 0);
+        usage.record(start + Duration::from_secs(5), MAX_PARALLEL_WORKERS - 1, 1);
+        usage.record(start + Duration::from_secs(10), MAX_PARALLEL_WORKERS, 2);
+        usage.record(start + Duration::from_secs(13), MAX_PARALLEL_WORKERS, 1);
+        usage.record(start + Duration::from_secs(19), MAX_PARALLEL_WORKERS - 1, 1);
+        usage.record(start + Duration::from_secs(20), MAX_PARALLEL_WORKERS, 0);
         assert_eq!(
-            usage.take(start + Duration::from_secs(30), 6, 0, false),
+            usage.take(
+                start + Duration::from_secs(30),
+                MAX_PARALLEL_WORKERS,
+                0,
+                false
+            ),
             // Nine seconds out of thirty: all_busy_with_queue_pct=30.00.
-            Some((Duration::from_secs(30), 6, Duration::from_secs(9))),
+            Some((
+                Duration::from_secs(30),
+                MAX_PARALLEL_WORKERS,
+                Duration::from_secs(9),
+            )),
         );
     }
 
@@ -1208,26 +2098,53 @@ mod tests {
     fn worker_pressure_spans_reporting_boundaries_without_double_counting() {
         let mut usage = WorkerOccupancy::default();
         let start = usage.since;
-        usage.record(start + Duration::from_secs(20), 6, 1);
+        usage.record(start + Duration::from_secs(20), MAX_PARALLEL_WORKERS, 1);
         assert!(
             usage
-                .take(start + Duration::from_secs(25), 6, 1, false)
+                .take(
+                    start + Duration::from_secs(25),
+                    MAX_PARALLEL_WORKERS,
+                    1,
+                    false
+                )
                 .is_none()
         );
         assert_eq!(
-            usage.take(start + Duration::from_secs(30), 6, 1, false),
-            Some((Duration::from_secs(30), 6, Duration::from_secs(10))),
+            usage.take(
+                start + Duration::from_secs(30),
+                MAX_PARALLEL_WORKERS,
+                1,
+                false
+            ),
+            Some((
+                Duration::from_secs(30),
+                MAX_PARALLEL_WORKERS,
+                Duration::from_secs(10)
+            )),
         );
         assert_eq!(
-            usage.take(start + Duration::from_secs(60), 6, 1, false),
-            Some((Duration::from_secs(30), 6, Duration::from_secs(30))),
+            usage.take(
+                start + Duration::from_secs(60),
+                MAX_PARALLEL_WORKERS,
+                1,
+                false
+            ),
+            Some((
+                Duration::from_secs(30),
+                MAX_PARALLEL_WORKERS,
+                Duration::from_secs(30)
+            )),
         );
         // Final partial interval includes pressure up to completion, then idle time.
         usage.record(start + Duration::from_secs(63), 0, 0);
         let finish = start + Duration::from_secs(67);
         assert_eq!(
             usage.take(finish, 0, 0, true),
-            Some((Duration::from_secs(7), 6, Duration::from_secs(3))),
+            Some((
+                Duration::from_secs(7),
+                MAX_PARALLEL_WORKERS,
+                Duration::from_secs(3)
+            )),
         );
         assert!(usage.take(finish, 0, 0, true).is_none());
     }
@@ -1255,18 +2172,70 @@ mod tests {
         node.fixed_peers.clear();
         node.inflight.clear();
         node.context.stop_height = num_blocks as u32;
+        node.context.utxo_db = Some(SwiftSyncUtxoDb::create(&node.datadir).unwrap());
         node
     }
 
     #[tokio::test]
+    async fn byte_window_keeps_network_inflight_bounded() {
+        let mut node = node_with_blocks(SwiftSync::MAX_INFLIGHT_REQUESTS * 2);
+        node.get_blocks_to_download();
+        assert_eq!(node.inflight.len(), SwiftSync::MAX_INFLIGHT_REQUESTS);
+        assert_eq!(
+            node.unprocessed_block_bytes(),
+            SwiftSync::MAX_INFLIGHT_REQUESTS * node.context.download_window.estimated_block_bytes()
+        );
+        assert!(!node.can_request_more_blocks());
+    }
+
+    #[tokio::test]
+    async fn byte_window_keeps_buffered_block_count_bounded() {
+        let mut node = node();
+        let block: Block = deserialize_hex(
+            include_str!("../../../../floresta-chain/testdata/mainnet_blocks.txt")
+                .lines()
+                .nth(1)
+                .unwrap(),
+        )
+        .unwrap();
+        let block = Arc::new(block);
+        for height in 0..MAX_BUFFERED_BLOCKS as u32 {
+            node.context.indexed_blocks.insert(
+                height,
+                InflightBlock {
+                    peer: 0,
+                    block: Arc::clone(&block),
+                    aux_data: None,
+                    processing_since: None,
+                },
+            );
+        }
+        assert_eq!(node.unprocessed_blocks(), MAX_BUFFERED_BLOCKS);
+        assert!(!node.can_request_more_blocks());
+
+        for height in 0..SwiftSync::BLOCKS_PER_GETDATA as u32 {
+            node.context.indexed_blocks.remove(&height);
+        }
+        assert!(node.can_request_more_blocks());
+    }
+
+    #[tokio::test]
     async fn fills_the_window_and_waits_for_a_shrunken_window_to_drain() {
-        let initial_window = DownloadWindow::default().limit();
-        let mut node = node_with_blocks(initial_window * 2);
+        let mut node = node_with_blocks(SwiftSync::MAX_INFLIGHT_REQUESTS * 2);
+        assert_eq!(node.context.download_window.limit_bytes(), 1 << 30);
+        node.context.download_window.set_limit_for_test(100);
+        let initial_window = node.context.download_window.limit();
+        let initial_blocks =
+            initial_window / SwiftSync::BLOCKS_PER_GETDATA * SwiftSync::BLOCKS_PER_GETDATA;
         // One available peer can fill the global window without a separate per-peer limit.
         node.peers.retain(|&id, _| id == 0);
         node.get_blocks_to_download();
-        assert_eq!(node.unprocessed_blocks(), initial_window);
-        assert_eq!(node.last_block_request as usize, initial_window);
+        assert_eq!(node.unprocessed_blocks(), initial_blocks);
+        assert_eq!(
+            node.unprocessed_block_bytes(),
+            initial_blocks * node.context.download_window.estimated_block_bytes()
+        );
+        assert_eq!(node.last_block_request as usize, initial_blocks);
         assert!(!node.can_request_more_blocks());
 
         // Free one batch while the rest of the window is still outstanding.
@@ -1275,61 +2244,64 @@ mod tests {
             node.inflight.remove(&request);
         }
         node.get_blocks_to_download();
-        assert_eq!(node.unprocessed_blocks(), initial_window);
-        assert_eq!(node.last_block_request as usize, initial_window + 5);
+        assert_eq!(node.unprocessed_blocks(), initial_blocks);
+        assert_eq!(node.last_block_request as usize, initial_blocks + 5);
 
         let now = Instant::now() + Duration::from_secs(30);
         node.context.download_window.record_bytes(3_000, now);
+        node.context.download_window.probe_down_next();
         node.context
             .download_window
-            .update(now, Duration::ZERO, true, initial_window)
+            .update(now, Duration::ZERO, true, initial_blocks)
             .unwrap();
         let smaller_window = node.context.download_window.limit();
+        let smaller_blocks =
+            smaller_window / SwiftSync::BLOCKS_PER_GETDATA * SwiftSync::BLOCKS_PER_GETDATA;
         assert!(smaller_window < initial_window);
         // The first probe shrinks the window without cancelling existing downloads.
         node.get_blocks_to_download();
-        assert_eq!(node.unprocessed_blocks(), initial_window);
-        assert_eq!(node.last_block_request as usize, initial_window + 5);
+        assert_eq!(node.unprocessed_blocks(), initial_blocks);
+        assert_eq!(node.last_block_request as usize, initial_blocks + 5);
 
         // No sample is produced while the old requests still exceed the cap.
         let now = now + Duration::from_secs(60);
         assert!(
             node.context
                 .download_window
-                .update(now, Duration::ZERO, true, initial_window)
+                .update(now, Duration::ZERO, true, initial_blocks)
                 .is_none()
         );
         let completed: Vec<_> = node
             .inflight
             .keys()
-            .take(initial_window - smaller_window + 5)
+            .take(initial_blocks - smaller_blocks + 5)
             .cloned()
             .collect();
         for request in completed {
             node.inflight.remove(&request);
         }
         node.get_blocks_to_download();
-        assert_eq!(node.unprocessed_blocks(), smaller_window);
-        assert_eq!(node.last_block_request as usize, initial_window + 10);
+        assert_eq!(node.unprocessed_blocks(), smaller_blocks);
+        assert_eq!(node.last_block_request as usize, initial_blocks + 10);
 
         // Draining starts settling; only the following full sample can reject the trial.
         assert!(
             node.context
                 .download_window
-                .update(now, Duration::ZERO, true, smaller_window)
+                .update(now, Duration::ZERO, true, smaller_blocks)
                 .is_none()
         );
         let now = now + Duration::from_secs(35);
         node.context
             .download_window
-            .update(now, Duration::ZERO, true, smaller_window)
+            .update(now, Duration::ZERO, true, smaller_blocks)
             .unwrap();
         assert_eq!(node.context.download_window.limit(), initial_window);
         node.get_blocks_to_download();
-        assert_eq!(node.unprocessed_blocks(), initial_window);
+        assert_eq!(node.unprocessed_blocks(), initial_blocks);
         assert_eq!(
             node.last_block_request as usize,
-            initial_window + 10 + initial_window - smaller_window
+            initial_blocks + 10 + initial_blocks - smaller_blocks
         );
     }
 
@@ -1371,6 +2343,10 @@ mod tests {
         diagnostics.worker_results = 1;
         diagnostics.worker_turnaround = Duration::from_millis(2);
         diagnostics.max_worker_turnaround = Duration::from_millis(2);
+        diagnostics.validation_results = 1;
+        diagnostics.prevout_fetch_time = Duration::from_millis(3);
+        diagnostics.consensus_validation_time = Duration::from_millis(5);
+        diagnostics.prevout_delete_time = Duration::from_millis(4);
 
         node.log_download_diagnostics();
 
@@ -1396,6 +2372,28 @@ mod tests {
         assert_eq!(diagnostics.worker_results, 0);
         assert_eq!(diagnostics.worker_turnaround, Duration::ZERO);
         assert_eq!(diagnostics.max_worker_turnaround, Duration::ZERO);
+        assert_eq!(diagnostics.validation_results, 0);
+        assert_eq!(diagnostics.prevout_fetch_time, Duration::ZERO);
+        assert_eq!(diagnostics.prevout_delete_time, Duration::ZERO);
+        assert_eq!(diagnostics.consensus_validation_time, Duration::ZERO);
+    }
+
+    #[test]
+    fn dynamic_block_timeout_has_safety_bounds() {
+        let context = SwiftSync::default();
+        assert_eq!(context.block_request_timeout(None), Duration::from_secs(10));
+        assert_eq!(
+            context.block_request_timeout(Some(Duration::from_millis(100))),
+            Duration::from_millis(2_400)
+        );
+        assert_eq!(
+            context.block_request_timeout(Some(Duration::from_secs(2))),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            context.block_request_timeout(Some(Duration::from_secs(20))),
+            Duration::from_secs(30)
+        );
     }
 
     #[tokio::test]
@@ -1410,12 +2408,12 @@ mod tests {
         .unwrap();
         let hash = block.block_hash();
         let request = InflightRequests::Blocks(hash);
+        let timeout = node
+            .context
+            .block_request_timeout(node.average_peer_latency(ServiceFlags::NETWORK));
         node.inflight.insert(
             request.clone(),
-            (
-                0,
-                Instant::now() - Duration::from_secs(SwiftSync::REQUEST_TIMEOUT + 1),
-            ),
+            (0, Instant::now() - timeout - Duration::from_millis(1)),
         );
         // Make peer 1 the only eligible replacement.
         node.peers.get_mut(&0).unwrap().services = ServiceFlags::NONE;
@@ -1447,23 +2445,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_pressure_tracks_arrivals_and_inline_refills() {
-        let mut node = node_with_blocks(8);
+    async fn worker_pressure_tracks_queued_arrivals() {
+        let mut node = node_with_blocks(MAX_PARALLEL_WORKERS + 2);
         let blocks: Vec<Block> =
             include_str!("../../../../floresta-chain/testdata/mainnet_blocks.txt")
                 .lines()
                 .skip(1)
-                .take(8)
+                .take(MAX_PARALLEL_WORKERS + 2)
                 .map(|line| deserialize_hex(line).unwrap())
                 .collect();
         let mut hints =
             Hintsfile::from_reader(&mut &include_bytes!("../tests/test_data/bitcoin.hints")[..])
                 .unwrap();
-        node.last_block_request = 8;
-        node.context.stump_updater = Some(StumpUpdater::spawn(Stump::new(), 0, 8));
+        node.last_block_request = (MAX_PARALLEL_WORKERS + 2) as u32;
+        node.context.stump_updater = Some(StumpUpdater::spawn(
+            Stump::new(),
+            0,
+            (MAX_PARALLEL_WORKERS + 2) as u32,
+        ));
 
-        // Simulate six occupied slots, then accept two more downloaded blocks.
-        for block in &blocks[..6] {
+        // Simulate all occupied slots, then accept two more downloaded blocks.
+        for block in &blocks[..MAX_PARALLEL_WORKERS] {
             let entry = InflightBlock {
                 peer: 0,
                 block: Arc::new(block.clone()),
@@ -1474,7 +2476,7 @@ mod tests {
         }
         node.record_worker_occupancy();
         assert!(!node.context.worker_occupancy.all_busy_with_queue);
-        for block in &blocks[6..] {
+        for block in &blocks[MAX_PARALLEL_WORKERS..] {
             node.inflight.insert(
                 InflightRequests::Blocks(block.block_hash()),
                 (0, Instant::now()),
@@ -1487,22 +2489,11 @@ mod tests {
             .unwrap();
             assert!(node.context.worker_occupancy.all_busy_with_queue);
         }
-
-        // Completing one worker recursively processes both queued coinbase-only blocks inline.
-        let indexes = hints.indices_at_height(1).unwrap().into_iter().collect();
-        let result = Consensus::from(Network::Bitcoin).process_block_swiftsync(
-            &blocks[0],
-            1,
-            &indexes,
-            &node.context.salt,
-        );
-        node.handle_worker_notification(result, blocks[0].block_hash(), 1, &mut hints)
-            .unwrap();
-        assert_eq!(node.context.processed_blocks, 3);
-        assert_eq!(node.blocks.len(), 5);
-        assert_eq!(node.busy_workers(), 5);
-        assert!(!node.context.worker_occupancy.all_busy_with_queue);
-        assert_eq!(node.context.worker_occupancy.peak, 6);
+        assert_eq!(node.context.processed_blocks, 0);
+        assert_eq!(node.blocks.len(), MAX_PARALLEL_WORKERS + 2);
+        assert_eq!(node.busy_workers(), MAX_PARALLEL_WORKERS);
+        assert!(node.context.worker_occupancy.all_busy_with_queue);
+        assert_eq!(node.context.worker_occupancy.peak, MAX_PARALLEL_WORKERS);
     }
 
     #[tokio::test]
@@ -1540,8 +2531,20 @@ mod tests {
                 .await
                 .unwrap();
             }
+            assert_eq!(node.context.downloaded_block_bytes, size);
+            assert_eq!(node.unprocessed_block_bytes(), size);
+            while node.context.processed_blocks == 0 {
+                let notification =
+                    tokio::time::timeout(Duration::from_secs(5), node.node_rx.recv())
+                        .await
+                        .expect("worker notification timeout")
+                        .expect("worker notification channel");
+                node.handle_message(notification, &mut hints).await.unwrap();
+            }
             assert_eq!(node.context.processed_blocks, 1);
-            // Inline processing finishes before a tick, but its occupied slot still counts.
+            assert_eq!(node.context.downloaded_block_bytes, 0);
+            assert_eq!(node.unprocessed_block_bytes(), 0);
+            // Indexing and validation share one occupied slot for the block's lifetime.
             assert_eq!(node.busy_workers(), 0);
             assert_eq!(node.context.worker_occupancy.peak, 1);
             assert!(!node.context.worker_occupancy.all_busy_with_queue);
@@ -1555,6 +2558,7 @@ mod tests {
             assert_eq!(diagnostics.processed_blocks, 1);
             assert_eq!(diagnostics.processed_bytes, size as u64);
             assert_eq!(diagnostics.worker_results, 1);
+            assert_eq!(diagnostics.validation_results, 1);
             assert_eq!(
                 diagnostics
                     .peers
@@ -1594,7 +2598,7 @@ mod tests {
                     Instant::now() + Duration::from_secs(30),
                     Duration::ZERO,
                     true,
-                    node.unprocessed_blocks(),
+                    DownloadWindow::units_for_bytes(node.unprocessed_block_bytes()),
                 )
                 .unwrap();
             assert!(sample.bytes_per_second > 0.0);
@@ -1606,26 +2610,34 @@ mod tests {
     async fn timeouts_from_multiple_peers_leave_window_decisions_to_throughput() {
         let mut node = node();
         let initial_window = node.context.download_window.limit();
-        let expired = Instant::now() - Duration::from_secs(SwiftSync::REQUEST_TIMEOUT + 1);
+        let timeout = node
+            .context
+            .block_request_timeout(node.average_peer_latency(ServiceFlags::NETWORK));
+        let expired = Instant::now() - timeout - Duration::from_millis(1);
         for peer in [0, 1] {
             let hash = node.chain.get_block_hash(peer + 1).unwrap();
             node.inflight
                 .insert(InflightRequests::Blocks(hash), (peer, expired));
         }
-        node.check_for_timeout().unwrap();
+        assert!(matches!(
+            node.check_for_timeout(),
+            Err(WireError::NoPeersAvailable)
+        ));
+        assert_eq!(node.inflight.len(), 2);
         for peer in node.peers.values() {
             assert_eq!(peer.banscore, 0);
             assert!(peer.message_times.value().unwrap() > 1.0);
         }
         assert_eq!(node.context.download_window.limit(), initial_window);
 
-        // Despite both peers timing out, the next sample starts a normal 20% probe down.
+        // Despite both peers timing out, throughput sampling starts a normal downward probe.
         let now = Instant::now() + Duration::from_secs(30);
         node.context.download_window.record_bytes(3_000, now);
+        let waiting_units = DownloadWindow::units_for_bytes(node.unprocessed_block_bytes());
         let sample = node
             .context
             .download_window
-            .update(now, Duration::ZERO, true, node.unprocessed_blocks())
+            .update(now, Duration::ZERO, true, waiting_units)
             .unwrap();
         assert_eq!(sample.action, "probe-down");
         assert!(node.context.download_window.limit() < initial_window);

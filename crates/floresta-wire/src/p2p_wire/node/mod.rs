@@ -21,6 +21,7 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use bitcoin::Amount;
@@ -70,16 +71,25 @@ use crate::node_context::PeerId;
 /// As per BIP 155, limit the number of addresses to 1,000
 pub const MAX_ADDRV2_ADDRESSES: usize = 1_000;
 
-type WorkerResult = Result<(SwiftSyncAgg, Amount, Vec<BitcoinNodeHash>), BlockchainError>;
+type IndexWorkerResult = Result<(SwiftSyncAgg, Amount, Vec<BitcoinNodeHash>), BlockchainError>;
+type ValidationWorkerResult = Result<(), BlockchainError>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ValidationTimings {
+    pub(crate) prevout_fetch: Duration,
+    pub(crate) prevout_delete: Duration,
+    pub(crate) consensus: Duration,
+}
 
 #[derive(Debug)]
 pub enum NodeNotification {
     DnsSeedAddresses(Vec<LocalAddress>),
     FromPeer(u32, PeerMessages, Instant),
     FromUser(UserRequest, oneshot::Sender<NodeResponse>),
-    /// Returns the validation result with the delta SwiftSync aggregator and the total unspent
-    /// amount sum, together with the block hash and height.
-    FromWorker((WorkerResult, BlockHash, u32)),
+    /// Returns an indexing result together with the block hash and height.
+    FromWorker((IndexWorkerResult, BlockHash, u32)),
+    /// Returns contextual validation and its prevout-fetch, deletion, and execution durations.
+    FromValidationWorker((ValidationWorkerResult, BlockHash, u32, ValidationTimings)),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

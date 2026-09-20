@@ -97,10 +97,8 @@ pub struct Config {
 
     /// Assume that all blocks prior to and including this block have valid scripts.
     ///
-    /// This is an optimization mirrored from Bitcoin Core: script execution (including signature
-    /// checks) is skipped under the assumption that these scripts were correctly validated when
-    /// the software was released. Since users already trust the developers and reviewers of the
-    /// software, the hardcoded boundary is assumed to be correct.
+    /// Disabled by default while non-assumevalid SwiftSync is under test, so every script is
+    /// verified from genesis. Callers may still opt into a hardcoded or explicit checkpoint.
     pub assume_valid: AssumeValidArg,
 
     /// A vector of xpubs to cache
@@ -232,7 +230,7 @@ impl Config {
         Self {
             disable_dns_seeds: false,
             datadir: datadir.as_ref().into(),
-            assume_valid: AssumeValidArg::Hardcoded,
+            assume_valid: AssumeValidArg::Disabled,
             wallet_xpub: None,
             wallet_descriptor: None,
             config_file: None,

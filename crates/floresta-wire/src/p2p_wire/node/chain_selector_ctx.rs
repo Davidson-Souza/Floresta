@@ -70,6 +70,7 @@ use rustreexo::stump::Stump;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
 use tokio::time::timeout;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -142,7 +143,7 @@ pub enum PeerCheck {
 
 impl NodeContext for ChainSelector {
     const REQUEST_TIMEOUT: u64 = 60; // Ban peers stalling our IBD
-
+    const MAX_OUTGOING_PEERS: usize = 10;
     // Since we don't have any peers when chain selection starts, we use a more aggressive batch
     // size to make sure we get to our `MAX_OUTGOING_CONNECTIONS` ASAP
     const NEW_CONNECTIONS_BATCH_SIZE: usize = 12;
@@ -877,8 +878,9 @@ where
 
         if let ChainSelectorState::LookingForForks(start) = self.context.state {
             if start.elapsed().as_secs() > ChainSelector::REQUEST_TIMEOUT {
-                self.context.state = ChainSelectorState::LookingForForks(Instant::now());
-                self.poke_peers()?;
+                self.context.state = ChainSelectorState::Done;
+                //self.context.state = ChainSelectorState::LookingForForks(Instant::now());
+                //self.poke_peers()?;
             }
         }
 
@@ -957,9 +959,11 @@ where
                     NodeNotification::FromUser(request, responder) => {
                         self.perform_user_request(request, responder).await;
                     }
-
                     NodeNotification::FromWorker(msg) => {
-                        error!("Received a notification from the worker thread {msg:?}");
+                        debug!("Ignoring stale SwiftSync indexing result: {msg:?}");
+                    }
+                    NodeNotification::FromValidationWorker(msg) => {
+                        debug!("Ignoring stale SwiftSync validation result: {msg:?}");
                     }
                 }
             }
@@ -1008,9 +1012,11 @@ where
             NodeNotification::DnsSeedAddresses(addresses) => {
                 self.address_man.push_addresses(&addresses);
             }
-
             NodeNotification::FromWorker(msg) => {
-                error!("Received a notification from the worker thread {msg:?}");
+                debug!("Ignoring stale SwiftSync indexing result: {msg:?}");
+            }
+            NodeNotification::FromValidationWorker(msg) => {
+                debug!("Ignoring stale SwiftSync validation result: {msg:?}");
             }
         }
         Ok(())
