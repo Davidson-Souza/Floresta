@@ -78,6 +78,8 @@ type ValidationWorkerResult = Result<(), BlockchainError>;
 pub struct ValidationTimings {
     pub(crate) prevout_fetch: Duration,
     pub(crate) prevout_delete: Duration,
+    pub(crate) deletion_fetches: u64,
+    pub(crate) deletion_nodes_followed: u64,
     pub(crate) consensus: Duration,
 }
 

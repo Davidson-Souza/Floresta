@@ -29,6 +29,8 @@ use bitcoin::script;
 use bitcoinkernel::PrecomputedTransactionData;
 #[cfg(feature = "bitcoinkernel")]
 use bitcoinkernel::ScriptVerificationFlags;
+#[cfg(feature = "bitcoinkernel")]
+use core::fmt::Write as _;
 use floresta_common::prelude::*;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
@@ -475,18 +477,38 @@ impl Consensus {
             .map_err(|error| {
                 let previous_output = transaction.input[input_index].previous_output;
                 let script_pubkey = &spent_utxos[input_index].txout.script_pubkey;
+                let spent_prevouts = Self::spent_prevouts_diagnostic(transaction, spent_utxos);
                 tx_err!(
                     txid,
                     ScriptValidationError,
                     format!(
                         "input {input_index} prevout {previous_output} amount {amount} \
-                         script_pubkey {script_pubkey:?}: {error}"
+                         script_pubkey {script_pubkey:?}: {error}; \
+                         spent_prevouts=[{spent_prevouts}]"
                     )
                 )
             })?;
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    fn spent_prevouts_diagnostic(transaction: &Transaction, spent_utxos: &[UtxoData]) -> String {
+        let mut diagnostic = String::new();
+        for (input_index, (input, utxo)) in transaction.input.iter().zip(spent_utxos).enumerate() {
+            if input_index != 0 {
+                diagnostic.push_str("; ");
+            }
+            let _ = write!(
+                diagnostic,
+                "input {input_index} prevout {} amount_sat {} script_pubkey {:?}",
+                input.previous_output,
+                utxo.txout.value.to_sat(),
+                utxo.txout.script_pubkey
+            );
+        }
+        diagnostic
     }
 
     /// Returns `true` if the transaction contains duplicate inputs
@@ -1674,6 +1696,39 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn script_failure_diagnostic_lists_every_spent_prevout() {
+        let first = dummy_outpoint();
+        let second = OutPoint {
+            txid: Txid::from_byte_array([2_u8; 32]),
+            vout: 7,
+        };
+        let transaction = build_tx(
+            vec![txin!(first), txin!(second)],
+            vec![txout!(1, ScriptBuf::new())],
+        );
+        let spent_utxos = [
+            UtxoData {
+                txout: txout!(11, ScriptBuf::from_bytes(vec![0x51])),
+                is_coinbase: false,
+                creation_height: 1,
+                creation_time: 2,
+            },
+            UtxoData {
+                txout: txout!(22, ScriptBuf::from_bytes(vec![0x52])),
+                is_coinbase: false,
+                creation_height: 3,
+                creation_time: 4,
+            },
+        ];
+
+        let diagnostic = Consensus::spent_prevouts_diagnostic(&transaction, &spent_utxos);
+        assert!(diagnostic.contains(&format!("input 0 prevout {first} amount_sat 11")));
+        assert!(diagnostic.contains(&format!("input 1 prevout {second} amount_sat 22")));
+        assert_eq!(diagnostic.matches("script_pubkey").count(), 2);
     }
 
     #[test]

@@ -130,21 +130,22 @@ where
         };
 
         let swift_sync = swift_sync.run(|_| {}).await;
-        let swift_sync_failed = swift_sync.was_aborted();
+        if swift_sync.completed_successfully() || swift_sync.was_aborted() {
+            if swift_sync.was_aborted() {
+                error!("SwiftSync aborted; shutting down Floresta");
+            }
+            *swift_sync.kill_signal.write().await = true;
+            return Ok(Self {
+                common: swift_sync.common,
+                context: self.context,
+            });
+        }
 
-        // Finish IBD with regular utreexo sync
-        let mut sync = UtreexoNode {
+        // SwiftSync was not applicable, so finish IBD with regular utreexo sync.
+        let sync = UtreexoNode {
             common: swift_sync.common,
             context: SyncNode::default(),
         };
-
-        // If SwiftSync couldn't complete, we need to validate all blocks from scratch
-        if swift_sync_failed {
-            // Clear the inflight requests and in-memory blocks to start from genesis
-            sync.inflight.clear();
-            sync.blocks.clear();
-            assert_eq!(sync.unprocessed_blocks(), 0);
-        }
 
         let sync = sync.run(|_| {}).await;
 

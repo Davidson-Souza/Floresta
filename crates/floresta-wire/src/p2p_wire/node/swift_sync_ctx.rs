@@ -13,6 +13,8 @@ use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -93,6 +95,7 @@ impl DatabaseError for SwiftSyncDatabaseError {}
 struct SwiftSyncUtxoDb {
     database: Option<Database>,
     path: PathBuf,
+    retain: AtomicBool,
 }
 
 const UTXO_KEY_SIZE: usize = 16;
@@ -108,6 +111,7 @@ const PACKED_HEIGHT_MAX: u32 = (1 << 23) - 1;
 
 struct LoadedInputs {
     utxos: HashMap<OutPoint, UtxoData>,
+    deletion_stats: floresta_db::BatchPopStats,
 }
 
 impl SwiftSyncUtxoDb {
@@ -117,11 +121,15 @@ impl SwiftSyncUtxoDb {
         // Sparse mappings: these are address-space maxima, not eager disk allocations.
         config.body_capacity = 256 << 30;
         config.blob_capacity = 256 << 30;
+        config.block_size = 1 << 12;
+
         let database = Database::create(&path, config)
             .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?;
+        info!("SwiftSync UTXO database: {}", path.display());
         Ok(Arc::new(Self {
             database: Some(database),
             path,
+            retain: AtomicBool::new(false),
         }))
     }
 
@@ -407,12 +415,15 @@ impl SwiftSyncUtxoDb {
             .iter()
             .map(|(outpoint, _)| (*outpoint, Self::outpoint_key(*outpoint)))
             .collect();
-        let values = self.pop_inputs(&keys)?;
+        let (values, deletion_stats) = self.pop_inputs(&keys)?;
         inputs.reserve(external_inputs.len());
         for ((outpoint, input), value) in external_inputs.into_iter().zip(values) {
             inputs.insert(outpoint, Self::decode_utxo(&value, input)?);
         }
-        Ok(LoadedInputs { utxos: inputs })
+        Ok(LoadedInputs {
+            utxos: inputs,
+            deletion_stats,
+        })
     }
 
     /// Destructively loads inputs in bounded batches so body and blob reclamation never retains
@@ -420,24 +431,58 @@ impl SwiftSyncUtxoDb {
     fn pop_inputs(
         &self,
         keys: &[(OutPoint, [u8; UTXO_KEY_SIZE])],
-    ) -> Result<Vec<Vec<u8>>, BlockchainError> {
+    ) -> Result<(Vec<Vec<u8>>, floresta_db::BatchPopStats), BlockchainError> {
         let database = self.database.as_ref().expect("database exists until drop");
         let mut values = Vec::with_capacity(keys.len());
+        let mut stats = floresta_db::BatchPopStats::default();
         for chunk in keys.chunks(RECLAIM_WATERMARK) {
-            let popped = database
-                .batch_pop(chunk.iter().map(|(_, key)| key.as_slice()))
+            let (popped, chunk_stats) = database
+                .batch_pop_with_stats(chunk.iter().map(|(_, key)| key.as_slice()))
                 .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?;
+            stats.fetches = stats.fetches.saturating_add(chunk_stats.fetches);
+            stats.nodes_followed = stats
+                .nodes_followed
+                .saturating_add(chunk_stats.nodes_followed);
             for ((outpoint, _), value) in chunk.iter().zip(popped) {
                 values.push(value.ok_or(BlockValidationErrors::UtxoNotFound(*outpoint))?);
             }
         }
-        Ok(values)
+        Ok((values, stats))
+    }
+
+    fn stats(&self) -> Result<floresta_db::DatabaseStats, BlockchainError> {
+        self.database
+            .as_ref()
+            .expect("database exists until drop")
+            .stats()
+            .map_err(|err| SwiftSyncDatabaseError(err.to_string()).into())
+    }
+
+    fn flush_and_retain(&self) -> Result<(), BlockchainError> {
+        self.database
+            .as_ref()
+            .expect("database exists until drop")
+            .sync()
+            .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?;
+        self.retain.store(true, Ordering::Release);
+        info!(
+            "Flushed and retained SwiftSync UTXO database at {}",
+            self.path.display()
+        );
+        Ok(())
     }
 }
 
 impl Drop for SwiftSyncUtxoDb {
     fn drop(&mut self) {
         drop(self.database.take());
+        if self.retain.load(Ordering::Acquire) {
+            info!(
+                "Keeping SwiftSync UTXO database for inspection at {}",
+                self.path.display()
+            );
+            return;
+        }
         if let Err(err) = fs::remove_dir_all(&self.path) {
             warn!("Failed to remove temporary SwiftSync UTXO index: {err}");
         }
@@ -502,6 +547,9 @@ pub struct SwiftSync {
     /// We abort when either the hints are found to be invalid or the current chain is invalid (we
     /// may find an invalid block or, at the end, a violation of the maximum supply limit).
     abort_height: Option<u32>,
+
+    /// Set only after all SwiftSync invariants pass and its UTXO database is durable.
+    completed_successfully: bool,
 }
 
 const BLOCK_TIMEOUT_MULTIPLIER: u32 = 10;
@@ -647,6 +695,8 @@ struct DownloadDiagnostics {
     prevout_fetch_time: Duration,
     prevout_delete_time: Duration,
     consensus_validation_time: Duration,
+    deletion_fetches: u64,
+    deletion_nodes_followed: u64,
 }
 
 impl Default for DownloadDiagnostics {
@@ -664,6 +714,8 @@ impl Default for DownloadDiagnostics {
             prevout_fetch_time: Duration::ZERO,
             prevout_delete_time: Duration::ZERO,
             consensus_validation_time: Duration::ZERO,
+            deletion_fetches: 0,
+            deletion_nodes_followed: 0,
         }
     }
 }
@@ -757,6 +809,10 @@ where
     /// being invalid (below the SwiftSync stop height).
     pub(crate) fn was_aborted(&self) -> bool {
         self.context.abort_height.is_some()
+    }
+
+    pub(crate) fn completed_successfully(&self) -> bool {
+        self.context.completed_successfully
     }
 
     /// Computes the next blocks to request, and sends a GETDATA request, advancing
@@ -964,7 +1020,10 @@ where
             let loaded = database.load_inputs(&block, height, previous_median_time_past);
             let prevout_pop_time = pop_started.elapsed();
             let (result, timings) = match loaded {
-                Ok(LoadedInputs { utxos }) => {
+                Ok(LoadedInputs {
+                    utxos,
+                    deletion_stats,
+                }) => {
                     let validation_started = Instant::now();
                     let result = consensus.validate_indexed_swiftsync_block(
                         &block,
@@ -977,6 +1036,8 @@ where
                         ValidationTimings {
                             prevout_fetch: prevout_pop_time,
                             prevout_delete: Duration::ZERO,
+                            deletion_fetches: deletion_stats.fetches,
+                            deletion_nodes_followed: deletion_stats.nodes_followed,
                             consensus: validation_started.elapsed(),
                         },
                     )
@@ -986,6 +1047,8 @@ where
                     ValidationTimings {
                         prevout_fetch: prevout_pop_time,
                         prevout_delete: Duration::ZERO,
+                        deletion_fetches: 0,
+                        deletion_nodes_followed: 0,
                         consensus: Duration::ZERO,
                     },
                 ),
@@ -1026,6 +1089,7 @@ where
         );
         self.last_block_request = 0;
         self.context.processed_blocks = 0;
+        self.context.completed_successfully = false;
         self.context.indexed_prefix = 0;
         self.context.indexed_blocks.clear();
         self.context.downloaded_block_bytes = 0;
@@ -1116,6 +1180,11 @@ where
             // A prior diagnostic names the specific validation, indexing, or chain lookup error.
             // The temporary UTXO state cannot be trusted after any such failure.
             error!("Aborting SwiftSync after failure at height {invalid_h}");
+            if let Some(database) = self.context.utxo_db.as_ref()
+                && let Err(error) = database.flush_and_retain()
+            {
+                error!("Failed to retain aborted SwiftSync UTXO database: {error}");
+            }
             return LoopControl::Break;
         }
 
@@ -1309,9 +1378,28 @@ where
         let pending_blocks =
             inflight_blocks + self.blocks.len() + self.context.indexed_blocks.len();
         let memory = process_memory();
+        let database_stats = match self
+            .context
+            .utxo_db
+            .as_ref()
+            .map(|database| database.stats())
+        {
+            Some(Ok(stats)) => stats,
+            Some(Err(error)) => {
+                warn!("Failed to read SwiftSync database statistics: {error}");
+                floresta_db::DatabaseStats::default()
+            }
+            None => floresta_db::DatabaseStats::default(),
+        };
+        let blob_stats = database_stats.blobs.unwrap_or_default();
+        let average_delete_nodes_followed = if diagnostics.deletion_fetches == 0 {
+            0.0
+        } else {
+            diagnostics.deletion_nodes_followed as f64 / diagnostics.deletion_fetches as f64
+        };
 
         info!(
-            "SwiftSync diagnostics: interval_secs={:.3} phase={} window_mib={} headroom_mib={} pending_mib={} pending_blocks={} rss_mib={} rss_anon_mib={} rss_file_mib={} swap_mib={} processed_total={} requested_height={} received_block_mbps={:.2} processed_block_mbps={:.2} ignored_block_mbps={:.2} received_blocks={} processed_blocks={} ignored_blocks={} other_peer_replies={} avg_received_block_bytes={} estimated_block_bytes={} inflight_blocks={} buffered_blocks={} queued_blocks={} busy_workers={} oldest_worker_secs={:.3} avg_worker_turnaround_ms={:.3} max_worker_turnaround_ms={:.3} validated_blocks={} avg_prevout_fetch_ms={:.3} avg_prevout_delete_ms={:.3} avg_consensus_validation_ms={:.3} node_queue_messages={} max_block_message_delay_ms={:.3} eligible_peers={} inflight_peers={} delivering_peers={} max_peer_inflight={} median_request_age_secs={:.1} oldest_request_age_secs={:.1} requests_age_ge_10s={} requests_age_ge_30s={} requests_age_ge_120s={} socket_read_mbps={:.2} socket_read_peers={}",
+            "SwiftSync diagnostics: interval_secs={:.3} phase={} window_mib={} headroom_mib={} pending_mib={} pending_blocks={} rss_mib={} rss_anon_mib={} rss_file_mib={} swap_mib={} processed_total={} requested_height={} received_block_mbps={:.2} processed_block_mbps={:.2} ignored_block_mbps={:.2} received_blocks={} processed_blocks={} ignored_blocks={} other_peer_replies={} avg_received_block_bytes={} estimated_block_bytes={} inflight_blocks={} buffered_blocks={} queued_blocks={} busy_workers={} oldest_worker_secs={:.3} avg_worker_turnaround_ms={:.3} max_worker_turnaround_ms={:.3} validated_blocks={} avg_prevout_fetch_ms={:.3} avg_prevout_delete_ms={:.3} avg_consensus_validation_ms={:.3} node_queue_messages={} max_block_message_delay_ms={:.3} eligible_peers={} inflight_peers={} delivering_peers={} max_peer_inflight={} median_request_age_secs={:.1} oldest_request_age_secs={:.1} requests_age_ge_10s={} requests_age_ge_30s={} requests_age_ge_120s={} socket_read_mbps={:.2} socket_read_peers={} avg_delete_nodes_followed_per_fetch={:.3} db_body_avg_page_load={:.2} db_body_empty_pages={} db_body_claimed_unused_pages={} db_body_used_pages={} db_body_high_water_pages={} db_blob_avg_page_load={:.2} db_blob_empty_pages={} db_blob_claimed_unused_pages={} db_blob_used_pages={} db_blob_high_water_pages={}",
             elapsed,
             self.context.download_window.phase(now),
             window_bytes / (1 << 20),
@@ -1366,6 +1454,17 @@ where
             ages.iter().filter(|age| **age >= 120.0).count(),
             mbps(socket_read_bytes),
             socket_read_peers,
+            average_delete_nodes_followed,
+            database_stats.body.average_page_load,
+            database_stats.body.empty_pages,
+            database_stats.body.claimed_but_unused_pages,
+            database_stats.body.used_pages,
+            database_stats.body.high_water_pages,
+            blob_stats.average_page_load,
+            blob_stats.empty_pages,
+            blob_stats.claimed_but_unused_pages,
+            blob_stats.used_pages,
+            blob_stats.high_water_pages,
         );
 
         // One compact line per tick avoids per-block logging on the hot path.
@@ -1454,7 +1553,18 @@ where
             return;
         }
 
-        info!("SwiftSync is finished, switching to normal operation mode");
+        let Some(database) = self.context.utxo_db.as_ref() else {
+            error!("SwiftSync completed without a UTXO database");
+            self.context.abort_height = Some(stop_height);
+            return;
+        };
+        if let Err(error) = database.flush_and_retain() {
+            error!("Failed to flush SwiftSync UTXO database: {error}");
+            self.context.abort_height = Some(stop_height);
+            return;
+        }
+
+        info!("SwiftSync is finished; exiting after retaining its UTXO database");
         let tip_hash = self.chain.get_block_hash(stop_height).unwrap();
 
         info!("SwiftSync produced the following accumulator for {tip_hash}: \n{final_acc:?}");
@@ -1462,6 +1572,7 @@ where
         self.chain
             .mark_chain_as_assumed(final_acc, tip_hash)
             .unwrap();
+        self.context.completed_successfully = true;
     }
 
     /// Process a message from a peer and handle it accordingly between the variants of [`PeerMessages`].
@@ -1648,6 +1759,17 @@ where
         self.context.diagnostics.prevout_fetch_time += timings.prevout_fetch;
         self.context.diagnostics.prevout_delete_time += timings.prevout_delete;
         self.context.diagnostics.consensus_validation_time += timings.consensus;
+
+        self.context.diagnostics.deletion_fetches = self
+            .context
+            .diagnostics
+            .deletion_fetches
+            .saturating_add(timings.deletion_fetches);
+        self.context.diagnostics.deletion_nodes_followed = self
+            .context
+            .diagnostics
+            .deletion_nodes_followed
+            .saturating_add(timings.deletion_nodes_followed);
 
         match result {
             Ok(()) => {
@@ -1900,6 +2022,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn flushed_swiftsync_database_is_retained_for_inspection() {
+        let database = SwiftSyncUtxoDb::create(&std::env::temp_dir()).unwrap();
+        let path = database.path.clone();
+        database.flush_and_retain().unwrap();
+        drop(database);
+
+        assert!(path.is_dir());
+        assert!(path.join("body.counts").is_file());
+        assert!(path.join("blobs.counts").is_file());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     fn transaction_spending(previous_output: OutPoint) -> bitcoin::Transaction {
         bitcoin::Transaction {
             version: bitcoin::transaction::Version::ONE,
@@ -2005,10 +2140,10 @@ mod tests {
             .put_batch([(key.as_slice(), b"prevout".as_slice())])
             .unwrap();
 
-        assert_eq!(
-            database.pop_inputs(&[(outpoint, key)]).unwrap(),
-            vec![b"prevout".to_vec()]
-        );
+        let (values, stats) = database.pop_inputs(&[(outpoint, key)]).unwrap();
+        assert_eq!(values, vec![b"prevout".to_vec()]);
+        assert_eq!(stats.fetches, 1);
+        assert_eq!(stats.nodes_followed, 1);
         assert_eq!(
             database
                 .database
@@ -2347,6 +2482,8 @@ mod tests {
         diagnostics.prevout_fetch_time = Duration::from_millis(3);
         diagnostics.consensus_validation_time = Duration::from_millis(5);
         diagnostics.prevout_delete_time = Duration::from_millis(4);
+        diagnostics.deletion_fetches = 2;
+        diagnostics.deletion_nodes_followed = 5;
 
         node.log_download_diagnostics();
 
@@ -2376,19 +2513,21 @@ mod tests {
         assert_eq!(diagnostics.prevout_fetch_time, Duration::ZERO);
         assert_eq!(diagnostics.prevout_delete_time, Duration::ZERO);
         assert_eq!(diagnostics.consensus_validation_time, Duration::ZERO);
+        assert_eq!(diagnostics.deletion_fetches, 0);
+        assert_eq!(diagnostics.deletion_nodes_followed, 0);
     }
 
     #[test]
     fn dynamic_block_timeout_has_safety_bounds() {
         let context = SwiftSync::default();
-        assert_eq!(context.block_request_timeout(None), Duration::from_secs(10));
+        assert_eq!(context.block_request_timeout(None), Duration::from_secs(22));
         assert_eq!(
             context.block_request_timeout(Some(Duration::from_millis(100))),
-            Duration::from_millis(2_400)
+            Duration::from_secs(3)
         );
         assert_eq!(
             context.block_request_timeout(Some(Duration::from_secs(2))),
-            Duration::from_secs(10)
+            Duration::from_secs(22)
         );
         assert_eq!(
             context.block_request_timeout(Some(Duration::from_secs(20))),
