@@ -629,6 +629,16 @@ where
     async fn empty_headers_message(&mut self, peer: PeerId) -> Result<(), WireError> {
         match self.context.state {
             ChainSelectorState::DownloadingHeaders => {
+                let (best_height, best_hash) = self.chain.get_best_block()?;
+                let advertised_height = self.peers.get(&peer).map_or(0, |peer| peer.height);
+                if best_height < advertised_height {
+                    warn!(
+                        "Peer {peer} returned empty headers at height {best_height} below its \
+                         advertised height {advertised_height}; banning it and retrying"
+                    );
+                    self.disconnect_and_ban(peer)?;
+                    return self.request_headers(best_hash);
+                }
                 info!("Finished downloading headers from peer={peer}, checking if our peers agree");
                 self.poke_peers()?;
                 self.context.state = ChainSelectorState::LookingForForks(Instant::now());
@@ -779,7 +789,8 @@ where
             .get_block_locator_for_tip(tip)
             .unwrap_or_default();
 
-        let peer = self.send_to_fast_peer(NodeRequest::GetHeaders(locator), ServiceFlags::NONE)?;
+        let peer =
+            self.send_to_fast_peer(NodeRequest::GetHeaders(locator), ServiceFlags::NETWORK)?;
 
         self.inflight
             .insert(InflightRequests::Headers, (peer, Instant::now()));

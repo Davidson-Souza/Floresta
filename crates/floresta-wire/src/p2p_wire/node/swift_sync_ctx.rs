@@ -458,6 +458,17 @@ impl SwiftSyncUtxoDb {
             .map_err(|err| SwiftSyncDatabaseError(err.to_string()).into())
     }
 
+    fn compact(
+        &self,
+        minimum_page_load: u16,
+    ) -> Result<floresta_db::CompactionStats, BlockchainError> {
+        self.database
+            .as_ref()
+            .expect("database exists until drop")
+            .compact(minimum_page_load)
+            .map_err(|err| SwiftSyncDatabaseError(err.to_string()).into())
+    }
+
     fn flush_and_retain(&self) -> Result<(), BlockchainError> {
         self.database
             .as_ref()
@@ -550,13 +561,22 @@ pub struct SwiftSync {
 
     /// Set only after all SwiftSync invariants pass and its UTXO database is durable.
     completed_successfully: bool,
+
+    /// Last online body-page compaction attempt.
+    last_compaction: Option<Instant>,
+
+    /// Prevents overlapping background compaction passes.
+    compaction_running: Arc<AtomicBool>,
 }
 
 const BLOCK_TIMEOUT_MULTIPLIER: u32 = 10;
 const BLOCK_TIMEOUT_SAFETY_MARGIN: Duration = Duration::from_secs(2);
 const MIN_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Compact body pages below 25% occupancy (32 of 128 nodes in a 4 KiB page).
+const SWIFTSYNC_COMPACTION_PAGE_LOAD: u16 = 32;
 const FALLBACK_PEER_RESPONSE_TIME: Duration = Duration::from_secs(2);
+const SWIFTSYNC_COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
 
 impl NodeContext for SwiftSync {
     fn get_required_services(&self) -> bitcoin::p2p::ServiceFlags {
@@ -829,8 +849,16 @@ where
                 }
 
                 let next_height = self.last_block_request + 1;
-                let Ok(next_block) = self.chain.get_block_hash(next_height) else {
-                    break;
+                let next_block = match self.chain.get_block_hash(next_height) {
+                    Ok(block) => block,
+                    Err(error) => {
+                        error!(
+                            "Aborting SwiftSync: header index ends before hints at height \
+                             {next_height}: {error}"
+                        );
+                        self.context.abort_height = Some(next_height);
+                        return;
+                    }
                 };
 
                 blocks.push(next_block);
@@ -1075,6 +1103,7 @@ where
         };
 
         let validation_idx = self.chain.get_validation_index().unwrap();
+        self.context.last_compaction = Some(Instant::now());
         if validation_idx >= hints.stop_height() {
             return self;
         }
@@ -1177,6 +1206,9 @@ where
         }
 
         if let Some(invalid_h) = self.context.abort_height {
+            if self.context.compaction_running.load(Ordering::Acquire) {
+                return LoopControl::Continue;
+            }
             // A prior diagnostic names the specific validation, indexing, or chain lookup error.
             // The temporary UTXO state cannot be trusted after any such failure.
             error!("Aborting SwiftSync after failure at height {invalid_h}");
@@ -1202,6 +1234,14 @@ where
         self.log_worker_occupancy(false);
 
         // Checks if we need to open a new connection
+        let compaction_due = self
+            .context
+            .last_compaction
+            .is_some_and(|last| last.elapsed() >= SWIFTSYNC_COMPACTION_INTERVAL);
+        if compaction_due {
+            self.start_database_compaction();
+            self.context.last_compaction = Some(Instant::now());
+        }
         periodic_job!(
             self.last_connection => self.check_connections(),
             SwiftSync::TRY_NEW_CONNECTION,
@@ -1279,6 +1319,47 @@ where
                 response_ms,
             );
         }
+    }
+
+    fn start_database_compaction(&self) {
+        let Some(database) = self.context.utxo_db.as_ref().map(Arc::clone) else {
+            return;
+        };
+        if self
+            .context
+            .compaction_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let running = Arc::clone(&self.context.compaction_running);
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            match database
+                .compact(SWIFTSYNC_COMPACTION_PAGE_LOAD)
+                .and_then(|compaction| database.stats().map(|stats| (compaction, stats)))
+            {
+                Ok((compaction, stats)) => info!(
+                    "SwiftSync database compaction: elapsed_ms={:.3} page_load_threshold={} \
+                     candidate_pages={} moved_nodes={} reclaimed_pages={} \
+                     remaining_candidate_pages={} body_empty_pages={} body_used_pages={} \
+                     body_high_water_pages={} body_avg_page_load={:.2}",
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                    SWIFTSYNC_COMPACTION_PAGE_LOAD,
+                    compaction.candidate_pages,
+                    compaction.moved_nodes,
+                    compaction.reclaimed_pages,
+                    compaction.remaining_candidate_pages,
+                    stats.body.empty_pages,
+                    stats.body.used_pages,
+                    stats.body.high_water_pages,
+                    stats.body.average_page_load,
+                ),
+                Err(error) => error!("SwiftSync database compaction failed: {error}"),
+            }
+            running.store(false, Ordering::Release);
+        });
     }
 
     /// Logs slot peaks and the percentage of wall time queued blocks had no free worker slot.
@@ -1505,6 +1586,9 @@ where
     /// processed all of them, and we have added all utreexo leaves to the accumulator.
     fn swift_sync_finished(&mut self) -> Option<Stump> {
         let requesting_blocks = self.last_block_request != self.context.stop_height;
+        if self.context.compaction_running.load(Ordering::Acquire) {
+            return None;
+        }
 
         // We are still requesting or processing blocks
         if requesting_blocks || self.unprocessed_blocks() != 0 {
