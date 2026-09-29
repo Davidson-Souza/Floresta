@@ -102,6 +102,8 @@ const UTXO_KEY_SIZE: usize = 16;
 const SCRIPT_COMMITMENT_SIZE: usize = 12;
 const UTXO_METADATA_SIZE: usize = 16;
 const RECLAIM_WATERMARK: usize = 16 * 1024;
+/// Fits every consensus-valid output script plus SwiftSync and blob metadata in one allocation.
+const SWIFTSYNC_DATABASE_BLOCK_SIZE: u64 = 1 << 14;
 const PACKED_AMOUNT_BITS: u32 = 37;
 const PACKED_AMOUNT_MASK: u64 = (1 << PACKED_AMOUNT_BITS) - 1;
 const PACKED_SPK_SHIFT: u32 = PACKED_AMOUNT_BITS;
@@ -121,7 +123,7 @@ impl SwiftSyncUtxoDb {
         // Sparse mappings: these are address-space maxima, not eager disk allocations.
         config.body_capacity = 256 << 30;
         config.blob_capacity = 256 << 30;
-        config.block_size = 1 << 12;
+        config.block_size = SWIFTSYNC_DATABASE_BLOCK_SIZE;
 
         let database = Database::create(&path, config)
             .map_err(|err| SwiftSyncDatabaseError(err.to_string()))?;
@@ -573,8 +575,8 @@ const BLOCK_TIMEOUT_MULTIPLIER: u32 = 10;
 const BLOCK_TIMEOUT_SAFETY_MARGIN: Duration = Duration::from_secs(2);
 const MIN_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Compact body pages below 25% occupancy (32 of 128 nodes in a 4 KiB page).
-const SWIFTSYNC_COMPACTION_PAGE_LOAD: u16 = 32;
+/// Compact body pages below 25% occupancy (128 of 512 nodes in a 16 KiB page).
+const SWIFTSYNC_COMPACTION_PAGE_LOAD: u16 = 128;
 const FALLBACK_PEER_RESPONSE_TIME: Duration = Duration::from_secs(2);
 const SWIFTSYNC_COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -2103,6 +2105,39 @@ mod tests {
         assert_eq!(
             SwiftSyncUtxoDb::decode_utxo(&encoded, &input).unwrap(),
             utxo
+        );
+    }
+
+    #[test]
+    fn maximum_script_fallback_fits_database_page() {
+        let utxo = UtxoData {
+            txout: TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51; 10_000]),
+            },
+            is_coinbase: false,
+            creation_height: 1,
+            creation_time: 2,
+        };
+        let encoded = SwiftSyncUtxoDb::encode_utxo(&utxo);
+        let database = SwiftSyncUtxoDb::create(&std::env::temp_dir()).unwrap();
+        let key = [3_u8; UTXO_KEY_SIZE];
+        database
+            .database
+            .as_ref()
+            .unwrap()
+            .write_only()
+            .unwrap()
+            .put_batch([(key.as_slice(), encoded.as_slice())])
+            .unwrap();
+        assert_eq!(
+            database
+                .database
+                .as_ref()
+                .unwrap()
+                .batch_fetch([key.as_slice()])
+                .unwrap(),
+            vec![Some(encoded)]
         );
     }
 
