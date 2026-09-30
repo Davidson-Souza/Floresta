@@ -401,8 +401,6 @@ dependencies = [
 [[package]]
 name = "bitcoinkernel"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202e7d3409ef1457abbe72404cfb3f43a104980313cc685e45cfe0366048618d"
 dependencies = [
  "libbitcoinkernel-sys",
 ]
@@ -1020,6 +1018,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "twox-hash",
+ "ufsecp-sys",
  "zstd",
 ]
 
@@ -1841,8 +1840,6 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "libbitcoinkernel-sys"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccee819dc48af6ce3fb213e6f93bae7a7231cd0689b0435afd86ab167cad5321"
 dependencies = [
  "cc",
 ]
@@ -3294,6 +3291,10 @@ name = "twox-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+
+[[package]]
+name = "ufsecp-sys"
+version = "0.0.0-dev"
 
 [[package]]
 name = "unicode-ident"

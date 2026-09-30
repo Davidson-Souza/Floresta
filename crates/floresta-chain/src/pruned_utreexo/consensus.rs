@@ -35,6 +35,8 @@ use floresta_common::prelude::*;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
 use rustreexo::stump::Stump;
+#[cfg(feature = "bitcoinkernel")]
+use spin::Mutex;
 use swift_sync_agg::SwiftSyncAgg;
 
 use super::chainparams::ChainParams;
@@ -62,6 +64,145 @@ pub const UTREEXO_TAG_V1: [u8; 64] = [
     0xae, 0x53, 0x4d, 0xc3, 0xf6, 0x42, 0x99, 0x19, 0x99, 0x31, 0x77, 0x2e, 0x03, 0x78, 0x7d, 0x18,
     0x15, 0x6e, 0xb3, 0x15, 0x1e, 0x0e, 0xd1, 0xb3, 0x09, 0x8b, 0xdc, 0x84, 0x45, 0x86, 0x18, 0x85,
 ];
+#[cfg(feature = "bitcoinkernel")]
+struct UltraFastVerifier {
+    cpu: *mut ufsecp_sys::ufsecp_ctx,
+    gpu: Option<*mut ufsecp_sys::ufsecp_gpu_ctx>,
+}
+
+#[cfg(feature = "bitcoinkernel")]
+unsafe impl Send for UltraFastVerifier {}
+
+#[cfg(feature = "bitcoinkernel")]
+impl UltraFastVerifier {
+    const OPENCL_BACKEND: u32 = 2;
+
+    fn cpu_only() -> Result<Self, String> {
+        let mut cpu = core::ptr::null_mut();
+        let cpu_result = unsafe { ufsecp_sys::ufsecp_ctx_create(&mut cpu) };
+        if cpu_result != 0 || cpu.is_null() {
+            return Err(format!(
+                "UltraFastSecp CPU context creation failed with code {cpu_result}"
+            ));
+        }
+        Ok(Self { cpu, gpu: None })
+    }
+
+    fn new() -> Result<Self, String> {
+        let mut verifier = Self::cpu_only()?;
+        verifier.gpu = if unsafe { ufsecp_sys::ufsecp_gpu_is_available(Self::OPENCL_BACKEND) } == 1
+        {
+            let mut context = core::ptr::null_mut();
+            let result =
+                unsafe { ufsecp_sys::ufsecp_gpu_ctx_create(&mut context, Self::OPENCL_BACKEND, 0) };
+            if result == 0 && !context.is_null() {
+                Some(context)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if verifier.gpu.is_some() {
+            tracing::info!("UltraFastSecp OpenCL verifier initialized");
+        } else {
+            tracing::info!(
+                "UltraFastSecp OpenCL unavailable; using parallel CPU batch verification"
+            );
+        }
+        Ok(verifier)
+    }
+
+    fn verify_ecdsa(&mut self, entries: &[bitcoinkernel::EcdsaVerification]) -> bool {
+        if entries.is_empty() {
+            return true;
+        }
+        if let Some(gpu) = self.gpu {
+            let mut messages = Vec::with_capacity(entries.len() * 32);
+            let mut pubkeys = Vec::with_capacity(entries.len() * 33);
+            let mut signatures = Vec::with_capacity(entries.len() * 64);
+            for entry in entries {
+                messages.extend_from_slice(&entry.message);
+                pubkeys.extend_from_slice(&entry.pubkey);
+                signatures.extend_from_slice(&entry.signature);
+            }
+            let mut results = vec![0_u8; entries.len()];
+            let status = unsafe {
+                ufsecp_sys::ufsecp_gpu_ecdsa_verify_batch(
+                    gpu,
+                    messages.as_ptr(),
+                    pubkeys.as_ptr(),
+                    signatures.as_ptr(),
+                    entries.len(),
+                    results.as_mut_ptr(),
+                )
+            };
+            if status == 0 {
+                return results.iter().all(|result| *result == 1);
+            }
+        }
+
+        let mut rows = Vec::with_capacity(entries.len() * 129);
+        for entry in entries {
+            rows.extend_from_slice(&entry.message);
+            rows.extend_from_slice(&entry.pubkey);
+            rows.extend_from_slice(&entry.signature);
+        }
+        unsafe {
+            ufsecp_sys::ufsecp_ecdsa_batch_verify(self.cpu, rows.as_ptr(), entries.len()) == 0
+        }
+    }
+
+    fn verify_schnorr(&mut self, entries: &[bitcoinkernel::SchnorrVerification]) -> bool {
+        if entries.is_empty() {
+            return true;
+        }
+        if let Some(gpu) = self.gpu {
+            let mut messages = Vec::with_capacity(entries.len() * 32);
+            let mut pubkeys = Vec::with_capacity(entries.len() * 32);
+            let mut signatures = Vec::with_capacity(entries.len() * 64);
+            for entry in entries {
+                messages.extend_from_slice(&entry.message);
+                pubkeys.extend_from_slice(&entry.pubkey);
+                signatures.extend_from_slice(&entry.signature);
+            }
+            let mut results = vec![0_u8; entries.len()];
+            let status = unsafe {
+                ufsecp_sys::ufsecp_gpu_schnorr_verify_batch(
+                    gpu,
+                    messages.as_ptr(),
+                    pubkeys.as_ptr(),
+                    signatures.as_ptr(),
+                    entries.len(),
+                    results.as_mut_ptr(),
+                )
+            };
+            if status == 0 {
+                return results.iter().all(|result| *result == 1);
+            }
+        }
+
+        let mut rows = Vec::with_capacity(entries.len() * 128);
+        for entry in entries {
+            rows.extend_from_slice(&entry.pubkey);
+            rows.extend_from_slice(&entry.message);
+            rows.extend_from_slice(&entry.signature);
+        }
+        unsafe {
+            ufsecp_sys::ufsecp_schnorr_batch_verify(self.cpu, rows.as_ptr(), entries.len()) == 0
+        }
+    }
+}
+
+#[cfg(feature = "bitcoinkernel")]
+impl Drop for UltraFastVerifier {
+    fn drop(&mut self) {
+        if let Some(gpu) = self.gpu {
+            unsafe { ufsecp_sys::ufsecp_gpu_ctx_destroy(gpu) };
+        }
+        unsafe { ufsecp_sys::ufsecp_ctx_destroy(self.cpu) };
+    }
+}
 
 /// The unspendable UTXO on block 91_722 that exists because of the historical
 /// [BIP30 violation](https://bips.dev/30/). For Utreexo, this UTXO is not overwritten
@@ -189,11 +330,56 @@ impl Consensus {
     pub fn verify_block_transactions(
         height: u32,
         lock_time_cutoff: u32,
+        utxos: HashMap<OutPoint, UtxoData>,
+        transactions: &[Transaction],
+        subsidy: Amount,
+        verify_script: bool,
+        flags: u32,
+    ) -> Result<(), BlockchainError> {
+        #[cfg(feature = "bitcoinkernel")]
+        if verify_script {
+            let mut signature_batch = bitcoinkernel::SignatureBatch::new()
+                .map_err(|error| BlockValidationErrors::ScriptValidationError(error.to_string()))?;
+            Self::verify_block_transactions_inner(
+                height,
+                lock_time_cutoff,
+                utxos,
+                transactions,
+                subsidy,
+                verify_script,
+                flags,
+                Some(&mut signature_batch),
+            )?;
+            return Self::verify_deferred_signatures(&signature_batch);
+        }
+        Self::verify_block_transactions_inner(
+            height,
+            lock_time_cutoff,
+            utxos,
+            transactions,
+            subsidy,
+            verify_script,
+            flags,
+            #[cfg(feature = "bitcoinkernel")]
+            None,
+            #[cfg(not(feature = "bitcoinkernel"))]
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_transactions_inner(
+        height: u32,
+        lock_time_cutoff: u32,
         mut utxos: HashMap<OutPoint, UtxoData>,
         transactions: &[Transaction],
         subsidy: Amount,
         verify_script: bool,
         flags: u32,
+        #[cfg(feature = "bitcoinkernel")] mut signature_batch: Option<
+            &mut bitcoinkernel::SignatureBatch,
+        >,
+        #[cfg(not(feature = "bitcoinkernel"))] _signature_batch: Option<&mut ()>,
     ) -> Result<(), BlockchainError> {
         // Blocks must contain at least one transaction (i.e., the coinbase)
         if transactions.is_empty() {
@@ -218,8 +404,17 @@ impl Consensus {
             }
 
             // Actually verify the transaction
-            let (in_value, out_value) =
-                Self::verify_transaction(transaction, &mut utxos, height, verify_script, flags)?;
+            let (in_value, out_value) = Self::verify_transaction_inner(
+                transaction,
+                &mut utxos,
+                height,
+                verify_script,
+                flags,
+                #[cfg(feature = "bitcoinkernel")]
+                signature_batch.as_deref_mut(),
+                #[cfg(not(feature = "bitcoinkernel"))]
+                None,
+            )?;
 
             // Fee is the difference between inputs and outputs. In the above function call we have
             // verified that `out_value <= in_value` (no underflow risk).
@@ -384,8 +579,32 @@ impl Consensus {
         transaction: &Transaction,
         utxos: &mut HashMap<OutPoint, UtxoData>,
         height: u32,
+        verify_script: bool,
+        flags: u32,
+    ) -> Result<(Amount, Amount), BlockchainError> {
+        Self::verify_transaction_inner(
+            transaction,
+            utxos,
+            height,
+            verify_script,
+            flags,
+            #[cfg(feature = "bitcoinkernel")]
+            None,
+            #[cfg(not(feature = "bitcoinkernel"))]
+            None,
+        )
+    }
+
+    fn verify_transaction_inner(
+        transaction: &Transaction,
+        utxos: &mut HashMap<OutPoint, UtxoData>,
+        height: u32,
         _verify_script: bool,
         _flags: u32,
+        #[cfg(feature = "bitcoinkernel")] signature_batch: Option<
+            &mut bitcoinkernel::SignatureBatch,
+        >,
+        #[cfg(not(feature = "bitcoinkernel"))] _signature_batch: Option<&mut ()>,
     ) -> Result<(Amount, Amount), BlockchainError> {
         let txid = || transaction.compute_txid();
 
@@ -428,7 +647,7 @@ impl Consensus {
         // Verify the tx script
         #[cfg(feature = "bitcoinkernel")]
         if _verify_script {
-            Self::verify_input_scripts(transaction, &spent_utxos, _flags)?;
+            Self::verify_input_scripts(transaction, &spent_utxos, _flags, signature_batch)?;
         }
 
         Ok((in_value, out_value))
@@ -440,6 +659,7 @@ impl Consensus {
         transaction: &Transaction,
         spent_utxos: &[UtxoData],
         flags: ScriptVerificationFlags,
+        mut signature_batch: Option<&mut bitcoinkernel::SignatureBatch>,
     ) -> Result<(), BlockchainError> {
         let tx = serialize(&transaction);
         let txid = || transaction.compute_txid();
@@ -466,15 +686,34 @@ impl Consensus {
             .map_err(|e| tx_err!(txid, ScriptValidationError, e.to_string()))?;
 
         for (input_index, (script, amount)) in prevout_data.iter().enumerate() {
-            bitcoinkernel::verify(
-                script,
-                Some(*amount),
-                &tx,
-                input_index,
-                Some(flags),
-                &tx_data,
-            )
-            .map_err(|error| {
+            let defer = signature_batch.is_some()
+                && Self::can_defer_signature(
+                    &spent_utxos[input_index].txout.script_pubkey,
+                    &transaction.input[input_index],
+                );
+            let result = if defer {
+                signature_batch
+                    .as_deref_mut()
+                    .expect("checked above")
+                    .verify_deferred(
+                        script,
+                        Some(*amount),
+                        &tx,
+                        input_index,
+                        Some(flags),
+                        &tx_data,
+                    )
+            } else {
+                bitcoinkernel::verify(
+                    script,
+                    Some(*amount),
+                    &tx,
+                    input_index,
+                    Some(flags),
+                    &tx_data,
+                )
+            };
+            result.map_err(|error| {
                 let previous_output = transaction.input[input_index].previous_output;
                 let script_pubkey = &spent_utxos[input_index].txout.script_pubkey;
                 let spent_prevouts = Self::spent_prevouts_diagnostic(transaction, spent_utxos);
@@ -491,6 +730,80 @@ impl Consensus {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    fn can_defer_signature(script_pubkey: &ScriptBuf, input: &TxIn) -> bool {
+        if script_pubkey.is_p2pkh() || script_pubkey.is_p2wpkh() {
+            return true;
+        }
+        if !script_pubkey.is_p2tr() {
+            return false;
+        }
+        match input.witness.len() {
+            1 => true,
+            2 => input
+                .witness
+                .last()
+                .is_some_and(|annex| annex.first() == Some(&0x50)),
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    fn verify_deferred_signatures(
+        batch: &bitcoinkernel::SignatureBatch,
+    ) -> Result<(), BlockchainError> {
+        let ecdsa = batch
+            .ecdsa()
+            .map_err(|error| BlockValidationErrors::ScriptValidationError(error.to_string()))?;
+        let schnorr = batch
+            .schnorr()
+            .map_err(|error| BlockValidationErrors::ScriptValidationError(error.to_string()))?;
+        static GPU_VERIFIER: Mutex<Option<UltraFastVerifier>> = Mutex::new(None);
+        let mut shared = GPU_VERIFIER.lock();
+        if shared.is_none() {
+            *shared = Some(UltraFastVerifier::new().map_err(|error| {
+                BlockValidationErrors::ScriptValidationError(format!(
+                    "UltraFastSecp initialization failed: {error}"
+                ))
+            })?);
+        }
+        if shared
+            .as_ref()
+            .expect("UltraFastSecp verifier initialized above")
+            .gpu
+            .is_some()
+        {
+            let verifier = shared
+                .as_mut()
+                .expect("UltraFastSecp verifier initialized above");
+            return if verifier.verify_ecdsa(&ecdsa) && verifier.verify_schnorr(&schnorr) {
+                Ok(())
+            } else {
+                Err(BlockValidationErrors::ScriptValidationError(
+                    "UltraFastSecp batch verification failed".to_owned(),
+                )
+                .into())
+            };
+        }
+        drop(shared);
+
+        // CPU contexts are independent, so concurrent block-validation workers do not spin on a
+        // process-wide verifier lock.
+        let mut verifier = UltraFastVerifier::cpu_only().map_err(|error| {
+            BlockValidationErrors::ScriptValidationError(format!(
+                "UltraFastSecp CPU context creation failed: {error}"
+            ))
+        })?;
+        if verifier.verify_ecdsa(&ecdsa) && verifier.verify_schnorr(&schnorr) {
+            Ok(())
+        } else {
+            Err(BlockValidationErrors::ScriptValidationError(
+                "UltraFastSecp batch verification failed".to_owned(),
+            )
+            .into())
+        }
     }
 
     #[cfg(feature = "bitcoinkernel")]
@@ -680,21 +993,36 @@ impl Consensus {
         })?;
         let subsidy = self.get_subsidy(height);
         #[cfg(feature = "bitcoinkernel")]
-        let flags = self
-            .parameters
-            .get_validation_flags(height, block.block_hash());
+        {
+            let flags = self
+                .parameters
+                .get_validation_flags(height, block.block_hash());
+            let mut signature_batch = bitcoinkernel::SignatureBatch::new()
+                .map_err(|error| BlockValidationErrors::ScriptValidationError(error.to_string()))?;
+            Self::verify_block_transactions_inner(
+                height,
+                lock_time_cutoff,
+                inputs,
+                &block.txdata,
+                subsidy,
+                true,
+                flags,
+                Some(&mut signature_batch),
+            )?;
+            Self::verify_deferred_signatures(&signature_batch)
+        }
         #[cfg(not(feature = "bitcoinkernel"))]
-        let flags = 0;
-
-        Self::verify_block_transactions(
-            height,
-            lock_time_cutoff,
-            inputs,
-            &block.txdata,
-            subsidy,
-            true,
-            flags,
-        )
+        {
+            Self::verify_block_transactions(
+                height,
+                lock_time_cutoff,
+                inputs,
+                &block.txdata,
+                subsidy,
+                true,
+                0,
+            )
+        }
     }
 
     /// Removes and returns the UTXO spent by `input`.
@@ -1729,6 +2057,137 @@ mod tests {
         assert!(diagnostic.contains(&format!("input 0 prevout {first} amount_sat 11")));
         assert!(diagnostic.contains(&format!("input 1 prevout {second} amount_sat 22")));
         assert_eq!(diagnostic.matches("script_pubkey").count(), 2);
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn ultrafast_batch_accepts_valid_and_rejects_corrupt_p2pkh_signature() {
+        const SCRIPT: &str = "76a9144bfbaf6afb76cc5771bc6404810d1cc041a6933988ac";
+        const VALID: &str = "02000000013f7cebd65c27431a90bba7f796914fe8cc2ddfc3f2cbd6f7e5f2fc854534da95000000006b483045022100de1ac3bcdfb0332207c4a91f3832bd2c2915840165f876ab47c5f8996b971c3602201c6c053d750fadde599e6f5c4e1963df0f01fc0d97815e8157e3d59fe09ca30d012103699b464d1d8bc9e47d4fb1cdaa89a1c5783d68363c4dbc4b524ed3d857148617feffffff02836d3c01000000001976a914fc25d6d5c94003bf5b0c7b640a248e2c637fcfb088ac7ada8202000000001976a914fbed3d9b11183209a57999d54d59f67c019e756c88ac6acb0700";
+        const CORRUPT: &str = "02000000013f7cebd65c27431a90bba7f796914fe8cc2ddfc3f2cbd6f7e5f2fc854534da95000000006b483045022100de1ac3bcdfb0332207c4a91f3832bd2c2915840165f876ab47c6f8996b971c3602201c6c053d750fadde599e6f5c4e1963df0f01fc0d97815e8157e3d59fe09ca30d012103699b464d1d8bc9e47d4fb1cdaa89a1c5783d68363c4dbc4b524ed3d857148617feffffff02836d3c01000000001976a914fc25d6d5c94003bf5b0c7b640a248e2c637fcfb088ac7ada8202000000001976a914fbed3d9b11183209a57999d54d59f67c019e756c88ac6acb0700";
+
+        let script = ScriptBuf::from_hex(SCRIPT).unwrap();
+        let kernel_script = bitcoinkernel::ScriptPubkey::try_from(script.as_bytes()).unwrap();
+        let collect = |raw: &str| {
+            let transaction: Transaction = deserialize_hex(raw).unwrap();
+            let serialized = bitcoin::consensus::serialize(&transaction);
+            let kernel_transaction =
+                bitcoinkernel::Transaction::try_from(serialized.as_slice()).unwrap();
+            let txdata = bitcoinkernel::PrecomputedTransactionData::new(
+                &kernel_transaction,
+                &Vec::<bitcoinkernel::TxOut>::new(),
+            )
+            .unwrap();
+            let mut batch = bitcoinkernel::SignatureBatch::new().unwrap();
+            batch
+                .verify_deferred(
+                    &kernel_script,
+                    Some(0),
+                    &kernel_transaction,
+                    0,
+                    Some(bitcoinkernel::VERIFY_ALL_PRE_TAPROOT),
+                    &txdata,
+                )
+                .unwrap();
+            batch
+        };
+
+        let valid = collect(VALID);
+        assert_eq!(valid.ecdsa().unwrap().len(), 1);
+        Consensus::verify_deferred_signatures(&valid).unwrap();
+
+        let corrupt = collect(CORRUPT);
+        assert_eq!(corrupt.ecdsa().unwrap().len(), 1);
+        assert!(Consensus::verify_deferred_signatures(&corrupt).is_err());
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn ultrafast_batch_accepts_valid_and_rejects_corrupt_taproot_signature() {
+        const SCRIPT: &str = "5120339ce7e165e67d93adb3fef88a6d4beed33f01fa876f05a225242b82a631abc0";
+        const VALID: &str = "01000000000101d1f1c1f8cdf6759167b90f52c9ad358a369f95284e841d7a2536cef31c0549580100000000fdffffff020000000000000000316a2f49206c696b65205363686e6f7272207369677320616e6420492063616e6e6f74206c69652e204062697462756734329e06010000000000225120a37c3903c8d0db6512e2b40b0dffa05e5a3ab73603ce8c9c4b7771e5412328f90140a60c383f71bac0ec919b1d7dbc3eb72dd56e7aa99583615564f9f99b8ae4e837b758773a5b2e4c51348854c8389f008e05029db7f464a5ff2e01d5e6e626174affd30a00";
+        const CORRUPT: &str = "01000000000101d1f1c1f8cdf6759167b90f52c9ad358a369f95284e841d7a2536cef31c0549580100000000fdffffff020000000000000000316a2f49206c696b65205363686e6f7272207369677320616e6420492063616e6e6f74206c69652e204062697462756734329e06010000000000225120a37c3903c8d0db6512e2b40b0dffa05e5a3ab73603ce8c9c4b7771e5412328f90140a60c383f71bac0ec919b1d7dbc3eb72dd56e7aa99583615564f9f99b8ae4e837b758772a5b2e4c51348854c8389f008e05029db7f464a5ff2e01d5e6e626174affd30a00";
+        const AMOUNT: i64 = 88_480;
+
+        let script = ScriptBuf::from_hex(SCRIPT).unwrap();
+        let kernel_script = bitcoinkernel::ScriptPubkey::try_from(script.as_bytes()).unwrap();
+        let collect = |raw: &str| {
+            let transaction: Transaction = deserialize_hex(raw).unwrap();
+            let serialized = bitcoin::consensus::serialize(&transaction);
+            let kernel_transaction =
+                bitcoinkernel::Transaction::try_from(serialized.as_slice()).unwrap();
+            let prevout = bitcoinkernel::TxOut::new(&kernel_script, AMOUNT);
+            let txdata =
+                bitcoinkernel::PrecomputedTransactionData::new(&kernel_transaction, &[prevout])
+                    .unwrap();
+            let mut batch = bitcoinkernel::SignatureBatch::new().unwrap();
+            batch
+                .verify_deferred(
+                    &kernel_script,
+                    Some(AMOUNT),
+                    &kernel_transaction,
+                    0,
+                    Some(bitcoinkernel::VERIFY_ALL),
+                    &txdata,
+                )
+                .unwrap();
+            batch
+        };
+
+        let valid = collect(VALID);
+        assert_eq!(valid.schnorr().unwrap().len(), 1);
+        Consensus::verify_deferred_signatures(&valid).unwrap();
+
+        let corrupt = collect(CORRUPT);
+        assert_eq!(corrupt.schnorr().unwrap().len(), 1);
+        assert!(Consensus::verify_deferred_signatures(&corrupt).is_err());
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn deferred_signatures_are_limited_to_consensus_safe_templates() {
+        let input = |witness: bitcoin::Witness| TxIn {
+            previous_output: dummy_outpoint(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness,
+        };
+        let p2pkh =
+            ScriptBuf::from_hex("76a914000000000000000000000000000000000000000088ac").unwrap();
+        let p2wpkh = ScriptBuf::from_hex("00140000000000000000000000000000000000000000").unwrap();
+        let p2wsh = ScriptBuf::from_hex(
+            "00200000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let p2tr = ScriptBuf::from_hex(
+            "51200000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+
+        assert!(Consensus::can_defer_signature(
+            &p2pkh,
+            &input(bitcoin::Witness::new())
+        ));
+        assert!(Consensus::can_defer_signature(
+            &p2wpkh,
+            &input(bitcoin::Witness::new())
+        ));
+        assert!(Consensus::can_defer_signature(
+            &p2tr,
+            &input(bitcoin::Witness::from_slice(&[[1_u8; 64]]))
+        ));
+        assert!(!Consensus::can_defer_signature(
+            &p2wsh,
+            &input(bitcoin::Witness::new())
+        ));
+        assert!(!Consensus::can_defer_signature(
+            &p2tr,
+            &input(bitcoin::Witness::from_slice(&[
+                [1_u8; 64].as_slice(),
+                [2_u8; 64].as_slice(),
+                [3_u8; 33].as_slice(),
+            ]))
+        ));
     }
 
     #[test]

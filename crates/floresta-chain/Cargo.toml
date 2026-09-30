@@ -23,6 +23,7 @@ crate-type = ["cdylib", "rlib"]
 bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 bitcoinkernel = { version = "=0.3.0", optional = true }
+ufsecp-sys = { path = "../../../ultrafast-secp256k1/bindings/rust/ufsecp-sys", optional = true }
 lru = { version = "=0.18.2", optional = true }
 memmap2 = { version = "=0.9.11", optional = true }
 rustreexo = { workspace = true }
@@ -50,7 +51,7 @@ zstd = { workspace = true }
 
 [features]
 default = []
-bitcoinkernel = ["dep:bitcoinkernel"]
+bitcoinkernel = ["dep:bitcoinkernel", "dep:ufsecp-sys"]
 metrics = ["dep:floresta-metrics"]
 test-utils = ["dep:serde"]
 flat-chainstore = ["dep:memmap2", "dep:lru", "dep:twox-hash"]
@@ -59,6 +60,11 @@ flat-chainstore = ["dep:memmap2", "dep:lru", "dep:twox-hash"]
 name = "chain_state_bench"
 harness = false
 required-features = ["flat-chainstore", "test-utils"]
+
+[[bench]]
+name = "signature_verification_bench"
+harness = false
+required-features = ["bitcoinkernel"]
 
 [lints]
 workspace = true
