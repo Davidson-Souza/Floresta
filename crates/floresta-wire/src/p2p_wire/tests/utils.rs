@@ -9,12 +9,15 @@ use std::time::Instant;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Network;
+use bitcoin::Transaction;
+use bitcoin::Txid;
 use bitcoin::block::Header;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::encode;
 use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::hex::FromHex;
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::p2p::message_filter::CFHeaders;
 use derive_more::Constructor;
 use floresta_chain::AssumeValidArg;
 use floresta_chain::ChainState;
@@ -63,11 +66,16 @@ pub struct UtreexoRoots {
 // Nightly Clippy false positive in `Constructor`-generated code:
 // https://github.com/rust-lang/rust-clippy/issues/17525
 #[allow(clippy::redundant_field_names)]
+#[allow(clippy::too_many_arguments)]
 #[derive(Debug, Constructor)]
 pub struct SimulatedPeer {
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, Block>,
     accs: HashMap<BlockHash, Vec<u8>>,
+    respond_to_header_requests: bool,
+    transactions: HashMap<Txid, Transaction>,
+    cfilter_headers: HashMap<BlockHash, CFHeaders>,
+    block_request_behavior: BlockRequestBehavior,
     node_tx: UnboundedSender<NodeNotification>,
     node_rx: UnboundedReceiver<NodeRequest>,
     peer_id: u32,
@@ -80,6 +88,13 @@ fn simulated_peer_services() -> ServiceFlags {
         | service_flags::UTREEXO_ARCHIVE.into()
         | ServiceFlags::WITNESS
         | ServiceFlags::COMPACT_FILTERS
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BlockRequestBehavior {
+    Reply,
+    Ignore(BlockHash),
+    Disconnect(BlockHash),
 }
 
 impl SimulatedPeer {
@@ -105,11 +120,17 @@ impl SimulatedPeer {
             .unwrap();
 
         loop {
-            let req = self.node_rx.recv().await.unwrap();
+            let Some(req) = self.node_rx.recv().await else {
+                break;
+            };
             let now = Instant::now();
 
             match req {
                 NodeRequest::GetHeaders(hashes) => {
+                    if !self.respond_to_header_requests {
+                        continue;
+                    }
+
                     let headers = hashes
                         .iter()
                         .filter_map(|h| self.headers.iter().find(|x| x.block_hash() == *h))
@@ -130,8 +151,22 @@ impl SimulatedPeer {
                         .unwrap();
                 }
                 NodeRequest::GetBlock(hashes) => {
+                    if let BlockRequestBehavior::Ignore(block) = self.block_request_behavior
+                        && hashes.contains(&block)
+                    {
+                        continue;
+                    }
+
+                    if let BlockRequestBehavior::Disconnect(block) = self.block_request_behavior
+                        && hashes.contains(&block)
+                    {
+                        break;
+                    }
+
                     for hash in hashes {
-                        let block = self.blocks.get(&hash).unwrap().clone();
+                        let Some(block) = self.blocks.get(&hash).cloned() else {
+                            continue;
+                        };
 
                         let peer_msg = PeerMessages::Block(block);
                         self.node_tx
@@ -155,17 +190,31 @@ impl SimulatedPeer {
                         .send(NodeNotification::FromPeer(self.peer_id, peer_msg, now))
                         .unwrap();
                 }
+                NodeRequest::MempoolTransaction(txid) => {
+                    let tx = self.transactions.get(&txid).unwrap().clone();
+
+                    let peer_msg = PeerMessages::Transaction(tx);
+                    self.node_tx
+                        .send(NodeNotification::FromPeer(self.peer_id, peer_msg, now))
+                        .unwrap();
+                }
+                NodeRequest::GetCFHeaders { stop_hash, .. } => {
+                    let cfheaders = self.cfilter_headers.get(&stop_hash).unwrap().clone();
+
+                    let peer_msg = PeerMessages::CFHeaders(cfheaders);
+                    self.node_tx
+                        .send(NodeNotification::FromPeer(self.peer_id, peer_msg, now))
+                        .unwrap();
+                }
                 _ => {}
             }
         }
 
-        self.node_tx
-            .send(NodeNotification::FromPeer(
-                self.peer_id,
-                PeerMessages::Disconnected(self.peer_id as usize),
-                Instant::now(),
-            ))
-            .unwrap();
+        let _ = self.node_tx.send(NodeNotification::FromPeer(
+            self.peer_id,
+            PeerMessages::Disconnected(self.peer_id as usize),
+            Instant::now(),
+        ));
     }
 }
 
@@ -179,9 +228,24 @@ pub fn spawn_peer(
         headers,
         blocks,
         accs,
+        respond_to_header_requests,
+        transactions,
+        cfilter_headers,
+        block_request_behavior,
     } = peer_data;
 
-    let mut peer = SimulatedPeer::new(headers, blocks, accs, node_sender, node_rcv, peer_id);
+    let mut peer = SimulatedPeer::new(
+        headers,
+        blocks,
+        accs,
+        respond_to_header_requests,
+        transactions,
+        cfilter_headers,
+        block_request_behavior,
+        node_sender,
+        node_rcv,
+        peer_id,
+    );
     task::spawn(async move {
         peer.run().await;
     });
@@ -193,7 +257,7 @@ pub fn spawn_peer(
         user_agent: "/utreexo:0.1.0/".to_string(),
         height: 0,
         time_offset: 0,
-        state: PeerStatus::Ready,
+        state: PeerStatus::Awaiting,
         channel: sender,
         kind: ConnectionKind::Regular(service_flags::UTREEXO.into()),
         banscore: 0,
@@ -211,6 +275,7 @@ pub fn get_node_config(
         network,
         pow_fraud_proofs,
         datadir: datadir.as_ref().into(),
+        disable_dns_seeds: true,
         user_agent: "node_test".to_string(),
         ..Default::default()
     }
@@ -313,12 +378,84 @@ pub fn mutate_block(block: &mut Block) {
 // Nightly Clippy false positive in `Constructor`-generated code:
 // https://github.com/rust-lang/rust-clippy/issues/17525
 #[allow(clippy::redundant_field_names)]
-#[derive(Clone, Constructor)]
+#[derive(Clone)]
 /// The chain data that our simulated peer will have
 pub struct PeerData {
     headers: Vec<Header>,
     blocks: HashMap<BlockHash, Block>,
     accs: HashMap<BlockHash, Vec<u8>>,
+    respond_to_header_requests: bool,
+    transactions: HashMap<Txid, Transaction>,
+    cfilter_headers: HashMap<BlockHash, CFHeaders>,
+    block_request_behavior: BlockRequestBehavior,
+}
+
+impl PeerData {
+    pub fn new(
+        headers: Vec<Header>,
+        blocks: HashMap<BlockHash, Block>,
+        accs: HashMap<BlockHash, Vec<u8>>,
+    ) -> Self {
+        Self {
+            headers,
+            blocks,
+            accs,
+            respond_to_header_requests: true,
+            transactions: HashMap::new(),
+            cfilter_headers: HashMap::new(),
+            block_request_behavior: BlockRequestBehavior::Reply,
+        }
+    }
+
+    pub fn disconnecting_on_block_request(
+        headers: Vec<Header>,
+        blocks: HashMap<BlockHash, Block>,
+        accs: HashMap<BlockHash, Vec<u8>>,
+        block: BlockHash,
+    ) -> Self {
+        Self {
+            headers,
+            blocks,
+            accs,
+            respond_to_header_requests: true,
+            transactions: HashMap::new(),
+            cfilter_headers: HashMap::new(),
+            block_request_behavior: BlockRequestBehavior::Disconnect(block),
+        }
+    }
+
+    pub fn ignoring_block_requests(
+        headers: Vec<Header>,
+        blocks: HashMap<BlockHash, Block>,
+        accs: HashMap<BlockHash, Vec<u8>>,
+        block: BlockHash,
+    ) -> Self {
+        Self {
+            headers,
+            blocks,
+            accs,
+            respond_to_header_requests: true,
+            transactions: HashMap::new(),
+            cfilter_headers: HashMap::new(),
+            block_request_behavior: BlockRequestBehavior::Ignore(block),
+        }
+    }
+
+    pub fn ignoring_header_requests(mut self) -> Self {
+        self.respond_to_header_requests = false;
+        self
+    }
+
+    pub fn with_transaction(mut self, transaction: Transaction) -> Self {
+        self.transactions
+            .insert(transaction.compute_txid(), transaction);
+        self
+    }
+
+    pub fn with_cfilter_headers(mut self, cfheaders: CFHeaders) -> Self {
+        self.cfilter_headers.insert(cfheaders.stop_hash, cfheaders);
+        self
+    }
 }
 
 // Nightly Clippy false positive in `Constructor`-generated code:
@@ -392,6 +529,8 @@ where
             (peer_id, Instant::now()),
         );
     }
+
+    node.peer_id_count = node.peers.len() as u32;
 
     node
 }

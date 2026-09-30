@@ -52,6 +52,7 @@ mod tests {
         // tests call node methods directly, without running the node's event loop.
         for peer in node.peers.values_mut() {
             peer.message_times.add(1.0);
+            peer.state = PeerStatus::Ready;
         }
         node.inflight.clear();
         node

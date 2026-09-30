@@ -301,7 +301,24 @@ where
     /// On an orderly shutdown, the node closes its peer connections, persists its state and uses
     /// `stop_signal` to notify the owner that shutdown is complete. If startup terminates early,
     /// the sender is dropped and the corresponding receiver is closed.
-    pub async fn run(mut self, stop_signal: tokio::sync::oneshot::Sender<()>) {
+    pub async fn run(self, stop_signal: tokio::sync::oneshot::Sender<()>) {
+        self.run_inner(stop_signal, None).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_with_ready_signal(
+        self,
+        stop_signal: tokio::sync::oneshot::Sender<()>,
+        ready_signal: tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.run_inner(stop_signal, Some(ready_signal)).await;
+    }
+
+    async fn run_inner(
+        mut self,
+        stop_signal: tokio::sync::oneshot::Sender<()>,
+        ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
         try_and_warn!(self.init_peers());
 
         // Use this node state to Initial Block download
@@ -375,6 +392,9 @@ where
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         info!("starting running node...");
+        if let Some(ready_signal) = ready_signal {
+            let _ = ready_signal.send(());
+        }
         loop {
             tokio::select! {
                 biased;
