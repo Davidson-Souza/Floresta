@@ -538,7 +538,7 @@ impl<Blockchain: RpcChain> BlockchainRpc for RpcImpl<Blockchain> {
                 DeploymentInfo {
                     deployment_type: "buried".to_string(),
                     height: Some(activation_height),
-                    active: height >= activation_height,
+                    active: height + 1 >= activation_height,
                     bip9: None,
                 },
             );

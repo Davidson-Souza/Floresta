@@ -13,17 +13,18 @@ response but skipped on the floresta side.
 """
 
 import pytest
+from test_framework.util import compare_fields
 
 MINE_BLOCKS = 10
 
-# Five buried deployments per Bitcoin Core's deploymentinfo.cpp enum
-# (DEPLOYMENT_HEIGHTINCB, DEPLOYMENT_DERSIG, DEPLOYMENT_CLTV, DEPLOYMENT_CSV,
-# DEPLOYMENT_SEGWIT). Anything else in bitcoind's output is BIP9 and intentionally
-# absent on floresta.
-BURIED_DEPLOYMENTS = ("bip34", "bip66", "bip65", "csv", "segwit")
+# Deployments have special validation because Floresta does not support all of them.
+IGNORE_FIELDS = ["deployments"]
+UNORDERED_FIELDS = ["script_flags"]
+
+# bitcoind's output is BIP9 and intentionally absent on floresta.
+IGNORE_FIELDS_DEPLOYMENTS = ["bip9"]
 
 
-# pylint: disable=too-many-locals
 @pytest.mark.rpc
 def test_get_deployment_info(node_manager, florestad_bitcoind_utreexod_with_chain):
     """
@@ -35,75 +36,39 @@ def test_get_deployment_info(node_manager, florestad_bitcoind_utreexod_with_chai
 
     node_manager.wait_for_sync_nodes()
 
-    floresta_info = florestad.rpc.get_deployment_info()
-    bitcoind_info = bitcoind.rpc.get_deployment_info()
+    valid_info(florestad, bitcoind, None)
 
-    # Top-level fields: hash and height must match.
-    assert floresta_info["hash"] == bitcoind_info["hash"], (
-        f"hash mismatch: floresta={floresta_info['hash']} "
-        f"bitcoind={bitcoind_info['hash']}"
-    )
-    assert floresta_info["height"] == bitcoind_info["height"], (
-        f"height mismatch: floresta={floresta_info['height']} "
-        f"bitcoind={bitcoind_info['height']}"
-    )
-
-    floresta_deps = floresta_info["deployments"]
-    bitcoind_deps = bitcoind_info["deployments"]
-
-    # Every buried deployment bitcoind emits must also be in floresta's output,
-    # with matching type, height and active flag.
-    for name in BURIED_DEPLOYMENTS:
-        assert name in bitcoind_deps, (
-            f"bitcoind unexpectedly missing buried deployment '{name}': "
-            f"{bitcoind_deps.keys()}"
-        )
-        assert name in floresta_deps, f"floresta missing buried deployment '{name}'"
-
-        b_entry = bitcoind_deps[name]
-        f_entry = floresta_deps[name]
-
-        assert (
-            f_entry["type"] == "buried"
-        ), f"floresta did not classify '{name}' as buried: {f_entry['type']}"
-        assert (
-            f_entry["height"] == b_entry["height"]
-        ), f"{name}: floresta height {f_entry['height']} != bitcoind {b_entry['height']}"
-        assert (
-            f_entry["active"] == b_entry["active"]
-        ), f"{name}: floresta active {f_entry['active']} != bitcoind {b_entry['active']}"
-
-    # Sanity check: floresta should not be emitting any deployment outside the
-    # buried set yet (no BIP9 state machine).
-    extra = set(floresta_deps.keys()) - set(BURIED_DEPLOYMENTS)
-    assert not extra, f"floresta emitted unexpected non-buried deployments: {extra}"
-
-    # Pre-activation contract: at genesis, deployments with height > 0 must be inactive.
     genesis_hash = florestad.rpc.get_blockhash(0)
-    floresta_genesis = florestad.rpc.get_deployment_info(genesis_hash)
 
-    assert floresta_genesis["height"] == 0
-    for name in BURIED_DEPLOYMENTS:
-        f_entry = floresta_genesis["deployments"][name]
-        expected_active = f_entry["height"] <= 0
-        assert (
-            f_entry["active"] == expected_active
-        ), f"genesis {name}: active={f_entry['active']} but height={f_entry['height']}"
+    valid_info(florestad, bitcoind, genesis_hash)
 
     # Mid-chain blockhash: exercises the `Some(blockhash)` branch of the handler.
     # Activation heights are network constants already checked at the tip, so
     # only the active flag is compared here.
     mid_height = MINE_BLOCKS // 2
     mid_hash = florestad.rpc.get_blockhash(mid_height)
-    floresta_mid = florestad.rpc.get_deployment_info(mid_hash)
-    bitcoind_mid = bitcoind.rpc.get_deployment_info(mid_hash)
 
-    assert floresta_mid["height"] == bitcoind_mid["height"] == mid_height
-    assert floresta_mid["hash"] == bitcoind_mid["hash"]
+    valid_info(florestad, bitcoind, mid_hash)
 
-    for name in BURIED_DEPLOYMENTS:
-        f_entry = floresta_mid["deployments"][name]
-        b_entry = bitcoind_mid["deployments"][name]
-        assert (
-            f_entry["active"] == b_entry["active"]
-        ), f"mid {name}: floresta active {f_entry['active']} != bitcoind {b_entry['active']}"
+
+def valid_info(florestad, bitcoind, block_hash):
+    """
+    Compare a single deployment entry from floresta and bitcoind.
+    Raises an assertion error if any field does not match.
+    """
+    f_entry = florestad.rpc.get_deployment_info(block_hash)
+    b_entry = bitcoind.rpc.get_deployment_info(block_hash)
+
+    compare_fields(
+        f_entry, b_entry, ignore_fields=IGNORE_FIELDS, unordered_fields=UNORDERED_FIELDS
+    )
+
+    f_deployments = f_entry["deployments"]
+    b_deployments = b_entry["deployments"]
+
+    # Now the validation uses Floresta's result as the reference and Bitcoin Core's result as the
+    # candidate. Since Floresta doesn't support all the deployments that Bitcoin Core does, the
+    # comparison only validates the fields that Floresta provides.
+    compare_fields(
+        b_deployments, f_deployments, ignore_fields=IGNORE_FIELDS_DEPLOYMENTS
+    )
