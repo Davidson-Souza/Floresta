@@ -532,6 +532,9 @@ mod tests {
     use bitcoin::Block;
     use bitcoin::CompactTarget;
     use bitcoin::Network;
+    use bitcoin::OutPoint;
+    use bitcoin::ScriptBuf;
+    use bitcoin::Witness;
     use bitcoin::block::Header;
     use bitcoin::block::Version;
     use bitcoin::consensus::encode::deserialize_hex;
@@ -543,6 +546,7 @@ mod tests {
 
     use super::PartialChainState;
     use crate::BlockchainError;
+    use crate::TransactionError;
     use crate::pruned_utreexo::UpdatableChainstate;
     use crate::pruned_utreexo::chainparams::ChainParams;
     use crate::pruned_utreexo::consensus::Consensus;
@@ -568,6 +572,8 @@ mod tests {
             };
 
             assert_eq!(chainstate.has_invalid_blocks(), caches_error);
+            assert_eq!(chainstate.inner().current_height, 0);
+            assert_eq!(chainstate.get_acc(), Stump::default());
         }
         run(
             "0000002000226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f39adbcd7823048d34357bdca86cd47172afe2a4af8366b5b34db36df89386d49b23ec964ffff7f20000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff165108feddb99c6b8435060b2f503253482f627463642fffffffff0100f2052a01000000160014806cef41295922d32ddfca09c26cc4acd36c3ed000000000",
@@ -604,6 +610,158 @@ mod tests {
             error: None,
         }
         .into()
+    }
+
+    fn chain_with_validated_parent() -> (PartialChainState, Block) {
+        let blocks: Vec<_> = include_str!("../../testdata/regtest_blocks.txt")
+            .lines()
+            .take(3)
+            .map(parse_block)
+            .collect();
+        let chain = get_empty_pchain(blocks.iter().map(|block| block.header).collect());
+        chain.inner_mut().final_height = 2;
+        chain
+            .connect_block(&blocks[1], Proof::default(), HashMap::new(), vec![])
+            .unwrap();
+        (chain, blocks[2].clone())
+    }
+
+    #[test]
+    fn partial_chain_rejects_invalid_coinbase_without_advancing() {
+        let (chain, mut block) = chain_with_validated_parent();
+        let acc = chain.get_acc();
+        block.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(vec![0x51]);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        chain.inner_mut().blocks[2] = block.header;
+        let txid = block.txdata[0].compute_txid();
+
+        let error = chain
+            .connect_block(&block, Proof::default(), HashMap::new(), vec![])
+            .unwrap_err();
+        let BlockchainError::TransactionError(error) = error else {
+            panic!("expected coinbase transaction error, got {error:?}");
+        };
+        assert_eq!(error.txid, txid);
+        assert!(matches!(
+            error.error,
+            BlockValidationErrors::InvalidCoinbase(_)
+        ));
+        assert!(matches!(
+            &chain.inner().error,
+            Some(BlockchainError::TransactionError(cached)) if cached == &error
+        ));
+        assert!(chain.has_invalid_blocks());
+        assert_eq!(chain.inner().current_height, 1);
+        assert!(!chain.inner().is_sync());
+        assert_eq!(chain.get_acc(), acc);
+    }
+
+    #[test]
+    fn partial_chain_rejects_invalid_transactions_without_advancing() {
+        for reason in [
+            BlockValidationErrors::EmptyOutputs,
+            BlockValidationErrors::DuplicateInput,
+            BlockValidationErrors::CoinbaseNotMatured,
+        ] {
+            let (chain, mut block) = chain_with_validated_parent();
+            let acc = chain.get_acc();
+            // Spending this block's coinbase needs no peer-supplied UTXO data.
+            let mut tx = block.txdata[0].clone();
+            tx.input[0].previous_output = OutPoint::new(block.txdata[0].compute_txid(), 0);
+            tx.input[0].script_sig = ScriptBuf::new();
+            match reason {
+                BlockValidationErrors::EmptyOutputs => tx.output.clear(),
+                BlockValidationErrors::DuplicateInput => tx.input.push(tx.input[0].clone()),
+                BlockValidationErrors::CoinbaseNotMatured => {}
+                _ => unreachable!(),
+            }
+            let expected = TransactionError {
+                txid: tx.compute_txid(),
+                error: reason,
+            };
+            block.txdata.push(tx);
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            chain.inner_mut().blocks[2] = block.header;
+
+            assert!(matches!(
+                chain.connect_block(&block, Proof::default(), HashMap::new(), vec![]),
+                Err(BlockchainError::TransactionError(error)) if error == expected
+            ));
+            assert!(matches!(
+                &chain.inner().error,
+                Some(BlockchainError::TransactionError(error)) if error == &expected
+            ));
+            assert!(chain.has_invalid_blocks());
+            assert_eq!(chain.inner().current_height, 1);
+            assert!(!chain.inner().is_sync());
+            assert_eq!(chain.get_acc(), acc);
+        }
+    }
+
+    #[test]
+    fn partial_chain_missing_ancestor_is_retryable() {
+        let (chain, block) = chain_with_validated_parent();
+        let acc = chain.get_acc();
+        let headers = core::mem::take(&mut chain.inner_mut().blocks);
+
+        assert!(matches!(
+            chain.connect_block(&block, Proof::default(), HashMap::new(), vec![]),
+            Err(BlockchainError::BlockNotPresent)
+        ));
+        assert!(!chain.has_invalid_blocks());
+        assert_eq!(chain.inner().current_height, 1);
+        assert_eq!(chain.get_acc(), acc);
+
+        chain.inner_mut().blocks = headers;
+        assert_eq!(
+            chain
+                .connect_block(&block, Proof::default(), HashMap::new(), vec![])
+                .unwrap(),
+            2
+        );
+        assert!(!chain.has_invalid_blocks());
+        assert!(chain.inner().is_sync());
+        assert_eq!(chain.get_acc().leaves, acc.leaves + 1);
+    }
+
+    #[test]
+    fn partial_chain_mutated_payload_does_not_poison_valid_retry() {
+        for reason in [
+            BlockValidationErrors::BadMerkleRoot,
+            BlockValidationErrors::BadWitnessCommitment,
+        ] {
+            let (chain, block) = chain_with_validated_parent();
+            let acc = chain.get_acc();
+            let mut mutated = block.clone();
+            match reason {
+                BlockValidationErrors::BadMerkleRoot => {
+                    mutated.txdata[0].output.clear();
+                }
+                BlockValidationErrors::BadWitnessCommitment => {
+                    mutated.txdata[0].input[0].witness = Witness::from_slice(&[&[0u8; 32]]);
+                }
+                _ => unreachable!(),
+            }
+            // Keep the same header: another peer can supply the original payload.
+            assert_eq!(mutated.block_hash(), block.block_hash());
+            assert!(matches!(
+                chain.connect_block(&mutated, Proof::default(), HashMap::new(), vec![]),
+                Err(BlockchainError::BlockValidation(error)) if error == reason
+            ));
+            assert!(!chain.has_invalid_blocks());
+            assert_eq!(chain.inner().current_height, 1);
+            assert_eq!(chain.get_acc(), acc);
+
+            assert_eq!(
+                chain
+                    .connect_block(&block, Proof::default(), HashMap::new(), vec![])
+                    .unwrap(),
+                2
+            );
+            assert!(!chain.has_invalid_blocks());
+            assert!(chain.inner().is_sync());
+            assert_eq!(chain.get_acc().leaves, acc.leaves + 1);
+        }
     }
 
     fn test_pchain_inner_with_times(times: &[u32]) -> PartialChainStateInner {
