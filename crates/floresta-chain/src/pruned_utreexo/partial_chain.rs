@@ -528,7 +528,9 @@ impl From<PartialChainStateInner> for PartialChainState {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::slice;
 
+    use bitcoin::Amount;
     use bitcoin::Block;
     use bitcoin::CompactTarget;
     use bitcoin::Network;
@@ -539,6 +541,8 @@ mod tests {
     use bitcoin::block::Version;
     use bitcoin::consensus::encode::deserialize_hex;
     use bitcoin::constants::genesis_block;
+    use bitcoin::hashes::Hash;
+    use bitcoin::hashes::sha256;
     use floresta_common::acchashes;
     use rustreexo::node_hash::BitcoinNodeHash;
     use rustreexo::proof::Proof;
@@ -546,7 +550,10 @@ mod tests {
 
     use super::PartialChainState;
     use crate::BlockchainError;
+    use crate::CompactLeafData;
+    use crate::ScriptPubKeyKind;
     use crate::TransactionError;
+    use crate::proof_util::process_proof;
     use crate::pruned_utreexo::UpdatableChainstate;
     use crate::pruned_utreexo::chainparams::ChainParams;
     use crate::pruned_utreexo::consensus::Consensus;
@@ -762,6 +769,135 @@ mod tests {
             assert!(chain.inner().is_sync());
             assert_eq!(chain.get_acc().leaves, acc.leaves + 1);
         }
+    }
+
+    #[test]
+    fn partial_chain_authenticates_leaf_data_before_transaction_validation() {
+        let mut blocks: Vec<_> = include_str!("../../testdata/regtest_blocks.txt")
+            .lines()
+            .take(102)
+            .map(parse_block)
+            .collect();
+        // Only the first coinbase adds a spendable output. At height 101 it is
+        // mature, and its inclusion proof has target 0 with no sibling hashes.
+        for height in 1..=100 {
+            let previous = blocks[height - 1].block_hash();
+            let block = &mut blocks[height];
+            block.header.prev_blockhash = previous;
+            block.txdata[0].output[0].value = Amount::from_sat(1);
+            block.txdata[0].output[0].script_pubkey = if height == 1 {
+                ScriptBuf::from_bytes(vec![0x51])
+            } else {
+                ScriptBuf::new_op_return([0])
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+        }
+        let funding = OutPoint::new(blocks[1].txdata[0].compute_txid(), 0);
+        let mut spend = blocks[101].txdata[0].clone();
+        spend.input[0].previous_output = funding;
+        spend.input[0].script_sig = ScriptBuf::new();
+        spend.output[0].value = Amount::from_sat(1);
+        spend.output[0].script_pubkey = ScriptBuf::new_op_return([0]);
+        blocks[101].header.prev_blockhash = blocks[100].block_hash();
+        blocks[101].txdata.push(spend);
+        blocks[101].header.merkle_root = blocks[101].compute_merkle_root().unwrap();
+        let block = &blocks[101];
+        let honest_leaf = CompactLeafData {
+            header_code: (1 << 1) | 1,
+            amount: 1,
+            spk_ty: ScriptPubKeyKind::Other(vec![0x51].into_boxed_slice()),
+        };
+        let proof = Proof {
+            targets: vec![0],
+            hashes: vec![],
+        };
+
+        let mut forged_amount = honest_leaf.clone();
+        forged_amount.amount = 0;
+        let mut forged_height = honest_leaf.clone();
+        forged_height.header_code = (100 << 1) | 1;
+        for (forged_leaf, reason) in [
+            (forged_amount, BlockValidationErrors::NotEnoughMoney),
+            (forged_height, BlockValidationErrors::CoinbaseNotMatured),
+        ] {
+            let chain = get_empty_pchain(blocks.iter().map(|block| block.header).collect());
+            chain.inner_mut().final_height = 101;
+            for parent in &blocks[1..=100] {
+                chain
+                    .connect_block(parent, Proof::default(), HashMap::new(), vec![])
+                    .unwrap();
+            }
+            let acc = chain.get_acc();
+            assert_eq!(acc.leaves, 1);
+            let (bad_hashes, bad_inputs) =
+                process_proof(&[forged_leaf], &block.txdata, 101, |height| {
+                    Ok::<_, BlockchainError>(blocks[height as usize].block_hash())
+                })
+                .unwrap();
+            // Establish that validating unauthenticated data would blame the
+            // transaction rather than the peer that supplied the forged leaf.
+            assert!(matches!(
+                chain.inner().validate_block(block, 101, bad_inputs.clone()),
+                Err(BlockchainError::TransactionError(error)) if error.error == reason
+            ));
+            assert!(matches!(
+                chain.connect_block(block, proof.clone(), bad_inputs, bad_hashes),
+                Err(BlockchainError::InvalidUtreexoProof)
+            ));
+            assert!(!chain.has_invalid_blocks());
+            assert_eq!(chain.inner().current_height, 100);
+            assert_eq!(chain.get_acc(), acc);
+
+            let (hashes, inputs) = process_proof(
+                slice::from_ref(&honest_leaf),
+                &block.txdata,
+                101,
+                |height| Ok::<_, BlockchainError>(blocks[height as usize].block_hash()),
+            )
+            .unwrap();
+            assert_eq!(
+                chain
+                    .connect_block(block, proof.clone(), inputs, hashes)
+                    .unwrap(),
+                101
+            );
+            assert!(!chain.has_invalid_blocks());
+            assert!(chain.inner().is_sync());
+            assert_eq!(chain.get_acc().leaves, 2);
+        }
+    }
+
+    #[test]
+    fn partial_chain_bad_proof_does_not_poison_valid_retry() {
+        let (chain, block) = chain_with_validated_parent();
+        let acc = chain.get_acc();
+        // Target 0 exists, but this hash is not its committed leaf.
+        let proof = Proof {
+            targets: vec![0],
+            hashes: vec![],
+        };
+        assert!(matches!(
+            chain.connect_block(
+                &block,
+                proof,
+                HashMap::new(),
+                vec![sha256::Hash::hash(b"forged")],
+            ),
+            Err(BlockchainError::InvalidUtreexoProof)
+        ));
+        assert!(!chain.has_invalid_blocks());
+        assert_eq!(chain.inner().current_height, 1);
+        assert_eq!(chain.get_acc(), acc);
+
+        assert_eq!(
+            chain
+                .connect_block(&block, Proof::default(), HashMap::new(), vec![])
+                .unwrap(),
+            2
+        );
+        assert!(!chain.has_invalid_blocks());
+        assert!(chain.inner().is_sync());
+        assert_eq!(chain.get_acc().leaves, acc.leaves + 1);
     }
 
     fn test_pchain_inner_with_times(times: &[u32]) -> PartialChainStateInner {
