@@ -61,7 +61,7 @@ pub(crate) struct PartialChainStateInner {
     pub(crate) final_height: u32,
     /// The error that occurred during validation, if any. It is here so we can
     /// pull that afterwards.
-    pub(crate) error: Option<BlockValidationErrors>,
+    pub(crate) error: Option<BlockchainError>,
     /// The consensus parameters, we need this to validate the blocks.
     pub(crate) consensus: Consensus,
     /// Whether we assume the signatures in this interval as valid, this is used to
@@ -151,6 +151,29 @@ impl PartialChainStateInner {
         self.median_time_past(height.saturating_sub(1))
     }
 
+    /// Invalidate this block, if the error is sufficient to mark it as such.
+    ///
+    /// Not all errors marks a block as invalid, because they might mean either a mistake on our
+    /// side, or a misbehaving peer. This method will set the internal error if it is a consensus
+    /// error, invalidating this block.
+    fn maybe_invalidate(&mut self, error: &BlockchainError) {
+        if let BlockchainError::BlockValidation(e) = error {
+            // These errors may describe a mutated payload for an otherwise valid header.
+            // Another peer can still provide the valid block, so don't poison this chain.
+            if !matches!(
+                e,
+                BlockValidationErrors::BadMerkleRoot | BlockValidationErrors::BadWitnessCommitment
+            ) {
+                self.error = Some(BlockchainError::BlockValidation(e.clone()));
+            }
+        }
+
+        // All transaction errors are consensus invalidation reason.
+        if let BlockchainError::TransactionError(e) = error {
+            self.error = Some(BlockchainError::TransactionError(e.clone()));
+        }
+    }
+
     /// Process a block, given the proof, inputs, and deleted hashes.
     /// If we find an error that proves the assumed chain invalid, we save it.
     pub fn process_block(
@@ -161,24 +184,15 @@ impl PartialChainStateInner {
         del_hashes: Vec<bitcoin::hashes::sha256::Hash>,
     ) -> Result<u32, BlockchainError> {
         let height = self.current_height + 1;
-
-        if let Err(BlockchainError::BlockValidation(e)) = self.validate_block(block, height, inputs)
-        {
-            // These errors may describe a mutated payload for an otherwise valid header.
-            // Another peer can still provide the valid block, so don't poison this chain.
-            if !matches!(
-                e,
-                BlockValidationErrors::BadMerkleRoot | BlockValidationErrors::BadWitnessCommitment
-            ) {
-                self.error = Some(e.clone());
-            }
-            return Err(BlockchainError::BlockValidation(e));
+        if let Err(error) = self.validate_block(block, height, inputs) {
+            self.maybe_invalidate(&error);
+            return Err(error);
         }
 
         let acc = match Consensus::update_acc(&self.current_acc, block, height, proof, del_hashes) {
             Ok(acc) => acc,
             Err(_) => {
-                self.error = Some(BlockValidationErrors::InvalidUtreexoProof);
+                self.error = Some(BlockValidationErrors::InvalidUtreexoProof.into());
                 return Err(BlockchainError::InvalidUtreexoProof);
             }
         };
