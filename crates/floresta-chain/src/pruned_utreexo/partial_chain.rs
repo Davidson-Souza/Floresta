@@ -176,6 +176,11 @@ impl PartialChainStateInner {
 
     /// Process a block, given the proof, inputs, and deleted hashes.
     /// If we find an error that proves the assumed chain invalid, we save it.
+    ///
+    /// Authenticate the supplied leaf hashes with an accumulator update before
+    /// validating transactions against the supplied inputs. A bad proof does not
+    /// invalidate the chain, so another peer can supply a valid proof.
+    /// Commit the new accumulator only after block validation also succeeds.
     pub fn process_block(
         &mut self,
         block: &bitcoin::Block,
@@ -184,18 +189,13 @@ impl PartialChainStateInner {
         del_hashes: Vec<bitcoin::hashes::sha256::Hash>,
     ) -> Result<u32, BlockchainError> {
         let height = self.current_height + 1;
+        let acc = Consensus::update_acc(&self.current_acc, block, height, proof, del_hashes)
+            .map_err(|_| BlockchainError::InvalidUtreexoProof)?;
+
         if let Err(error) = self.validate_block(block, height, inputs) {
             self.maybe_invalidate(&error);
             return Err(error);
         }
-
-        let acc = match Consensus::update_acc(&self.current_acc, block, height, proof, del_hashes) {
-            Ok(acc) => acc,
-            Err(_) => {
-                self.error = Some(BlockValidationErrors::InvalidUtreexoProof.into());
-                return Err(BlockchainError::InvalidUtreexoProof);
-            }
-        };
 
         // ... If we came this far, we consider this block valid ...
 
