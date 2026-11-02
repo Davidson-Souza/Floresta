@@ -19,7 +19,6 @@ use bitcoin::TxIn;
 use bitcoin::Txid;
 use bitcoin::absolute;
 use bitcoin::block::Header as BlockHeader;
-use bitcoin::blockdata::Weight;
 #[cfg(feature = "bitcoinkernel")]
 use bitcoin::consensus::serialize;
 use bitcoin::constants::MAX_BLOCK_SIGOPS_COST;
@@ -44,6 +43,7 @@ use super::sigops::SigopExt;
 use super::udata;
 use crate::TransactionError;
 use crate::extensions::Bip30UnspendableExt;
+use crate::extensions::BlockExt;
 use crate::extensions::TransactionExt;
 use crate::pruned_utreexo::utxo_data::UtxoData;
 use crate::swift_sync_agg::SipHashKeys;
@@ -674,40 +674,30 @@ impl Consensus {
     /// Runs inexpensive, consensus-critical block checks that don't require script execution. If
     /// successful, returns the list of [`Txid`]s computed for the merkle root check.
     ///
-    /// This verifies:
-    /// - the header merkle root matches the block's txids
-    /// - BIP34 coinbase-encoded height once activated (at `bip34_height`)
-    /// - if there are SegWit transactions, the witness commitment is present and correct
-    /// - total block weight is within the 4,000,000 WU limit
-    /// - legacy signature-operation cost is within the block-wide limit
+    /// This function delegates all the validation to two helpers:
+    /// - [`BlockExt::check_block_structure`], which verifies the header merkle root matches the
+    ///   block's txids, the witness commitment is present and correct (when there are SegWit
+    ///   transactions), and the total block weight is within the 4,000,000 WU limit
+    /// - [`Consensus::check_bip34`], which verifies the BIP34 coinbase-encoded height once
+    ///   activated (at `bip34_height`)
     pub fn check_block(&self, block: &Block, height: u32) -> Result<Vec<Txid>, BlockchainError> {
-        let Some(txids) = Self::check_merkle_root(block) else {
-            Err(BlockValidationErrors::BadMerkleRoot)?
-        };
+        let txids = block.check_block_structure()?;
 
+        self.check_bip34(block, height)?;
+
+        Ok(txids)
+    }
+
+    /// Checks that the block height encoded in the coinbase input's scriptsig is correct,
+    /// as required by [BIP34](https://github.com/bitcoin/bips/blob/master/bip-0034.mediawiki).
+    pub fn check_bip34(&self, block: &Block, height: u32) -> Result<(), BlockchainError> {
         let bip34_height = self.parameters.params.bip34_height;
         // If bip34 is active, check that the encoded block height is correct
         if height >= bip34_height && Self::get_bip34_height(block) != Some(height) {
             Err(BlockValidationErrors::BadBip34)?;
         }
 
-        if !block.check_witness_commitment() {
-            Err(BlockValidationErrors::BadWitnessCommitment)?;
-        }
-
-        if block.weight() > Weight::MAX_BLOCK {
-            Err(BlockValidationErrors::BlockTooBig)?;
-        }
-
-        // Match Bitcoin Core's CheckBlock: sum every transaction's legacy sigops at four cost
-        // units each. P2SH and witness costs are added later once prevouts are available.
-        // https://github.com/bitcoin/bitcoin/blob/v31.0/src/validation.cpp#L4001-L4009
-        let sigop_cost: usize = block.txdata.iter().map(|tx| tx.legacy_sigop_cost()).sum();
-        if sigop_cost > usize::try_from(MAX_BLOCK_SIGOPS_COST).expect("non-negative") {
-            Err(BlockValidationErrors::TooManySigops)?;
-        }
-
-        Ok(txids)
+        Ok(())
     }
 
     /// Validates a block under AssumeValid SwiftSync, where previous outputs are unavailable,
@@ -1133,7 +1123,6 @@ pub mod swift_sync_agg {
 #[cfg(test)]
 mod tests {
     use core::str::FromStr;
-    use std::fs::File;
 
     use bitcoin::Amount;
     use bitcoin::Network;
@@ -1142,11 +1131,10 @@ mod tests {
     use bitcoin::Sequence;
     use bitcoin::Transaction;
     use bitcoin::TxIn;
-    use bitcoin::TxOut;
     use bitcoin::Txid;
+    use bitcoin::Weight;
     use bitcoin::Witness;
     use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::deserialize;
     use bitcoin::consensus::encode::deserialize_hex;
     use bitcoin::constants::genesis_block;
     use bitcoin::hashes::Hash;
@@ -1177,7 +1165,6 @@ mod tests {
     use floresta_common::assert_ok;
     use rand::Rng;
     use rand::SeedableRng;
-    use rand::prelude::IndexedMutRandom;
     use rand::rand_core::UnwrapErr;
     use rand::rngs::StdRng;
     use rand::rngs::SysRng;
@@ -1186,66 +1173,9 @@ mod tests {
     use super::*;
     use crate::pruned_utreexo::chainparams::VERIFY_P2SH;
     use crate::pruned_utreexo::chainparams::VERIFY_WITNESS;
-
-    #[macro_export]
-    /// Macro for creating a TxOut
-    macro_rules! txout {
-        ($sats:expr, $script:expr) => {
-            bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat($sats),
-                script_pubkey: $script,
-            }
-        };
-    }
-
-    #[macro_export]
-    /// Macro for constructing a legacy [`TxIn`] with optional scriptSig and sequence number.
-    /// Needs the outpoint and, if not provided, defaults to empty scriptSig and `Sequence::MAX`.
-    macro_rules! txin {
-        ($outpoint:expr) => {
-            bitcoin::TxIn {
-                previous_output: $outpoint,
-                script_sig: bitcoin::ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::new(),
-            }
-        };
-        ($outpoint:expr, $script:expr) => {
-            bitcoin::TxIn {
-                previous_output: $outpoint,
-                script_sig: $script,
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::new(),
-            }
-        };
-        ($outpoint:expr, $script:expr, $sequence:expr) => {
-            bitcoin::TxIn {
-                previous_output: $outpoint,
-                script_sig: $script,
-                sequence: $sequence,
-                witness: bitcoin::Witness::new(),
-            }
-        };
-    }
-
-    /// Helper for building a zero-locktime transaction given the input and output list.
-    fn build_tx(input: Vec<TxIn>, output: Vec<TxOut>) -> Transaction {
-        Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input,
-            output,
-        }
-    }
-
-    /// Helper to avoid boilerplate in test cases. Note this is not a null outpoint, restricted to
-    /// coinbase transactions only, as that requires the vout to be `u32::MAX`.
-    fn dummy_outpoint() -> OutPoint {
-        OutPoint {
-            txid: Txid::all_zeros(),
-            vout: 0,
-        }
-    }
+    use crate::test_utils::*;
+    use crate::txin;
+    use crate::txout;
 
     fn same_block_spend_fixture() -> (Vec<Transaction>, HashMap<OutPoint, UtxoData>) {
         let proof_outpoint = dummy_outpoint();
@@ -1450,84 +1380,6 @@ mod tests {
         "020000000139cf57739cb5d08335b7ed529792de34987d763d4856957dcc4b258c9cb1d0d300000000d601ff4cd276767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767600000000012602000000000000160014ef814b32b68a6138974b1144603b5c10569eeef600000000:2602000000000000160014ef814b32b68a6138974b1144603b5c10569eeef6",
     ];
 
-    fn coinbase(is_valid: bool) -> Transaction {
-        // This coinbase transaction was retrieved from https://learnmeabitcoin.com/explorer/block/0000000000000a0f82f8be9ec24ebfca3d5373fde8dc4d9b9a949d538e9ff679
-
-        // Create input
-        let script_sig = if is_valid {
-            ScriptBuf::from_hex("03f0a2a4d9f0a2").unwrap()
-        } else {
-            // This must invalidate the coinbase transaction since it's a big script.
-            ScriptBuf::from_hex(&format!("{:0>420}", "")).unwrap()
-        };
-        let input = txin!(OutPoint::null(), script_sig);
-
-        // Create outputs
-        let output_script = ScriptBuf::from_hex("41047eda6bd04fb27cab6e7c28c99b94977f073e912f25d1ff7165d9c95cd9bbe6da7e7ad7f2acb09e0ced91705f7616af53bee51a238b7dc527f2be0aa60469d140ac").unwrap();
-        let output = txout!(5_000_350_000, output_script);
-
-        Transaction {
-            version: Version::ONE,
-            lock_time: LockTime::from_height(150_007).unwrap(),
-            input: vec![input],
-            output: vec![output],
-        }
-    }
-
-    /// Modifies a block to have a different output script (txdata is tampered with).
-    fn mutate_block(block: &mut Block) {
-        let mut rng = StdRng::seed_from_u64(0x_bebe_cafe);
-
-        let tx = block.txdata.choose_mut(&mut rng).unwrap();
-        let out = tx.output.choose_mut(&mut rng).unwrap();
-        let spk = out.script_pubkey.as_mut_bytes();
-        // Random byte from a random scriptPubKey
-        let byte = spk.choose_mut(&mut rng).unwrap();
-
-        *byte += 1;
-    }
-
-    /// Test helper to update the witness commitment in a block, assuming txdata was modified.
-    /// This ensures `block` is not considered mutated, so we can exercise other error cases.
-    fn update_witness_commitment(block: &mut Block) -> Option<()> {
-        // BIP141 witness-commitment prefix, where the full commitment data is:
-        //  1-byte - OP_RETURN (0x6a)
-        //  1-byte - Push the following 36 bytes (0x24)
-        //  4-byte - Commitment header (0xaa21a9ed)
-        // 32-byte - Commitment hash: Double-SHA256(witness root hash|witness reserved value)
-        const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-
-        let coinbase = &block.txdata[0];
-
-        // Commitment is in the last coinbase output that starts with magic bytes.
-        let pos = coinbase.output.iter().rposition(|out| {
-            let spk = out.script_pubkey.as_bytes();
-            spk.len() >= 38 && spk[0..6] == MAGIC
-        })?;
-
-        // Witness reserved value is in coinbase input witness.
-        let witness_rv: &[u8; 32] = {
-            let mut it = coinbase.input[0].witness.iter();
-            match (it.next(), it.next()) {
-                (Some(rv), None) => rv.try_into().ok()?,
-                _ => return None,
-            }
-        };
-
-        let root = block.witness_root()?;
-        let c = *Block::compute_witness_commitment(&root, witness_rv).as_byte_array();
-
-        block.txdata[0].output[pos].script_pubkey.as_mut_bytes()[6..38].copy_from_slice(&c);
-        Some(())
-    }
-
-    /// Decode and deserialize a zstd-compressed block in the given file path.
-    fn decode_block(file_path: &str) -> Block {
-        let block_file = File::open(file_path).unwrap();
-        let block_bytes = zstd::decode_all(block_file).unwrap();
-        deserialize(&block_bytes).unwrap()
-    }
-
     #[test]
     fn test_check_merkle_root() {
         let blocks = [
@@ -1536,7 +1388,7 @@ mod tests {
             genesis_block(Network::Testnet4),
             genesis_block(Network::Signet),
             genesis_block(Network::Regtest),
-            decode_block("./testdata/block_866342/raw.zst"),
+            decode_block_866342(),
             decode_block("./testdata/block_367891/raw.zst"),
         ];
 
@@ -1561,7 +1413,7 @@ mod tests {
 
     #[test]
     fn rejects_cve_2012_2459_duplicate_subtree_mutation() {
-        let mut block = decode_block("./testdata/block_866342/raw.zst");
+        let mut block = decode_block_866342();
         block.txdata.truncate(6);
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
@@ -1585,34 +1437,6 @@ mod tests {
         ));
     }
 
-    /// Modifies historical block at height 866,342 by adding one extra transaction so that the
-    /// updated block weight is 4,000,001 WUs. The block merkle roots are updated accordingly.
-    fn build_oversized_866_342() -> Block {
-        let mut block = decode_block("./testdata/block_866342/raw.zst");
-
-        let consensus = Consensus::from(Network::Bitcoin);
-        consensus.check_block(&block, 866_342).expect("valid block");
-
-        // This block is close but below to the max weight
-        assert_eq!(block.weight().to_wu(), 3_993_209);
-
-        // Modify the block by adding one transaction that makes it exceed the weight limit
-        let mut script_out = ScriptBuf::default();
-        for _ in 0..1_636 {
-            script_out.push_opcode(OP_NOP);
-        }
-        let out = txout!(1, script_out);
-        let tx = build_tx(vec![txin!(dummy_outpoint())], vec![out]);
-
-        block.txdata.insert(1, tx);
-
-        // Update the witness commitment, and then the merkle root, which depends on the former
-        update_witness_commitment(&mut block).expect("should be able to update");
-        block.header.merkle_root = block.compute_merkle_root().unwrap();
-
-        block
-    }
-
     #[test]
     fn test_block_too_big() {
         let height = 866_342;
@@ -1633,6 +1457,173 @@ mod tests {
             Err(BlockchainError::BlockValidation(BlockValidationErrors::BlockTooBig)) => (),
             other => panic!("We should have `BlockValidationErrors::BlockTooBig`, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_check_block() {
+        let height = 866_342;
+        let consensus = Consensus::from(Network::Bitcoin);
+        let block = decode_block_866342();
+
+        let txids = consensus.check_block(&block, height).unwrap();
+        let expected_txid = block
+            .txdata
+            .iter()
+            .map(|tx| tx.compute_txid())
+            .collect::<Vec<_>>();
+
+        assert_eq!(txids, expected_txid);
+    }
+
+    #[test]
+    fn test_check_block_bad_bip34() {
+        let consensus = Consensus::from(Network::Bitcoin);
+        let height = consensus.parameters.params.bip34_height + 3;
+        let mut block = decode_block_866342();
+
+        // Encode a different height in the coinbase scriptSig.
+        block.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(vec![0x03, 0x01, 0x00, 0x00]);
+        update_witness_commitment(&mut block);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let error = consensus.check_block(&block, height).unwrap_err();
+        assert!(matches!(
+            error,
+            BlockchainError::BlockValidation(BlockValidationErrors::BadBip34)
+        ));
+
+        let height = consensus.parameters.params.bip34_height;
+        let error = consensus.check_block(&block, height).unwrap_err();
+        assert!(matches!(
+            error,
+            BlockchainError::BlockValidation(BlockValidationErrors::BadBip34)
+        ));
+    }
+
+    /// Builds a block whose (single-input) coinbase carries the given `script_sig`, with the
+    /// rest of the block left as-is. Only used to exercise BIP34-related checks.
+    fn block_with_coinbase_scriptsig(script_sig: ScriptBuf) -> Block {
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig,
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: Vec::new(),
+        };
+
+        let mut block = decode_block_866342();
+        block.txdata = vec![tx];
+        block
+    }
+
+    /// Encodes `height` as a minimal numeric push, which is what BIP34 requires miners to
+    /// include in the coinbase scriptsig. For `1..=16`, this yields the `OP_1`..`OP_16`
+    /// opcodes; any other value yields a minimal data push.
+    fn bip34_scriptsig(height: i64) -> ScriptBuf {
+        bitcoin::script::Builder::new()
+            .push_int(height)
+            .into_script()
+    }
+
+    #[test]
+    fn test_check_bip34_accepts_matching_encoded_height() {
+        let consensus = Consensus::from(Network::Bitcoin);
+        let bip34_height = consensus.parameters.params.bip34_height;
+
+        // Within the activation range, a correctly encoded height passes the check
+        for height in [bip34_height, 866_342] {
+            let block = block_with_coinbase_scriptsig(bip34_scriptsig(height as i64));
+            assert_ok!(consensus.check_bip34(&block, height));
+        }
+
+        // The real block mined at height 866,342 also carries the correct height
+        let block = decode_block_866342();
+        assert_ok!(consensus.check_bip34(&block, 866_342));
+
+        // Below the activation height the height isn't validated at all, so even a
+        // block encoding the wrong height passes
+        let block = block_with_coinbase_scriptsig(bip34_scriptsig(866_342));
+        assert_ok!(consensus.check_bip34(&block, 100));
+
+        // The same goes for a coinbase that doesn't encode any height
+        let block = block_with_coinbase_scriptsig(ScriptBuf::new());
+        assert_ok!(consensus.check_bip34(&block, bip34_height - 1));
+    }
+
+    #[test]
+    fn test_check_bip34_rejects_wrong_encoded_height() {
+        let consensus = Consensus::from(Network::Bitcoin);
+        let height = 866_342;
+
+        // The coinbase encodes a height that doesn't match the block's actual height
+        let block = block_with_coinbase_scriptsig(bip34_scriptsig((height + 1) as i64));
+
+        assert!(matches!(
+            consensus.check_bip34(&block, height),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadBip34
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_check_bip34_rejects_missing_encoded_height() {
+        let consensus = Consensus::from(Network::Bitcoin);
+        let height = consensus.parameters.params.bip34_height;
+
+        // An empty scriptsig doesn't encode any height at all
+        let block = block_with_coinbase_scriptsig(ScriptBuf::new());
+
+        assert!(matches!(
+            consensus.check_bip34(&block, height),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadBip34
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_check_bip34_enforced_at_activation_height() {
+        let consensus = Consensus::from(Network::Bitcoin);
+        let bip34_height = consensus.parameters.params.bip34_height;
+
+        // BIP34 becomes active at `bip34_height` itself: the same block that would be
+        // accepted one block earlier is rejected exactly at the activation height
+        let block = block_with_coinbase_scriptsig(ScriptBuf::new());
+        assert_err!(consensus.check_bip34(&block, bip34_height));
+    }
+
+    #[test]
+    fn test_check_bip34_accepts_op_pushnum_encoding() {
+        // Lower the activation height so `OP_1`..`OP_16` encodings are enforced, as they
+        // always encode heights below mainnet's BIP34 activation
+        let mut consensus = Consensus::from(Network::Bitcoin);
+        consensus.parameters.params.bip34_height = 16;
+        let height = 16;
+
+        // `OP_16` encodes the number 16
+        let scriptsig = bitcoin::script::Builder::new()
+            .push_opcode(OP_PUSHNUM_16)
+            .into_script();
+        let block = block_with_coinbase_scriptsig(scriptsig);
+        assert_ok!(consensus.check_bip34(&block, height));
+
+        // An `OP_PUSHNUM` encoding of a different number doesn't match
+        let scriptsig = bitcoin::script::Builder::new()
+            .push_opcode(OP_PUSHNUM_15)
+            .into_script();
+        let block = block_with_coinbase_scriptsig(scriptsig);
+
+        assert!(matches!(
+            consensus.check_bip34(&block, height),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadBip34
+            ))
+        ));
     }
 
     #[test]
@@ -2289,7 +2280,7 @@ mod tests {
         };
 
         let spending_tx: Transaction = deserialize_hex(spending).unwrap();
-        let txout: TxOut = deserialize_hex(prevout).unwrap();
+        let txout: bitcoin::TxOut = deserialize_hex(prevout).unwrap();
 
         let mut utxos = HashMap::new();
         utxos.insert(

@@ -8,9 +8,12 @@ use core::fmt::Formatter;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Transaction;
+use bitcoin::Txid;
+use bitcoin::Weight;
 use bitcoin::Work;
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::constants::MAX_BLOCK_SIGOPS_COST;
 use bitcoin::hashes::Hash;
 use bitcoin::transaction::Version;
 use floresta_common::bhash;
@@ -19,6 +22,8 @@ use floresta_common::prelude::String;
 use floresta_common::prelude::Vec;
 
 use crate::BlockchainInterface;
+use crate::pruned_utreexo::consensus::Consensus;
+use crate::pruned_utreexo::sigops::SigopExt;
 
 const MEDIAN_TIME_PAST_BLOCK_COUNT: usize = 11;
 
@@ -59,6 +64,52 @@ impl TransactionExt for Transaction {
         // TODO(jaoleal): remove this cast when https://github.com/rust-bitcoin/rust-bitcoin/pull/4040 lands in a release.
         self.version.0 as u32 >= Version::TWO.0 as u32
     }
+}
+
+pub trait BlockExt {
+    /// Runs the non-contextual block checks, which only require the block
+    /// itself: the merkle root, the witness commitment and the block weight.
+    /// Bitcoin Core performs them in
+    /// [`CheckBlock`](https://github.com/bitcoin/bitcoin/blob/v31.0/src/validation.cpp#L3950)
+    /// and
+    /// [`ContextualCheckBlock`](https://github.com/bitcoin/bitcoin/blob/v31.0/src/validation.cpp#L4161).
+    /// If successful, returns the list of [`Txid`]s computed for the merkle
+    /// root check.
+    fn check_block_structure(&self) -> Result<Vec<Txid>, BlockExtError>;
+}
+
+impl BlockExt for Block {
+    fn check_block_structure(&self) -> Result<Vec<Txid>, BlockExtError> {
+        let Some(txids) = Consensus::check_merkle_root(self) else {
+            Err(BlockExtError::BadMerkleRoot)?
+        };
+
+        if !self.check_witness_commitment() {
+            Err(BlockExtError::BadWitnessCommitment)?;
+        }
+
+        if self.weight() > Weight::MAX_BLOCK {
+            Err(BlockExtError::BlockTooBig)?;
+        }
+
+        // Match Bitcoin Core's CheckBlock: sum every transaction's legacy sigops at four cost
+        // units each. P2SH and witness costs are added later once prevouts are available.
+        // https://github.com/bitcoin/bitcoin/blob/v31.0/src/validation.cpp#L4001-L4009
+        let sigop_cost: usize = self.txdata.iter().map(|tx| tx.legacy_sigop_cost()).sum();
+        if sigop_cost > usize::try_from(MAX_BLOCK_SIGOPS_COST).expect("non-negative") {
+            Err(BlockExtError::TooManySigops)?;
+        }
+
+        Ok(txids)
+    }
+}
+
+#[derive(Debug)]
+pub enum BlockExtError {
+    BadMerkleRoot,
+    BadWitnessCommitment,
+    BlockTooBig,
+    TooManySigops,
 }
 
 /// Provides additional methods for working with [`Header`] objects,
@@ -333,13 +384,23 @@ mod tests {
 
     use bitcoin::Block;
     use bitcoin::BlockHash;
+    use bitcoin::Network;
     use bitcoin::OutPoint;
+    use bitcoin::ScriptBuf;
     use bitcoin::Transaction;
+    use bitcoin::TxMerkleNode;
     use bitcoin::Txid;
     use bitcoin::absolute::LockTime;
     use bitcoin::block::Header;
     use bitcoin::consensus::encode::deserialize_hex;
+    use bitcoin::constants::genesis_block;
+    use bitcoin::hashes::Hash;
     use bitcoin::hashes::sha256::Hash as Sha256Hash;
+    use bitcoin::opcodes::Opcode;
+    use bitcoin::opcodes::all::OP_CHECKMULTISIG;
+    use bitcoin::opcodes::all::OP_CHECKSIG;
+    use bitcoin::opcodes::all::OP_CHECKSIGADD;
+    use bitcoin::opcodes::all::OP_NOP;
     use bitcoin::params::Params;
     use rustreexo::proof::Proof;
     use rustreexo::stump::Stump;
@@ -349,6 +410,13 @@ mod tests {
     use crate::BlockchainError;
     use crate::UtxoData;
     use crate::pruned_utreexo::IBDState;
+    use crate::test_utils::build_oversized_866_342;
+    use crate::test_utils::build_tx;
+    use crate::test_utils::decode_block_866342;
+    use crate::test_utils::mutate_block;
+    use crate::test_utils::update_witness_commitment;
+    use crate::txin;
+    use crate::txout;
 
     const SAMPLE_WORK_BYTES: [u8; 32] = [
         0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0,
@@ -1060,5 +1128,255 @@ mod tests {
         // enforce BIP68 (see the TODO on `TransactionExt::is_bip68_enabled`).
         let high_bit_version = Version::non_standard(-1);
         assert!(tx_with_version(high_bit_version).is_bip68_enabled());
+    }
+    #[test]
+    fn test_check_block_structure_valid_block() {
+        let block = decode_block_866342();
+
+        let txids = block.check_block_structure().unwrap();
+
+        let expected_txids: Vec<Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+        assert_eq!(txids, expected_txids);
+    }
+
+    #[test]
+    fn test_check_block_structure_valid_block_without_witness() {
+        // The genesis block is pre-SegWit: witness commitments are optional when
+        // no transaction in the block has witness data
+        let block = genesis_block(Network::Bitcoin);
+
+        let txids = block.check_block_structure().unwrap();
+
+        let expected_txids: Vec<Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+        assert_eq!(txids, expected_txids);
+    }
+
+    #[test]
+    fn test_check_block_structure_bad_merkle_root() {
+        let mut block = decode_block_866342();
+        mutate_block(&mut block);
+
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::BadMerkleRoot)
+        ));
+    }
+
+    #[test]
+    fn test_check_block_structure_mutated_merkle_tree() {
+        let mut block = decode_block_866342();
+        block.txdata.truncate(6);
+        // Truncating a SegWit block breaks its witness commitment, so update it
+        // to keep every check but the merkle tree intact
+        update_witness_commitment(&mut block).unwrap();
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        // Sanity check: the truncated block is structurally valid
+        assert!(block.check_block_structure().is_ok());
+
+        // CVE-2012-2459: `[1, 2, 3, 4, 5, 6]` and `[1, 2, 3, 4, 5, 6, 5, 6]` have
+        // the same Merkle root
+        block.txdata.extend_from_within(4..6);
+
+        // A root-only check accepts it, but the consensus mutation detection
+        // must reject it
+        assert!(block.check_merkle_root());
+
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::BadMerkleRoot)
+        ));
+    }
+
+    #[test]
+    fn test_check_block_structure_bad_witness_commitment() {
+        let mut block = decode_block_866342();
+        block.txdata.truncate(6);
+        // Fix the merkle root so that only the witness commitment is broken
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::BadWitnessCommitment)
+        ));
+    }
+
+    #[test]
+    fn test_check_block_structure_block_too_big() {
+        let block = build_oversized_866_342();
+
+        // Both the merkle root and the witness commitment are valid, so only the
+        // weight check can reject it
+        assert!(block.check_merkle_root());
+        assert!(block.check_witness_commitment());
+        assert!(block.weight() > Weight::MAX_BLOCK);
+
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::BlockTooBig)
+        ));
+    }
+
+    #[test]
+    fn test_check_block_structure_empty_txdata_with_zero_merkle_root() {
+        let mut block = decode_block_866342();
+        block.txdata.clear();
+        // Bitcoin Core defines the merkle root of an empty transaction list as zero
+        block.header.merkle_root = TxMerkleNode::all_zeros();
+
+        let txids = block.check_block_structure().unwrap();
+
+        assert!(txids.is_empty());
+    }
+
+    /// Sums the legacy sigop cost of every transaction in `block`, mirroring the
+    /// accounting `check_block_structure` applies against `MAX_BLOCK_SIGOPS_COST`.
+    fn block_sigop_cost(block: &Block) -> usize {
+        block.txdata.iter().map(|tx| tx.legacy_sigop_cost()).sum()
+    }
+
+    /// Returns a genesis-based block whose coinbase carries no sigops, so that the sigop
+    /// cost of any block built on top of it is entirely explained by the added transactions.
+    ///
+    /// The genesis coinbase pays to a P2PK script (a single `OP_CHECKSIG`), which would
+    /// otherwise add a constant four units to every assertion below.
+    fn block_without_coinbase_sigops() -> Block {
+        let mut block = genesis_block(Network::Bitcoin);
+        block.txdata[0].output.clear();
+        block
+    }
+
+    /// Builds a pre-SegWit block with no coinbase sigops where each entry of `output_ops`
+    /// appends a transaction with that many `opcode`s in its scriptPubKey and, when
+    /// non-zero, `input_ops` repetitions of `opcode` in its scriptSig.
+    ///
+    /// The merkle root is recomputed so the block passes every other non-contextual check,
+    /// leaving the sigop budget as the only check that can reject it. Starting from the
+    /// genesis block keeps the witness commitment check trivially satisfied, since none of
+    /// the added transactions carry witness data.
+    fn block_with_sigop_txs(opcode: Opcode, output_ops: &[usize], input_ops: usize) -> Block {
+        let mut block = block_without_coinbase_sigops();
+        let script = |op_count: usize| ScriptBuf::from_bytes(vec![opcode.to_u8(); op_count]);
+
+        for (index, &op_count) in output_ops.iter().enumerate() {
+            // A distinct outpoint per transaction keeps their txids unique, so the
+            // CVE-2012-2459 merkle mutation check cannot reject the block first
+            let outpoint = OutPoint {
+                txid: Txid::all_zeros(),
+                vout: index as u32,
+            };
+            let tx = build_tx(
+                vec![txin!(outpoint, script(input_ops))],
+                vec![txout!(0, script(op_count))],
+            );
+            block.txdata.push(tx);
+        }
+
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block
+    }
+
+    #[test]
+    fn test_check_block_structure_sigops_at_limit_is_accepted() {
+        // 20,000 legacy sigops cost four units each, hitting the 80,000 budget exactly
+        let block = block_with_sigop_txs(OP_CHECKSIG, &[10_000, 10_000], 0);
+
+        assert_eq!(block_sigop_cost(&block), 80_000);
+        assert!(block.check_block_structure().is_ok());
+    }
+
+    #[test]
+    fn test_check_block_structure_sigops_one_over_limit_is_rejected() {
+        let block = block_with_sigop_txs(OP_CHECKSIG, &[10_000, 10_000, 1], 0);
+
+        assert_eq!(block_sigop_cost(&block), 80_004);
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::TooManySigops)
+        ));
+    }
+
+    #[test]
+    fn test_check_block_structure_sigops_are_summed_across_transactions() {
+        // Each transaction costs 28,000 units on its own, well below the budget, so only
+        // the block-wide sum can reject this block
+        let block = block_with_sigop_txs(OP_CHECKSIG, &[7_000, 7_000, 7_000], 0);
+
+        assert!(
+            block
+                .txdata
+                .iter()
+                .all(|tx| tx.legacy_sigop_cost() < 80_000)
+        );
+        assert_eq!(block_sigop_cost(&block), 84_000);
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::TooManySigops)
+        ));
+    }
+
+    #[test]
+    fn test_check_block_structure_counts_script_sig_sigops() {
+        // Legacy counting also covers scriptSigs: an input with 20,001 OP_CHECKSIGs
+        // overflows the budget without any sigop in an output script
+        let block = block_with_sigop_txs(OP_CHECKSIG, &[0], 20_001);
+
+        assert_eq!(block_sigop_cost(&block), 80_004);
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::TooManySigops)
+        ));
+    }
+
+    #[test]
+    fn test_check_block_structure_counts_coinbase_script_sig_sigops() {
+        // The coinbase is not exempt: its scriptSig sigops count towards the budget too
+        let mut block = block_without_coinbase_sigops();
+        block.txdata[0].input[0].script_sig =
+            ScriptBuf::from_bytes(vec![OP_CHECKSIG.to_u8(); 20_001]);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert_eq!(block_sigop_cost(&block), 80_004);
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::TooManySigops)
+        ));
+    }
+
+    #[test]
+    fn test_check_block_structure_counts_checkmultisig_as_twenty() {
+        // Without a preceding `OP_N`, a bare CHECKMULTISIG counts as 20 sigops, so 1,000
+        // of them fill the 80,000 budget and a single extra one overflows it
+        let at_limit = block_with_sigop_txs(OP_CHECKMULTISIG, &[1_000], 0);
+        assert_eq!(block_sigop_cost(&at_limit), 80_000);
+        assert!(at_limit.check_block_structure().is_ok());
+
+        let over_limit = block_with_sigop_txs(OP_CHECKMULTISIG, &[1_001], 0);
+        assert_eq!(block_sigop_cost(&over_limit), 80_080);
+        assert!(matches!(
+            over_limit.check_block_structure(),
+            Err(BlockExtError::TooManySigops)
+        ));
+    }
+
+    #[test]
+    fn test_check_block_structure_ignores_non_sigop_opcodes() {
+        // Only CHECKSIG/CHECKMULTISIG count; any amount of other opcodes must not consume
+        // the sigop budget
+        let block = block_with_sigop_txs(OP_NOP, &[20_001, 20_001], 0);
+
+        assert_eq!(block_sigop_cost(&block), 0);
+        assert!(block.check_block_structure().is_ok());
+    }
+
+    #[test]
+    fn test_check_block_structure_ignores_taproot_checksigadd() {
+        // `OP_CHECKSIGADD` is deliberately excluded from the legacy count: BIP342 gives
+        // taproot its own per-input budget, enforced during script validation rather than
+        // by this block-wide check
+        let block = block_with_sigop_txs(OP_CHECKSIGADD, &[20_001], 0);
+
+        assert_eq!(block_sigop_cost(&block), 0);
+        assert!(block.check_block_structure().is_ok());
     }
 }

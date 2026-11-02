@@ -24,6 +24,9 @@
 pub mod extensions;
 
 pub mod pruned_utreexo;
+
+#[cfg(test)]
+pub(crate) mod test_utils;
 pub(crate) use floresta_common::prelude;
 pub use pruned_utreexo::BlockchainInterface;
 pub use pruned_utreexo::ChainBackend;

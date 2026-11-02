@@ -13,7 +13,7 @@ use super::chainparams::VERIFY_WITNESS;
 use super::utxo_data::UtxoData;
 use crate::prelude::HashMap;
 
-pub(super) trait SigopExt {
+pub(crate) trait SigopExt {
     /// Returns the legacy sigop cost using Bitcoin Core's
     /// [`GetLegacySigOpCount`](https://github.com/bitcoin/bitcoin/blob/v31.0/src/consensus/tx_verify.cpp#L112-L124).
     ///

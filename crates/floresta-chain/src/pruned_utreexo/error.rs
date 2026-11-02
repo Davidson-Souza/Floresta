@@ -23,6 +23,7 @@ use floresta_common::impl_error_from;
 use floresta_common::prelude::*;
 use rustreexo::stump::StumpError;
 
+use crate::extensions::BlockExtError;
 use crate::extensions::ChainWorkOverflow;
 use crate::proof_util::UtreexoLeafError;
 use crate::pruned_utreexo::chain_state_builder::BlockchainBuilderError;
@@ -269,3 +270,20 @@ impl<T: DatabaseError> From<T> for BlockchainBuilderError {
 impl_error_from!(BlockchainError, TransactionError, TransactionError);
 impl_error_from!(BlockchainError, BlockValidationErrors, BlockValidation);
 impl_error_from!(BlockchainError, StumpError, AccumulatorError);
+
+impl From<BlockExtError> for BlockValidationErrors {
+    fn from(value: BlockExtError) -> Self {
+        match value {
+            BlockExtError::BadMerkleRoot => Self::BadMerkleRoot,
+            BlockExtError::BadWitnessCommitment => Self::BadWitnessCommitment,
+            BlockExtError::BlockTooBig => Self::BlockTooBig,
+            BlockExtError::TooManySigops => Self::TooManySigops,
+        }
+    }
+}
+
+impl From<BlockExtError> for BlockchainError {
+    fn from(value: BlockExtError) -> Self {
+        Self::BlockValidation(value.into())
+    }
+}

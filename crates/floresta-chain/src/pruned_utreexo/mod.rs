@@ -21,7 +21,7 @@ pub mod consensus;
 pub mod flat_chain_store;
 pub mod merkle;
 pub mod partial_chain;
-mod sigops;
+pub(crate) mod sigops;
 pub mod udata;
 
 use alloc::sync::Arc;
