@@ -6,15 +6,29 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use bitcoin::Amount;
 use bitcoin::Block;
 use bitcoin::BlockHash;
+use bitcoin::CompactTarget;
 use bitcoin::Network;
+use bitcoin::OutPoint;
+use bitcoin::ScriptBuf;
+use bitcoin::Sequence;
+use bitcoin::TxMerkleNode;
+use bitcoin::TxOut;
+use bitcoin::Witness;
+use bitcoin::absolute::LockTime;
 use bitcoin::block::Header;
+use bitcoin::block::Version as BlockVersion;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::encode;
 use bitcoin::consensus::encode::deserialize_hex;
+use bitcoin::hashes::Hash;
 use bitcoin::hex::FromHex;
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::transaction::Transaction;
+use bitcoin::transaction::TxIn;
+use bitcoin::transaction::Version as TransactionVersion;
 use derive_more::Constructor;
 use floresta_chain::AssumeValidArg;
 use floresta_chain::ChainState;
@@ -54,6 +68,8 @@ use crate::p2p_wire::block_proof::UtreexoProof;
 use crate::p2p_wire::peer::PeerMessages;
 use crate::p2p_wire::peer::Version;
 use crate::p2p_wire::transport::TransportProtocol;
+
+pub mod mock_chain;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UtreexoRoots {
@@ -247,7 +263,7 @@ pub fn create_false_acc(tip: usize) -> Vec<u8> {
 pub fn signet_headers() -> Vec<Header> {
     let mut headers: Vec<Header> = Vec::new();
 
-    let file = include_bytes!("../../../../floresta-chain/testdata/signet_headers.zst");
+    let file = include_bytes!("../../../../../floresta-chain/testdata/signet_headers.zst");
     let uncompressed: Vec<u8> = zstd::decode_all(std::io::Cursor::new(file)).unwrap();
     let mut buffer = uncompressed.as_slice();
 
@@ -261,7 +277,7 @@ pub fn signet_headers() -> Vec<Header> {
 pub fn mainnet_headers() -> Vec<Header> {
     let mut headers: Vec<Header> = Vec::new();
 
-    let file = include_bytes!("../../../../floresta-chain/testdata/headers.zst");
+    let file = include_bytes!("../../../../../floresta-chain/testdata/headers.zst");
     let uncompressed: Vec<u8> = zstd::decode_all(std::io::Cursor::new(file)).unwrap();
     let mut buffer = uncompressed.as_slice();
 
@@ -274,7 +290,7 @@ pub fn mainnet_headers() -> Vec<Header> {
 
 /// Returns the first 121 signet blocks, including genesis
 pub fn signet_blocks() -> HashMap<BlockHash, Block> {
-    let file = include_str!("./test_data/blocks.json");
+    let file = include_str!("../test_data/blocks.json");
     let entries: Vec<serde_json::Value> = serde_json::from_str(file).unwrap();
 
     entries
@@ -290,7 +306,7 @@ pub fn signet_blocks() -> HashMap<BlockHash, Block> {
 /// Returns the first 120 signet accumulators. The genesis hash doesn't have a value since those
 /// coinbase coins are unspendable.
 pub fn signet_roots() -> HashMap<BlockHash, Vec<u8>> {
-    let file = include_str!("./test_data/roots.json");
+    let file = include_str!("../test_data/roots.json");
     let roots: Vec<UtreexoRoots> = serde_json::from_str(file).unwrap();
 
     let headers = signet_headers();
@@ -309,6 +325,40 @@ pub fn signet_roots() -> HashMap<BlockHash, Vec<u8>> {
 /// Flips a bit in the first output script, invalidating the block's Merkle root.
 pub fn mutate_block(block: &mut Block) {
     block.txdata[0].output[0].script_pubkey.as_mut_bytes()[0] ^= 1;
+}
+
+/// Builds a coinbase-only block that isn't a valid block, but passes the
+/// mutated-block checks: with a single transaction the merkle root is its txid, and
+/// since no transaction uses witness, the witness commitment is optional.
+pub fn synthetic_block() -> Block {
+    let coinbase = Transaction {
+        version: TransactionVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+
+    let merkle_root = TxMerkleNode::from_byte_array(coinbase.compute_txid().to_byte_array());
+
+    Block {
+        header: Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root,
+            time: 0,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txdata: vec![coinbase],
+    }
 }
 
 // Nightly Clippy false positive in `Constructor`-generated code:
@@ -393,6 +443,7 @@ where
         }
 
         node.peers.insert(peer_id, peer);
+
         // Populate the peer services too
         for service in [
             service_flags::UTREEXO.into(),
