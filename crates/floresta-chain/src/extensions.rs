@@ -7,6 +7,7 @@ use core::fmt::Formatter;
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
+use bitcoin::OutPoint;
 use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::Weight;
@@ -76,6 +77,13 @@ pub trait BlockExt {
     /// If successful, returns the list of [`Txid`]s computed for the merkle
     /// root check.
     fn check_block_structure(&self) -> Result<Vec<Txid>, BlockExtError>;
+
+    /// Classifies an observed missing input using only the block's transactions.
+    ///
+    /// A missing output created by a transaction in this block, or an outpoint
+    /// spent more than once in this block, proves the block invalid. Other missing
+    /// inputs may be caused by incomplete peer-supplied leaf data.
+    fn is_invalid_missing_input(&self, outpoint: OutPoint) -> bool;
 }
 
 impl BlockExt for Block {
@@ -101,6 +109,24 @@ impl BlockExt for Block {
         }
 
         Ok(txids)
+    }
+
+    fn is_invalid_missing_input(&self, outpoint: OutPoint) -> bool {
+        let mut spends = 0;
+        for tx in &self.txdata {
+            if tx.compute_txid() == outpoint.txid {
+                return true;
+            }
+            spends += tx
+                .input
+                .iter()
+                .filter(|input| input.previous_output == outpoint)
+                .count();
+            if spends > 1 {
+                return true;
+            }
+        }
+        false
     }
 }
 

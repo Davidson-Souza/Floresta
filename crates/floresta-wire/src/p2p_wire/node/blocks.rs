@@ -5,12 +5,12 @@ use std::time::Instant;
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
-use bitcoin::OutPoint;
 use bitcoin::p2p::ServiceFlags;
 use floresta_chain::BlockValidationErrors;
 use floresta_chain::BlockchainError;
 use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
+use floresta_chain::extensions::BlockExt;
 use floresta_chain::proof_util;
 use floresta_chain::proof_util::UtreexoLeafError;
 use floresta_common::service_flags;
@@ -411,23 +411,6 @@ where
         }
     }
 
-    /// Returns whether a UTXO was created in the same block as it got spent, by looking for a txid
-    /// inside that block. The goal of this function is to differentiate between two cases where a
-    /// UTXO can't be found:
-    ///  - The UTXO was created inside the same block, but spent before being created.
-    ///  - We got a bad proof.
-    ///
-    /// The former is a consensus violation, and should invalidate a block, the latter isn't.
-    fn is_same_block_spend(block: &Block, outpoint: OutPoint) -> bool {
-        for tx in block.txdata.iter() {
-            if tx.compute_txid() == outpoint.txid {
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// Handles the different block validation errors that can happen when connecting a block.
     ///
     /// Utreexo errors are checked first, since only the proof peer can cause them; everything
@@ -456,7 +439,7 @@ where
             // The utreexo peer sent us incomplete leaf data. A same-block spend falls through
             // below: the block is invalid, not the proof.
             BlockValidationErrors::UtxoNotFound(outpoint)
-                if !Self::is_same_block_spend(&block, *outpoint) =>
+                if !block.is_invalid_missing_input(*outpoint) =>
             {
                 self.blocks
                     .insert(hash, InflightBlock::new(block, block_peer));
@@ -552,6 +535,7 @@ mod tests {
     use floresta_chain::CompactLeafData;
     use floresta_chain::ScriptPubKeyKind;
     use floresta_chain::TransactionError;
+    use floresta_chain::extensions::BlockExt;
     use floresta_chain::proof_util::LeafErrorKind;
     use floresta_chain::proof_util::UtreexoLeafError;
     use floresta_common::Ema;
@@ -572,7 +556,6 @@ mod tests {
     use crate::p2p_wire::tests::utils::mock_chain::MockChain;
     use crate::p2p_wire::tests::utils::synthetic_block;
     use crate::p2p_wire::transport::TransportProtocol;
-
     /// The node under test: a [`UtreexoNode`] running on top of a [`MockChain`].
     type MockNode = UtreexoNode<MockChain, SyncNode>;
 
@@ -760,7 +743,7 @@ mod tests {
             // An output spent before being created in the same block is a consensus
             // violation. Any other missing output is the utreexo peer's fault.
             UtxoNotFound(outpoint) => {
-                if MockNode::is_same_block_spend(block, *outpoint) {
+                if block.is_invalid_missing_input(*outpoint) {
                     ExpectedBlame::InvalidatesBlock
                 } else {
                     ExpectedBlame::BlamesUtreexoPeer

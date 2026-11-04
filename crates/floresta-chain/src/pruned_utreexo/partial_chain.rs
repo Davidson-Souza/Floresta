@@ -39,6 +39,7 @@ use super::chainparams::ChainParams;
 use super::consensus::Consensus;
 use super::error::BlockValidationErrors;
 use super::error::BlockchainError;
+use crate::extensions::BlockExt;
 use crate::extensions::HeaderExt;
 use crate::pruned_utreexo::IBDState;
 use crate::pruned_utreexo::utxo_data::UtxoData;
@@ -156,7 +157,7 @@ impl PartialChainStateInner {
     /// Not all errors marks a block as invalid, because they might mean either a mistake on our
     /// side, or a misbehaving peer. This method will set the internal error if it is a consensus
     /// error, invalidating this block.
-    fn maybe_invalidate(&mut self, error: &BlockchainError) {
+    fn maybe_invalidate(&mut self, block: &Block, error: &BlockchainError) {
         if let BlockchainError::BlockValidation(e) = error {
             // These errors may describe a mutated payload for an otherwise valid header.
             // Another peer can still provide the valid block, so don't poison this chain.
@@ -168,8 +169,12 @@ impl PartialChainStateInner {
             }
         }
 
-        // All transaction errors are consensus invalidation reason.
         if let BlockchainError::TransactionError(e) = error {
+            if let BlockValidationErrors::UtxoNotFound(outpoint) = &e.error {
+                if !block.is_invalid_missing_input(*outpoint) {
+                    return;
+                }
+            }
             self.error = Some(BlockchainError::TransactionError(e.clone()));
         }
     }
@@ -193,7 +198,7 @@ impl PartialChainStateInner {
             .map_err(|_| BlockchainError::InvalidUtreexoProof)?;
 
         if let Err(error) = self.validate_block(block, height, inputs) {
-            self.maybe_invalidate(&error);
+            self.maybe_invalidate(block, &error);
             return Err(error);
         }
 
@@ -558,6 +563,7 @@ mod tests {
     use crate::ScriptPubKeyKind;
     use crate::TransactionError;
     use crate::proof_util::process_proof;
+    use crate::pruned_utreexo::BlockchainInterface;
     use crate::pruned_utreexo::UpdatableChainstate;
     use crate::pruned_utreexo::chainparams::ChainParams;
     use crate::pruned_utreexo::consensus::Consensus;
@@ -833,11 +839,23 @@ mod tests {
             }
             let acc = chain.get_acc();
             assert_eq!(acc.leaves, 1);
-            let (bad_hashes, bad_inputs) =
-                process_proof(&[forged_leaf], &block.txdata, 101, |height| {
-                    Ok::<_, BlockchainError>(blocks[height as usize].block_hash())
-                })
-                .unwrap();
+            // An omitted external leaf is retryable, even with an empty proof.
+            assert!(matches!(
+                chain.connect_block(block, Proof::default(), HashMap::new(), vec![]),
+                Err(BlockchainError::TransactionError(error))
+                    if matches!(error.error, BlockValidationErrors::UtxoNotFound(outpoint) if outpoint == funding)
+            ));
+            assert!(!chain.has_invalid_blocks());
+            assert_eq!(chain.inner().current_height, 100);
+            assert_eq!(chain.get_acc(), acc);
+            let (bad_hashes, bad_inputs) = process_proof(
+                &[forged_leaf],
+                &block.txdata,
+                101,
+                |height| Ok::<_, BlockchainError>(blocks[height as usize].block_hash()),
+                |height| chain.get_mtp_by_height(height),
+            )
+            .unwrap();
             // Establish that validating unauthenticated data would blame the
             // transaction rather than the peer that supplied the forged leaf.
             assert!(matches!(
@@ -857,6 +875,7 @@ mod tests {
                 &block.txdata,
                 101,
                 |height| Ok::<_, BlockchainError>(blocks[height as usize].block_hash()),
+                |height| chain.get_mtp_by_height(height),
             )
             .unwrap();
             assert_eq!(
@@ -869,6 +888,38 @@ mod tests {
             assert!(chain.inner().is_sync());
             assert_eq!(chain.get_acc().leaves, 2);
         }
+    }
+
+    #[test]
+    fn partial_chain_classifies_missing_inputs() {
+        let (chain, mut block) = chain_with_validated_parent();
+        let external = OutPoint::new(bitcoin::Txid::from_byte_array([42; 32]), 0);
+        let mut tx = block.txdata[0].clone();
+        tx.input[0].previous_output = external;
+        tx.input[0].script_sig = ScriptBuf::new();
+        block.txdata.push(tx.clone());
+        let error = BlockchainError::TransactionError(TransactionError {
+            txid: tx.compute_txid(),
+            error: BlockValidationErrors::UtxoNotFound(external),
+        });
+        chain.inner_mut().maybe_invalidate(&block, &error);
+        assert!(!chain.has_invalid_blocks());
+
+        // A second transaction spending the same external output proves invalidity.
+        tx.output[0].value = Amount::from_sat(1);
+        block.txdata.push(tx);
+        chain.inner_mut().maybe_invalidate(&block, &error);
+        assert!(chain.has_invalid_blocks());
+
+        // A missing output created in this block is also provably invalid.
+        chain.inner_mut().error = None;
+        let same_block = OutPoint::new(block.txdata[1].compute_txid(), 0);
+        let error = BlockchainError::TransactionError(TransactionError {
+            txid: block.txdata[2].compute_txid(),
+            error: BlockValidationErrors::UtxoNotFound(same_block),
+        });
+        chain.inner_mut().maybe_invalidate(&block, &error);
+        assert!(chain.has_invalid_blocks());
     }
 
     #[test]
