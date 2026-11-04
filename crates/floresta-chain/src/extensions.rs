@@ -7,6 +7,7 @@ use core::fmt::Formatter;
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
+use bitcoin::OutPoint;
 use bitcoin::Work;
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::serialize_hex;
@@ -19,6 +20,36 @@ use floresta_common::prelude::Vec;
 use crate::BlockchainInterface;
 
 const MEDIAN_TIME_PAST_BLOCK_COUNT: usize = 11;
+
+/// Additional block validation helpers.
+pub trait BlockExt {
+    /// Classifies an observed missing input using only the block's transactions.
+    ///
+    /// A missing output created by a transaction in this block, or an outpoint
+    /// spent more than once in this block, proves the block invalid. Other missing
+    /// inputs may be caused by incomplete peer-supplied leaf data.
+    fn is_invalid_missing_input(&self, outpoint: OutPoint) -> bool;
+}
+
+impl BlockExt for Block {
+    fn is_invalid_missing_input(&self, outpoint: OutPoint) -> bool {
+        let mut spends = 0;
+        for tx in &self.txdata {
+            if tx.compute_txid() == outpoint.txid {
+                return true;
+            }
+            spends += tx
+                .input
+                .iter()
+                .filter(|input| input.previous_output == outpoint)
+                .count();
+            if spends > 1 {
+                return true;
+            }
+        }
+        false
+    }
+}
 
 pub trait Bip30UnspendableExt {
     /// Returns true if the coinbase output in this block is BIP-30 unspendable.
