@@ -5,12 +5,12 @@ use std::time::Instant;
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
-use bitcoin::OutPoint;
 use bitcoin::p2p::ServiceFlags;
 use floresta_chain::BlockValidationErrors;
 use floresta_chain::BlockchainError;
 use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
+use floresta_chain::extensions::BlockExt;
 use floresta_chain::proof_util;
 use floresta_chain::proof_util::UtreexoLeafError;
 use floresta_common::service_flags;
@@ -387,23 +387,6 @@ where
         }
     }
 
-    /// Returns whether a UTXO was created in the same block as it got spent, by looking for a txid
-    /// inside that block. The goal of this function is to differentiate between two cases where a
-    /// UTXO can't be found:
-    ///  - The UTXO was created inside the same block, but spent before being created.
-    ///  - We got a bad proof.
-    ///
-    /// The former is a consensus violation, and should invalidate a block, the latter isn't.
-    fn is_same_block_spend(block: &Block, outpoint: OutPoint) -> bool {
-        for tx in block.txdata.iter() {
-            if tx.compute_txid() == outpoint.txid {
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// Handles the different block validation errors that can happen when connecting a block.
     ///
     /// Returns the peer id that caused this error, since it could be block or utreexo-related.
@@ -427,9 +410,9 @@ where
 
             // The utreexo peer sent us incomplete leaf data. Block is not yet processed.
             //
-            // If this is a same-block spent, then the block is actually invalid.
+            // A same-block or repeated spend proves the block is invalid.
             BlockValidationErrors::UtxoNotFound(outpoint)
-                if !Self::is_same_block_spend(&block, *outpoint) =>
+                if !block.is_invalid_missing_input(*outpoint) =>
             {
                 self.blocks
                     .insert(hash, InflightBlock::new(block, block_peer));
