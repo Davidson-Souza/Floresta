@@ -65,8 +65,13 @@ where
     ///
     /// Each candidate weight is computed as `lowest_time / time_i`. For instance, if we have two
     /// candidates with latencies of 50ms and 100ms, weights are 1.0 and 0.5 respectively, and the
-    /// probability of being chosen is 2/3 and 1/3.
-    fn choose_peer_by_latency(&self, service: ServiceFlags) -> Option<(&PeerId, &LocalPeerView)> {
+    /// probability of being chosen is 2/3 and 1/3. If `exclude` is `Some`, that peer is never
+    /// considered a candidate.
+    fn choose_peer_by_latency(
+        &self,
+        service: ServiceFlags,
+        exclude: Option<PeerId>,
+    ) -> Option<(&PeerId, &LocalPeerView)> {
         // Epsilon is a small positive floor for `f64`. If by any chance a peer has extremely low
         // message latency, we clamp it to `EPS` so `lowest_time / time_i` stays finite and stable.
         const EPS: f64 = 1e-9;
@@ -74,7 +79,11 @@ where
         let candidates: Vec<(&PeerId, &LocalPeerView, f64)> = self
             .peers
             .iter()
-            .filter(|(_, peer)| peer.services.has(service) && peer.state == PeerStatus::Ready)
+            .filter(|(id, peer)| {
+                Some(**id) != exclude
+                    && peer.services.has(service)
+                    && peer.state == PeerStatus::Ready
+            })
             .filter_map(|(id, peer)| {
                 // Get the average message latency from each peer
                 let Some(t) = peer.message_times.value() else {
@@ -128,8 +137,29 @@ where
         request: NodeRequest,
         required_service: ServiceFlags,
     ) -> Result<PeerId, WireError> {
+        self.send_to_fast_peer_inner(request, required_service, None)
+    }
+
+    /// Same as [`Self::send_to_fast_peer`], but never picks the `excluded` peer.
+    ///
+    /// Returns [`WireError::NoPeersAvailable`] if no other eligible peer exists.
+    pub(crate) fn send_to_fast_peer_excluding(
+        &self,
+        request: NodeRequest,
+        required_service: ServiceFlags,
+        excluded: PeerId,
+    ) -> Result<PeerId, WireError> {
+        self.send_to_fast_peer_inner(request, required_service, Some(excluded))
+    }
+
+    fn send_to_fast_peer_inner(
+        &self,
+        request: NodeRequest,
+        required_service: ServiceFlags,
+        exclude: Option<PeerId>,
+    ) -> Result<PeerId, WireError> {
         let (peer_id, peer) = self
-            .choose_peer_by_latency(required_service)
+            .choose_peer_by_latency(required_service, exclude)
             .ok_or(WireError::NoPeersAvailable)?;
 
         peer.channel.send(request)?;
