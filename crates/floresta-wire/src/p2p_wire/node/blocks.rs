@@ -554,6 +554,7 @@ mod tests {
     use crate::node::LocalPeerView;
     use crate::node::PeerStatus;
     use crate::node::sync_ctx::SyncNode;
+    use crate::p2p_wire::tests::utils::BlockDefect;
     use crate::p2p_wire::tests::utils::mock_chain::MockChain;
     use crate::p2p_wire::tests::utils::synthetic_block;
     use crate::p2p_wire::transport::TransportProtocol;
@@ -635,7 +636,7 @@ mod tests {
     /// A coinbase-only block: it passes the merkle-root and witness-commitment
     /// checks, and counts as ready to process when wrapped in an [`InflightBlock`].
     fn dummy_block() -> Arc<Block> {
-        Arc::new(synthetic_block())
+        Arc::new(synthetic_block(BlockDefect::None))
     }
 
     fn assert_peer_state(node: &MockNode, peer: PeerId, state: PeerStatus) {
