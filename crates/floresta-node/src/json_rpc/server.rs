@@ -13,7 +13,6 @@ use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::Method;
 use axum::http::Response as HttpResponse;
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -39,7 +38,6 @@ use floresta_wire::node_handle::NodeHandle;
 use serde_json::Value;
 use serde_json::json;
 use tokio::sync::RwLock;
-use tower_http::cors::CorsLayer;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -405,11 +403,6 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
         let router = Router::new()
             .route("/", post(json_rpc_request).get(cannot_get))
-            .layer(
-                CorsLayer::new()
-                    .allow_private_network(true)
-                    .allow_methods([Method::POST, Method::HEAD]),
-            )
             .layer(axum::middleware::from_fn_with_state(
                 credentials,
                 auth_middleware,
