@@ -5,6 +5,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use bitcoin::BlockHash;
 use bitcoin::Transaction;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::AddrV2Message;
@@ -662,6 +663,16 @@ where
         debug!("increasing banscore for peer {peer_id}");
 
         Ok(())
+    }
+
+    /// Punishes a peer for sending us a full block we never requested.
+    pub(crate) fn punish_unrequested_block(
+        &mut self,
+        peer: PeerId,
+        block_hash: BlockHash,
+    ) -> Result<(), WireError> {
+        warn!("Received block {block_hash} from peer {peer}, but we didn't ask for it");
+        self.increase_banscore(peer, 5)
     }
 
     /// Disconnects a peer and bans it for `T::BAN_TIME`.

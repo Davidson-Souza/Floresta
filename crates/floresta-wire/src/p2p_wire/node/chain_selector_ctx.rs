@@ -1058,9 +1058,8 @@ where
             PeerMessages::Block(block) => {
                 let block = self.check_is_user_block_and_reply(block)?;
 
-                if block.is_some() {
-                    error!("peer {peer} sent us a block we didn't request");
-                    self.increase_banscore(peer, 5)?;
+                if let Some(block) = block {
+                    self.punish_unrequested_block(peer, block.block_hash())?;
                 }
             }
 
