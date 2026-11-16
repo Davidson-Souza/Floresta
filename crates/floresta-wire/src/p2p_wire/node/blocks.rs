@@ -139,6 +139,25 @@ where
         Ok(())
     }
 
+    /// Validates the structure of the block using
+    /// [`Block::check_block_structure`].
+    ///
+    /// If validation fails, [`Self::handle_block_error`] is called to handle the
+    /// error and apply the appropriate network consensus.
+    ///
+    /// [`Block::check_block_structure`]: floresta_chain::extensions::BlockExt::check_block_structure
+    pub(crate) fn enforce_block_structure_check(
+        &mut self,
+        block: &Block,
+        peer: PeerId,
+    ) -> Result<(), WireError> {
+        let Err(e) = block.check_block_structure() else {
+            return Ok(());
+        };
+
+        self.handle_block_error(e.into(), Arc::new(block.clone()), peer, None)
+    }
+
     /// Handles a block received from a peer at the notification level.
     ///
     /// Removes the matching [`InflightRequests::Blocks`] entry and checks for an

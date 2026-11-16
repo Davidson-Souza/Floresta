@@ -10,6 +10,8 @@ mod tests {
     use bitcoin::Network;
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
+    use floresta_chain::extensions::BlockExt;
+    use floresta_chain::extensions::BlockExtError;
     use tokio::sync::oneshot;
     use tokio::sync::oneshot::Receiver;
 
@@ -21,20 +23,18 @@ mod tests {
     use crate::node_handle::UserRequest;
     use crate::p2p_wire::error::WireError;
     use crate::p2p_wire::tests::utils::BlockDefect;
+    use crate::p2p_wire::tests::utils::PEER_TEST;
     use crate::p2p_wire::tests::utils::PeerData;
     use crate::p2p_wire::tests::utils::SetupNodeArgs;
     use crate::p2p_wire::tests::utils::setup_node;
+    use crate::p2p_wire::tests::utils::setup_unit_node;
     use crate::p2p_wire::tests::utils::signet_blocks;
     use crate::p2p_wire::tests::utils::signet_headers;
     use crate::p2p_wire::tests::utils::synthetic_block;
 
-    const PEER_TEST: u32 = 0;
+    type TestNode = UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>;
 
-    type TestSetup = (
-        UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
-        Block,
-        Option<Receiver<NodeResponse>>,
-    );
+    type TestSetup = (TestNode, Block, Option<Receiver<NodeResponse>>);
 
     fn setup_test(is_user_request: bool) -> TestSetup {
         let datadir = format!("./tmp-db/{}.blocks", rand::random::<u32>());
@@ -84,6 +84,87 @@ mod tests {
             node.request_block_proof(block, peer)?;
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_enforce_block_structure_check_unmutated_block_is_ok() {
+        let mut node: TestNode = setup_unit_node();
+        let block = synthetic_block(BlockDefect::None);
+
+        node.enforce_block_structure_check(&block, PEER_TEST)
+            .unwrap();
+
+        // The peer shouldn't be punished
+        assert_eq!(node.peers.get(&PEER_TEST).unwrap().state, PeerStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_enforce_block_structure_check_mutated_block_bans_peer() {
+        let mut node: TestNode = setup_unit_node();
+        let block = synthetic_block(BlockDefect::MerkleRoot);
+        assert!(!block.check_merkle_root());
+
+        let result = node
+            .enforce_block_structure_check(&block, PEER_TEST)
+            .unwrap_err();
+
+        assert!(matches!(result, WireError::PeerMisbehaving));
+        assert_eq!(
+            node.peers.get(&PEER_TEST).unwrap().state,
+            PeerStatus::Banned
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enforce_block_structure_check_bad_witness_commitment_bans_peer() {
+        let mut node: TestNode = setup_unit_node();
+        let block = synthetic_block(BlockDefect::WitnessCommitment);
+
+        // The merkle root matches, so only the witness commitment is invalid
+        assert!(block.check_merkle_root());
+        assert!(!block.check_witness_commitment());
+
+        let result = node
+            .enforce_block_structure_check(&block, PEER_TEST)
+            .unwrap_err();
+
+        assert!(matches!(result, WireError::PeerMisbehaving));
+        assert_eq!(
+            node.peers.get(&PEER_TEST).unwrap().state,
+            PeerStatus::Banned
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enforce_block_structure_check_too_many_sigops_is_ok() {
+        let mut node: TestNode = setup_unit_node();
+        let block = synthetic_block(BlockDefect::TooManySigops);
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::TooManySigops)
+        ));
+
+        // Authentic consensus-invalid blocks invalidate but don't ban.
+        node.enforce_block_structure_check(&block, PEER_TEST)
+            .unwrap();
+
+        assert_eq!(node.peers.get(&PEER_TEST).unwrap().state, PeerStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_enforce_block_structure_check_block_too_big_is_ok() {
+        let mut node: TestNode = setup_unit_node();
+        let block = synthetic_block(BlockDefect::BlockTooBig);
+        assert!(matches!(
+            block.check_block_structure(),
+            Err(BlockExtError::BlockTooBig)
+        ));
+
+        // Authentic consensus-invalid blocks invalidate but don't ban.
+        node.enforce_block_structure_check(&block, PEER_TEST)
+            .unwrap();
+
+        assert_eq!(node.peers.get(&PEER_TEST).unwrap().state, PeerStatus::Ready);
     }
 
     #[tokio::test]
