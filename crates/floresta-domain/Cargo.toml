@@ -25,6 +25,7 @@ floresta-chain = { workspace = true }
 [features]
 default = []
 mempool = []
+node-interface = []
 wallet = []
 
 [lints]

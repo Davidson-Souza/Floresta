@@ -11,7 +11,7 @@
 //! The answer is: The node handle! You can get one by calling `get_handle`, and use it to send and
 //! receive messages to/from the node. You can use it request blocks, transactions, cfilters,
 //! proofs, ask the node to connect with someone, ask the node to disconnect from some peer, etc.
-//! This module actually implement the [`crate::node_interface::NodeMethods`] trait, and
+//! This module implements [`floresta_domain::node_interface::NodeMethods`], and
 //! contains the actual type you will use when interacting with a real node.
 
 use std::time::Instant;
@@ -22,20 +22,51 @@ use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::p2p::message_filter::CFHeaders;
 use floresta_domain::mempool::MempoolError;
+use floresta_domain::node_interface::ChainMethods;
+use floresta_domain::node_interface::MempoolMethods;
+use floresta_domain::node_interface::NetworkMethods;
+use floresta_domain::node_interface::NodeConfigMethods;
+use floresta_domain::node_interface::NodeError;
 use rustreexo::proof::Proof;
+use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::error::RecvError;
 
 use super::UtreexoNodeConfig;
+use super::node::ConnectionKind;
 use super::node::NodeNotification;
+use super::node::PeerStatus;
+use super::transport::TransportProtocol;
 use crate::address_man::ConnectionStats;
 use crate::bitcoin_socket_addr::BitcoinSocketAddr;
-use crate::node_interface::ChainMethods;
-use crate::node_interface::MempoolMethods;
-use crate::node_interface::NetworkMethods;
-use crate::node_interface::NodeConfigMethods;
-use crate::node_interface::PeerInfo;
+
+#[derive(Debug, Clone, Serialize)]
+/// A struct representing a peer connected to the node.
+///
+/// This struct contains information about a peer connected to the node, like its address, the
+/// services it provides, the user agent it's using, the height of the blockchain it's currently
+/// at, its state and the kind of connection it has with the node.
+pub struct PeerInfo {
+    pub id: u32,
+    #[serde(serialize_with = "serialize_addr")]
+    pub address: BitcoinSocketAddr,
+    pub services: String,
+    #[serde(rename = "servicesnames")]
+    pub services_names: Vec<String>,
+    #[serde(rename = "relaytxes")]
+    pub relay_txs: bool,
+    pub user_agent: String,
+    pub inbound: bool,
+    pub bip152_hb_to: bool,
+    pub bip152_hb_from: bool,
+    pub initial_height: u32,
+    #[serde(rename = "timeoffset")]
+    pub time_offset: i64,
+    pub state: PeerStatus,
+    pub kind: ConnectionKind,
+    pub permissions: Vec<String>,
+    pub transport_protocol: TransportProtocol,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// A request that can be made to the node.
@@ -183,26 +214,25 @@ impl NodeHandle {
     /// This is an internal utility function that will be used to send requests to the node. It will
     /// send the request to the node and return a oneshot receiver that will be used to get the
     /// response back.
-    async fn send_request(
-        &self,
-        request: UserRequest,
-    ) -> Result<NodeResponse, oneshot::error::RecvError> {
+    async fn send_request(&self, request: UserRequest) -> Result<NodeResponse, NodeError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .node_sender
             .send(NodeNotification::FromUser(request, tx)); // Send the request to the node
 
         rx.await
+            .map_err(|error| NodeError::Internal(error.to_string()))
     }
 }
 
 impl ChainMethods for NodeHandle {
-    type Error = RecvError;
-
-    async fn get_block(&self, block: BlockHash) -> Result<Option<Block>, Self::Error> {
+    async fn get_block(&self, block: BlockHash) -> Result<Block, NodeError> {
         let val = self.send_request(UserRequest::Block(block)).await?;
 
-        extract_variant!(Block, val);
+        let NodeResponse::Block(block) = val else {
+            panic!("Unexpected variant");
+        };
+        block.ok_or(NodeError::NotFound)
     }
 
     /// Returns a list of Compact Block Filters headers for the requested block range.
@@ -210,7 +240,7 @@ impl ChainMethods for NodeHandle {
         &self,
         start_height: u32,
         stop_hash: BlockHash,
-    ) -> Result<CFHeaders, oneshot::error::RecvError> {
+    ) -> Result<CFHeaders, NodeError> {
         let val = self
             .send_request(UserRequest::GetCFilterHeaders {
                 start_height,
@@ -223,39 +253,39 @@ impl ChainMethods for NodeHandle {
 }
 
 impl MempoolMethods for NodeHandle {
-    type Error = RecvError;
-
-    async fn broadcast_transaction(
-        &self,
-        transaction: Transaction,
-    ) -> Result<Result<Txid, MempoolError>, Self::Error> {
+    async fn broadcast_transaction(&self, transaction: Transaction) -> Result<Txid, NodeError> {
         let val = self
             .send_request(UserRequest::SendTransaction(transaction))
             .await?;
 
-        extract_variant!(TransactionBroadcastResult, val)
+        let NodeResponse::TransactionBroadcastResult(result) = val else {
+            panic!("Unexpected variant");
+        };
+        result.map_err(NodeError::from)
     }
 
-    async fn get_mempool_transaction(
-        &self,
-        txid: Txid,
-    ) -> Result<Option<Transaction>, Self::Error> {
+    async fn get_mempool_transaction(&self, txid: Txid) -> Result<Transaction, NodeError> {
         let val = self
             .send_request(UserRequest::MempoolTransaction(txid))
             .await?;
 
-        extract_variant!(MempoolTransaction, val);
+        let NodeResponse::MempoolTransaction(transaction) = val else {
+            panic!("Unexpected variant");
+        };
+        transaction.ok_or(NodeError::NotFound)
     }
 }
 
 impl NetworkMethods for NodeHandle {
-    type Error = RecvError;
+    type Address = BitcoinSocketAddr;
+    type PeerInfo = PeerInfo;
+    type ConnectionStats = ConnectionStats;
 
     async fn add_peer(
         &self,
         addr: BitcoinSocketAddr,
         v2transport: bool,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<bool, NodeError> {
         let val = self
             .send_request(UserRequest::Add((addr, v2transport)))
             .await?;
@@ -263,12 +293,12 @@ impl NetworkMethods for NodeHandle {
         extract_variant!(Add, val);
     }
 
-    async fn remove_peer(&self, addr: BitcoinSocketAddr) -> Result<bool, Self::Error> {
+    async fn remove_peer(&self, addr: BitcoinSocketAddr) -> Result<bool, NodeError> {
         let val = self.send_request(UserRequest::Remove(addr)).await?;
         extract_variant!(Remove, val);
     }
 
-    async fn disconnect_peer(&self, addr: BitcoinSocketAddr) -> Result<bool, Self::Error> {
+    async fn disconnect_peer(&self, addr: BitcoinSocketAddr) -> Result<bool, NodeError> {
         let val = self.send_request(UserRequest::Disconnect(addr)).await?;
 
         extract_variant!(Disconnect, val);
@@ -278,32 +308,32 @@ impl NetworkMethods for NodeHandle {
         &self,
         addr: BitcoinSocketAddr,
         v2transport: bool,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<bool, NodeError> {
         let val = self
             .send_request(UserRequest::Onetry((addr, v2transport)))
             .await?;
         extract_variant!(Onetry, val);
     }
 
-    async fn get_peer_info(&self) -> Result<Vec<PeerInfo>, Self::Error> {
+    async fn get_peer_info(&self) -> Result<Vec<PeerInfo>, NodeError> {
         let val = self.send_request(UserRequest::GetPeerInfo).await?;
 
         extract_variant!(GetPeerInfo, val);
     }
 
-    async fn get_connection_count(&self) -> Result<usize, Self::Error> {
+    async fn get_connection_count(&self) -> Result<usize, NodeError> {
         let val = self.send_request(UserRequest::GetConnectionCount).await?;
 
         extract_variant!(GetConnectionCount, val);
     }
 
-    async fn ping(&self) -> Result<bool, Self::Error> {
+    async fn ping(&self) -> Result<bool, NodeError> {
         let val = self.send_request(UserRequest::Ping).await?;
 
         extract_variant!(Ping, val)
     }
 
-    async fn get_addrman_info(&self) -> Result<ConnectionStats, Self::Error> {
+    async fn get_addrman_info(&self) -> Result<ConnectionStats, NodeError> {
         let val = self.send_request(UserRequest::GetAddrManInfo).await?;
 
         extract_variant!(GetAddrManInfo, val)
@@ -311,9 +341,9 @@ impl NetworkMethods for NodeHandle {
 }
 
 impl NodeConfigMethods for NodeHandle {
-    type Error = RecvError;
+    type Config = UtreexoNodeConfig;
 
-    async fn get_config(&self) -> Result<UtreexoNodeConfig, Self::Error> {
+    async fn get_config(&self) -> Result<UtreexoNodeConfig, NodeError> {
         let val = self.send_request(UserRequest::Config).await?;
 
         extract_variant!(Config, val)
@@ -331,3 +361,75 @@ macro_rules! extract_variant {
 }
 
 use extract_variant;
+
+fn serialize_addr<S>(local_addr: &BitcoinSocketAddr, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&local_addr.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::Network;
+    use bitcoin::blockdata::constants::genesis_block;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_data_is_distinct_from_a_stopped_node() {
+        let (sender, mut receiver) = unbounded_channel();
+        let handle = NodeHandle::new(sender);
+        let block = genesis_block(Network::Regtest);
+        let txid = block.txdata[0].compute_txid();
+        let responder = async {
+            let Some(NodeNotification::FromUser(_, reply)) = receiver.recv().await else {
+                panic!("Expected a block request");
+            };
+            reply.send(NodeResponse::Block(None)).unwrap();
+            let Some(NodeNotification::FromUser(_, reply)) = receiver.recv().await else {
+                panic!("Expected a transaction request");
+            };
+            reply.send(NodeResponse::MempoolTransaction(None)).unwrap();
+        };
+        let requests = async {
+            assert!(matches!(
+                handle.get_block(block.block_hash()).await,
+                Err(NodeError::NotFound)
+            ));
+            assert!(matches!(
+                handle.get_mempool_transaction(txid).await,
+                Err(NodeError::NotFound)
+            ));
+        };
+        tokio::join!(requests, responder);
+
+        drop(receiver);
+        let error = handle.get_block(block.block_hash()).await.unwrap_err();
+        assert!(matches!(error, NodeError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn broadcast_rejection_preserves_the_domain_error() {
+        let (sender, mut receiver) = unbounded_channel();
+        let handle = NodeHandle::new(sender);
+        let transaction = genesis_block(Network::Regtest).txdata.remove(0);
+        let responder = async {
+            let Some(NodeNotification::FromUser(_, reply)) = receiver.recv().await else {
+                panic!("Expected a broadcast request");
+            };
+            reply
+                .send(NodeResponse::TransactionBroadcastResult(Err(
+                    MempoolError::ConflictingTransaction,
+                )))
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(handle.broadcast_transaction(transaction), responder);
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            NodeError::Mempool(MempoolError::ConflictingTransaction)
+        ));
+    }
+}

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use floresta_common::PROTOCOL_VERSION;
 use floresta_common::advertised_services;
 use floresta_common::service_flags_strings;
+use floresta_domain::node_interface::NetworkMethods;
 use floresta_rpc::rpc_interfaces::NetworkRpc;
 use floresta_rpc::rpc_types::AddNodeCommand;
 use floresta_rpc::rpc_types::AddrManInfoNetwork;
@@ -18,7 +19,6 @@ use floresta_wire::address_man::NetworkStats;
 use floresta_wire::address_man::ReachableNetworks;
 use floresta_wire::bitcoin_socket_addr::BitcoinSocketAddr;
 use floresta_wire::bitcoin_socket_addr::SystemResolver;
-use floresta_wire::node_interface::NetworkMethods;
 
 use super::res::jsonrpc_interface::JsonRpcError;
 use super::server::RpcChain;

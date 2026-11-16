@@ -4,8 +4,8 @@ use core::error;
 use core::fmt;
 
 use floresta_common::impl_error_from;
+use floresta_domain::node_interface::NodeError;
 use floresta_domain::wallet::error::WatchOnlyError;
-use tokio::sync::oneshot;
 
 #[derive(Debug)]
 pub enum Error {
@@ -18,9 +18,9 @@ pub enum Error {
     /// An IO error has occurred.
     Io(std::io::Error),
     /// A Mempool error has occurred.
-    Mempool(Box<dyn error::Error + Send + 'static>),
+    Mempool(Box<dyn error::Error + Send + Sync + 'static>),
     /// The node is unresponsive.
-    NodeHandle(oneshot::error::RecvError),
+    NodeHandle(NodeError),
     /// Wallet error
     WalletError(WatchOnlyError),
 }
@@ -55,5 +55,4 @@ impl error::Error for Error {
 
 impl_error_from!(Error, serde_json::Error, Parsing);
 impl_error_from!(Error, std::io::Error, Io);
-impl_error_from!(Error, oneshot::error::RecvError, NodeHandle);
 impl_error_from!(Error, WatchOnlyError, WalletError);

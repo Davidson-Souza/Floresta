@@ -25,6 +25,8 @@ use bitcoin::hex::DisplayHex;
 use floresta_chain::extensions::ChainParamsExt;
 use floresta_chain::extensions::HeaderExt;
 use floresta_chain::extensions::WorkExt;
+use floresta_domain::node_interface::ChainMethods;
+use floresta_domain::node_interface::NodeError;
 use floresta_rpc::rpc_interfaces::BlockchainRpc;
 use floresta_rpc::rpc_types::CoinbaseTransaction;
 use floresta_rpc::rpc_types::DeploymentInfo;
@@ -36,7 +38,6 @@ use floresta_rpc::rpc_types::GetBlockchainInfo;
 use floresta_rpc::rpc_types::GetDeploymentInfo;
 use floresta_rpc::rpc_types::GetTxOut;
 use floresta_rpc::rpc_types::ScriptPubKey;
-use floresta_wire::node_interface::ChainMethods;
 use miniscript::descriptor::checksum;
 
 use super::res::jsonrpc_interface::JsonRpcError;
@@ -56,11 +57,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         // from the network, otherwise the request will hang indefinitely.
         self.get_block_header_inner(hash)?;
 
-        self.node
-            .get_block(hash)
-            .await
-            .map_err(|e| JsonRpcError::Node(e.to_string()))
-            .and_then(|block| block.ok_or(JsonRpcError::BlockNotFound))
+        self.node.get_block(hash).await.map_err(|e| match e {
+            NodeError::NotFound => JsonRpcError::BlockNotFound,
+            e => JsonRpcError::Node(e.to_string()),
+        })
     }
 
     /// Return the block that contains the given Txid
@@ -281,15 +281,15 @@ impl<Blockchain: RpcChain> BlockchainRpc for RpcImpl<Blockchain> {
         for candidate in candidates {
             let candidate = self.node.get_block(candidate).await;
             let candidate = match candidate {
-                Err(e) => {
-                    return Err(JsonRpcError::Node(e.to_string()));
-                }
-                Ok(None) => {
+                Err(NodeError::NotFound) => {
                     return Err(JsonRpcError::Node(format!(
                         "BUG: block {candidate:?} is a match in our filters, but we can't get it?"
                     )));
                 }
-                Ok(Some(candidate)) => candidate,
+                Err(e) => {
+                    return Err(JsonRpcError::Node(e.to_string()));
+                }
+                Ok(candidate) => candidate,
             };
 
             let Ok(Some(height)) = self.chain.get_block_height(&candidate.block_hash()) else {

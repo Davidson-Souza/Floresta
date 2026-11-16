@@ -30,7 +30,7 @@ time = { workspace = true }
 floresta-chain = { workspace = true, features = ["bitcoinkernel"] }
 floresta-compact-filters = { workspace = true, optional = true }
 floresta-common = { workspace = true }
-floresta-domain = { workspace = true, features = ["mempool", "wallet"] }
+floresta-domain = { workspace = true, features = ["mempool", "node-interface", "wallet"] }
 floresta-electrum = { workspace = true }
 floresta-mempool = { workspace = true }
 floresta-watch-only = { workspace = true }

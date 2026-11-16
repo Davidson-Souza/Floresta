@@ -6,12 +6,12 @@ use bitcoin::ScriptBuf;
 use bitcoin::constants::genesis_block;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 use floresta_compact_filters::network_filters::NetworkFilters;
+use floresta_domain::node_interface::ChainMethods;
 use floresta_rpc::rpc_interfaces::WalletRpc;
 use floresta_rpc::rpc_types::RescanConfidence;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::kv_database::KvDatabase;
 use floresta_wire::node_handle::NodeHandle;
-use floresta_wire::node_interface::ChainMethods;
 use tracing::debug;
 use tracing::info;
 
@@ -132,7 +132,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         info!("rescan filter hits: {blocks:?}");
 
         for block in blocks {
-            if let Ok(Some(block)) = node.get_block(block).await {
+            if let Ok(block) = node.get_block(block).await {
                 let height = chain
                     .get_block_height(&block.block_hash())
                     .map_err(|_| JsonRpcError::Chain)?

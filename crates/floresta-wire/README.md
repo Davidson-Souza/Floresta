@@ -29,6 +29,28 @@ Where:
 - Optional compact filters use `NetworkFilters` from `floresta-compact-filters`.
 - The kill signal is an `Arc<tokio::sync::RwLock<bool>>`. Set it to `true` to stop the node.
 
+All node interface traits live in `floresta_domain::node_interface`, behind the
+domain crate's `node-interface` feature:
+
+- `ChainMethods`: block and compact-filter header requests.
+- `MempoolMethods`: transaction broadcasts and mempool lookups; also requires `mempool`.
+- `NetworkMethods`: peer management, peer information, ping, and address-manager statistics.
+- `NodeConfigMethods`: the running node's configuration.
+- `NodeMethods`: the combined interface; also requires `mempool`.
+
+`NodeHandle` implements these contracts with `Send` futures. Wire enables both
+domain features. Consumers can implement the traits without depending on wire;
+network addresses, peer information, statistics, and configuration are associated
+types. The wire implementation uses `BitcoinSocketAddr`, `node_handle::PeerInfo`,
+`ConnectionStats`, and `UtreexoNodeConfig`, respectively.
+
+Every method returns the concrete domain `NodeError`. Missing blocks and
+transactions return `NodeError::NotFound`, rather than `Ok(None)`. Broadcasts return
+the transaction ID directly or `NodeError::Mempool` for a rejection. Implementation
+failures, such as a closed node channel, return `NodeError::Internal(String)`,
+containing only the diagnostic message. `NodeError` does not expose an underlying
+error through `Error::source()`.
+
 `UtreexoNode` can run in three contexts: `RunningNode` (default, high-level), `SyncNode` (IBD), and `ChainSelector` (header chain selection). In most cases you want the default `RunningNode` context, which delegates to `SyncNode`/`ChainSelector` as needed based on the current phase.
 
 > To start the node, regardless of context, call the `run` method. To stop it, set the kill signal you passed to the builder to `true`.

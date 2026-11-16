@@ -12,6 +12,9 @@
     html_favicon_url = "https://raw.githubusercontent.com/getfloresta/floresta-media/master/logo_png/Icon-Green(main).png"
 )]
 
+#[cfg(feature = "node-interface")]
+pub mod node_interface;
+
 #[cfg(feature = "mempool")]
 pub mod mempool;
 

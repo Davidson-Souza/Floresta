@@ -15,13 +15,13 @@ use floresta::chain::BlockchainInterface;
 use floresta::chain::ChainState;
 use floresta::chain::FlatChainStore;
 use floresta::chain::FlatChainStoreConfig;
+use floresta::domain::node_interface::ChainMethods;
 use floresta::mempool::Mempool;
 use floresta::wire::UtreexoNodeConfig;
 use floresta::wire::address_man::AddressMan;
 use floresta::wire::address_man::ReachableNetworks;
 use floresta::wire::node::UtreexoNode;
 use floresta::wire::node::running_ctx::RunningNode;
-use floresta::wire::node_interface::ChainMethods;
 use tokio::sync::Mutex;
 
 /// Where floresta will store all it's data, like the blockchain and wallet

@@ -10,6 +10,8 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hex;
 use bitcoin::hex::DisplayHex;
+use floresta_domain::node_interface::MempoolMethods;
+use floresta_domain::node_interface::NodeError;
 use floresta_rpc::rpc_interfaces::RawTransactionRpc;
 use floresta_rpc::rpc_types::GetRawTransactionRes;
 use floresta_rpc::rpc_types::GetRawTransactionVerbose;
@@ -18,7 +20,6 @@ use floresta_rpc::rpc_types::RawTransactionOutput;
 use floresta_rpc::rpc_types::ScriptPubKey;
 use floresta_rpc::rpc_types::ScriptSig;
 use floresta_watch_only::CachedTransaction;
-use floresta_wire::node_interface::MempoolMethods;
 
 use super::server::RpcChain;
 use super::server::RpcImpl;
@@ -58,11 +59,13 @@ impl<Blockchain: RpcChain> RawTransactionRpc for RpcImpl<Blockchain> {
         let tx: Transaction =
             deserialize(&tx_hex).map_err(|e| JsonRpcError::Decode(e.to_string()))?;
 
-        Ok(self
-            .node
+        self.node
             .broadcast_transaction(tx)
             .await
-            .map_err(|e| JsonRpcError::Node(e.to_string()))??)
+            .map_err(|e| match e {
+                NodeError::Mempool(e) => JsonRpcError::MempoolAccept(e),
+                e => JsonRpcError::Node(e.to_string()),
+            })
     }
 }
 

@@ -23,12 +23,12 @@ use floresta_common::spsc::Channel;
 use floresta_common::try_and_log;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 use floresta_compact_filters::network_filters::NetworkFilters;
+use floresta_domain::node_interface::ChainMethods;
+use floresta_domain::node_interface::MempoolMethods;
+use floresta_domain::node_interface::NodeError;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::CachedTransaction;
 use floresta_watch_only::kv_database::KvDatabase;
-use floresta_wire::node_handle::NodeHandle;
-use floresta_wire::node_interface::ChainMethods;
-use floresta_wire::node_interface::MempoolMethods;
 use serde_json::Value;
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
@@ -190,7 +190,10 @@ pub enum Message {
     Disconnect(ClientId),
 }
 
-pub struct ElectrumServer<Blockchain: BlockchainInterface> {
+/// An Electrum server with an injected, network-independent node interface.
+///
+/// The node implements the domain [`ChainMethods`] and [`MempoolMethods`] contracts.
+pub struct ElectrumServer<Blockchain: BlockchainInterface, Node> {
     /// The blockchain backend we are using. This will be used to query
     /// blockchain information and broadcast transactions.
     chain: Arc<Blockchain>,
@@ -221,7 +224,7 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
 
     /// An interface to a running node, used to broadcast transactions and request
     /// blocks.
-    node_interface: NodeHandle,
+    node_interface: Node,
 
     /// A list of addresses that we've just learned about and need to rescan for
     /// transactions.
@@ -237,12 +240,16 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
     last_rebroadcast: Option<Instant>,
 }
 
-impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
+impl<Blockchain, Node> ElectrumServer<Blockchain, Node>
+where
+    Blockchain: BlockchainInterface,
+    Node: ChainMethods + MempoolMethods + Send + Sync + 'static,
+{
     pub fn new(
         address_cache: Arc<AddressCache<KvDatabase>>,
         chain: Arc<Blockchain>,
         block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
-        node_interface: NodeHandle,
+        node_interface: Node,
     ) -> Result<Self, Box<dyn error::Error>> {
         let (tx, rx) = unbounded_channel();
 
@@ -482,14 +489,15 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                     deserialize(&hex).map_err(|_| super::error::Error::InvalidParams)?;
 
                 let txid = tx.compute_txid();
-                if let Err(e) = self
-                    .node_interface
-                    .broadcast_transaction(tx.clone())
-                    .await?
-                {
-                    error!("Could not broadcast transaction {txid} due to {e}");
-                    return Err(super::error::Error::Mempool(Box::new(e)));
-                };
+                if let Err(e) = self.node_interface.broadcast_transaction(tx.clone()).await {
+                    match e {
+                        NodeError::Mempool(e) => {
+                            error!("Could not broadcast transaction {txid} due to {e}");
+                            return Err(super::error::Error::Mempool(Box::new(e)));
+                        }
+                        e => return Err(super::error::Error::NodeHandle(e)),
+                    }
+                }
 
                 let updated = self
                     .address_cache
@@ -569,7 +577,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         let unconfirmed = self.address_cache.find_unconfirmed().unwrap();
         for tx in unconfirmed {
             let txid = tx.compute_txid();
-            if let Ok(Err(e)) = self.node_interface.broadcast_transaction(tx.clone()).await {
+            if let Err(e) = self.node_interface.broadcast_transaction(tx.clone()).await {
                 error!("Could not rebroadcast transaction {txid} due to {e}");
             } else {
                 debug!("Rebroadcasted transaction {txid}");
@@ -691,7 +699,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         // Tells users about the transactions we found
         for block in blocks {
             let block = self.node_interface.get_block(block).await;
-            let Ok(Some(block)) = block else {
+            let Ok(block) = block else {
                 self.addresses_to_scan.extend(addresses); // push them back to get a retry
                 return Ok(());
             };
@@ -1022,6 +1030,7 @@ mod test {
     use floresta_wire::address_man::ReachableNetworks;
     use floresta_wire::node::UtreexoNode;
     use floresta_wire::node::running_ctx::RunningNode;
+    use floresta_wire::node_handle::NodeHandle;
     use rcgen::CertifiedKey;
     use rcgen::generate_simple_self_signed;
     use serde_json::Number;
@@ -1140,7 +1149,7 @@ mod test {
 
     // Returns a server whose main loop is not started yet, and the port
     // assigned by the OS
-    async fn setup_electrum() -> (ElectrumServer<ChainState<FlatChainStore>>, u16) {
+    async fn setup_electrum() -> (ElectrumServer<ChainState<FlatChainStore>, NodeHandle>, u16) {
         let e_addr = "0.0.0.0:0";
         let ssl_e_addr = "0.0.0.0:0";
         let wallet = get_test_cache();
@@ -1185,7 +1194,7 @@ mod test {
         let tls_config = Some(create_tls_config().expect("Failed to create TLS config"));
         let tls_acceptor = tls_config.map(TlsAcceptor::from);
 
-        let electrum_server: ElectrumServer<ChainState<FlatChainStore>> =
+        let electrum_server: ElectrumServer<ChainState<FlatChainStore>, NodeHandle> =
             ElectrumServer::new(wallet, chain, None, node_interface).unwrap();
         let non_tls_listener = Arc::new(TcpListener::bind(e_addr).await.unwrap());
         let assigned_port = non_tls_listener.local_addr().unwrap().port();

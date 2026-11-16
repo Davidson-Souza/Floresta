@@ -25,7 +25,7 @@ required-features = ["chain-flat-chainstore"]
 [[example]]
 name = "node"
 path = "examples/node.rs"
-required-features = ["chain-flat-chainstore", "mempool", "wire"]
+required-features = ["chain-flat-chainstore", "domain-node-interface", "mempool", "wire"]
 
 [[example]]
 name = "watch-only"
@@ -62,7 +62,7 @@ full = [
     "chain-flat-chainstore",
     "common-std",
     "compact-filters",
-    "domain",
+    "domain-node-interface",
     "electrum",
     "mempool",
     "metrics",
@@ -88,6 +88,7 @@ compact-filters = ["dep:floresta-compact-filters"]
 # floresta-domain
 domain = ["dep:floresta-domain"]
 domain-mempool = ["domain", "floresta-domain/mempool"]
+domain-node-interface = ["domain", "floresta-domain/node-interface"]
 domain-wallet = ["domain", "floresta-domain/wallet"]
 
 # floresta-electrum
