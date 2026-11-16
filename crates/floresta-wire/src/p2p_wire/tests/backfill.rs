@@ -56,6 +56,9 @@ mod tests {
         assert_eq!(outcome.height, 9);
         assert!(!outcome.is_in_ibd);
         assert!(!outcome.has_invalid_blocks);
+
+        // PartialChainState doesn't check the block structure, so a mutated block that reached
+        // it would be connected with a wrong accumulator, without any error.
         assert_eq!(outcome.acc, honest_acc());
     }
 

@@ -197,9 +197,17 @@ pub trait BlockchainInterface {
 /// can notify new blocks and transactions to a chainstate, allowing it to update it's state.
 pub trait UpdatableChainstate {
     /// This is one of the most important methods for a ChainState,
-    /// it gets a block and some utreexo data, validates this block and
-    /// connects to our chain of blocks. This function is meant to be atomic
-    /// and prone of running in parallel.
+    /// it gets a block and some utreexo data, verifies the utreexo proof,
+    /// validates the block's transactions and connects it to our chain of
+    /// blocks. This function is meant to be atomic and prone of running
+    /// in parallel.
+    ///
+    /// The structural checks (merkle root, witness commitment and block weight}
+    /// are NOT run here: the caller must have called
+    /// [`BlockExt::check_block_structure`] on this block beforehand,
+    /// e.g. when it first arrived from the network.
+    ///
+    /// [`BlockExt::check_block_structure`]: crate::extensions::BlockExt::check_block_structure
     fn connect_block(
         &self,
         block: &Block,

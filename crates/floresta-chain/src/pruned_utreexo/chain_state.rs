@@ -1078,7 +1078,10 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
     /// function contains the core validation logic.
     ///
     /// The methods `BlockchainInterface::validate_block` and `UpdatableChainstate::connect_block`
-    /// call this and additionally verify the inclusion proof (i.e., they perform full validation).
+    /// call this and additionally verify the inclusion proof (i.e., they perform full validation)
+    ///
+    /// This method does not validate the block structure.
+    /// [`crate::extensions::BlockExt::check_block_structure`] must be called before this method.
     pub fn validate_block_no_acc(
         &self,
         block: &Block,
@@ -1086,7 +1089,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         inputs: HashMap<OutPoint, UtxoData>,
     ) -> Result<(), BlockchainError> {
         let consensus = read_lock!(self).consensus.clone();
-        consensus.check_block(block, height)?;
+        consensus.check_bip34(block, height)?;
 
         // Validate block transactions
         let subsidy = consensus.get_subsidy(height);

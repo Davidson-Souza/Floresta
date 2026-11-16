@@ -159,14 +159,7 @@ impl PartialChainStateInner {
     /// error, invalidating this block.
     fn maybe_invalidate(&mut self, block: &Block, error: &BlockchainError) {
         if let BlockchainError::BlockValidation(e) = error {
-            // These errors may describe a mutated payload for an otherwise valid header.
-            // Another peer can still provide the valid block, so don't poison this chain.
-            if !matches!(
-                e,
-                BlockValidationErrors::BadMerkleRoot | BlockValidationErrors::BadWitnessCommitment
-            ) {
-                self.error = Some(BlockchainError::BlockValidation(e.clone()));
-            }
+            self.error = Some(BlockchainError::BlockValidation(e.clone()));
         }
 
         if let BlockchainError::TransactionError(e) = error {
@@ -217,13 +210,18 @@ impl PartialChainStateInner {
     }
 
     /// Check whether a block is valid
+    ///
+    /// This method does not validate the block structure. [`BlockExt::check_block_structure`]
+    /// must be called before this method.
+    ///
+    /// [`BlockExt::check_block_structure`]: crate::extensions::BlockExt::check_block_structure
     fn validate_block(
         &self,
         block: &bitcoin::Block,
         height: u32,
         inputs: HashMap<bitcoin::OutPoint, UtxoData>,
     ) -> Result<(), BlockchainError> {
-        self.consensus.check_block(block, height)?;
+        self.consensus.check_bip34(block, height)?;
 
         let prev_block = self.get_ancestor(height)?;
         if block.header.prev_blockhash != prev_block.block_hash() {
@@ -545,7 +543,6 @@ mod tests {
     use bitcoin::Network;
     use bitcoin::OutPoint;
     use bitcoin::ScriptBuf;
-    use bitcoin::Witness;
     use bitcoin::block::Header;
     use bitcoin::block::Version;
     use bitcoin::consensus::encode::deserialize_hex;
@@ -596,17 +593,6 @@ mod tests {
             "0000002000226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f39adbcd7823048d34357bdca86cd47172afe2a4af8366b5b34db36df89386d49b23ec964ffff7f20000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff165108feddb99c6b8435060b2f503253482f627463642fffffffff0100f2052a01000000160014806cef41295922d32ddfca09c26cc4acd36c3ed000000000",
             BlockValidationErrors::BlockExtendsAnOrphanChain,
             true,
-        );
-        run(
-            "0000002000226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f40adbcd7823048d34357bdca86cd47172afe2a4af8366b5b34db36df89386d49b23ec964ffff7f20000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff165108feddb99c6b8435060b2f503253482f627463642fffffffff0100f2052a01000000160014806cef41295922d32ddfca09c26cc4acd36c3ed000000000",
-            BlockValidationErrors::BadMerkleRoot,
-            false, // Potentially mutated block, original txdata may be valid
-        );
-        // Valid Merkle root, but the coinbase has witness data without a witness commitment
-        run(
-            "0000002000226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f39adbcd7823048d34357bdca86cd47172afe2a4af8366b5b34db36df89386d49b23ec964ffff7f200000000001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff165108feddb99c6b8435060b2f503253482f627463642fffffffff0100f2052a01000000160014806cef41295922d32ddfca09c26cc4acd36c3ed001010000000000",
-            BlockValidationErrors::BadWitnessCommitment,
-            false,
         );
     }
 
@@ -739,46 +725,6 @@ mod tests {
         assert!(!chain.has_invalid_blocks());
         assert!(chain.inner().is_sync());
         assert_eq!(chain.get_acc().leaves, acc.leaves + 1);
-    }
-
-    #[test]
-    fn partial_chain_mutated_payload_does_not_poison_valid_retry() {
-        for reason in [
-            BlockValidationErrors::BadMerkleRoot,
-            BlockValidationErrors::BadWitnessCommitment,
-        ] {
-            let (chain, block) = chain_with_validated_parent();
-            let acc = chain.get_acc();
-            let mut mutated = block.clone();
-            match reason {
-                BlockValidationErrors::BadMerkleRoot => {
-                    mutated.txdata[0].output.clear();
-                }
-                BlockValidationErrors::BadWitnessCommitment => {
-                    mutated.txdata[0].input[0].witness = Witness::from_slice(&[&[0u8; 32]]);
-                }
-                _ => unreachable!(),
-            }
-            // Keep the same header: another peer can supply the original payload.
-            assert_eq!(mutated.block_hash(), block.block_hash());
-            assert!(matches!(
-                chain.connect_block(&mutated, Proof::default(), HashMap::new(), vec![]),
-                Err(BlockchainError::BlockValidation(error)) if error == reason
-            ));
-            assert!(!chain.has_invalid_blocks());
-            assert_eq!(chain.inner().current_height, 1);
-            assert_eq!(chain.get_acc(), acc);
-
-            assert_eq!(
-                chain
-                    .connect_block(&block, Proof::default(), HashMap::new(), vec![])
-                    .unwrap(),
-                2
-            );
-            assert!(!chain.has_invalid_blocks());
-            assert!(chain.inner().is_sync());
-            assert_eq!(chain.get_acc().leaves, acc.leaves + 1);
-        }
     }
 
     #[test]
