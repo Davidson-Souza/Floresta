@@ -24,11 +24,130 @@ pub mod rpc;
 pub mod rpc_interfaces;
 pub mod rpc_types;
 
+use std::io;
+use std::path::Path;
+use std::path::PathBuf;
+
+use bitcoin::Network;
+
 /// Indicates whether the `async` feature is enabled or disabled.
 pub const IS_ASYNC: bool = cfg!(feature = "async");
 
+// TODO: Use floresta_common::data_subdir once a release containing
+// https://github.com/getfloresta/Floresta/pull/1348 is available.
+/// Datadir subdirectory for `network`, `None` for mainnet. Core's layout.
+fn data_subdir(network: Network) -> Option<&'static str> {
+    match network {
+        Network::Bitcoin => None,
+        Network::Signet => Some("signet"),
+        Network::Testnet => Some("testnet3"),
+        Network::Testnet4 => Some("testnet4"),
+        Network::Regtest => Some("regtest"),
+    }
+}
+
+/// Cookie file name, matching Bitcoin Core.
+pub const COOKIE_FILE_NAME: &str = ".cookie";
+
+/// Network-specific data directory, `<base>/[<net>/]`; `base` defaults to
+/// `~/.floresta`, or the current directory if `$HOME` is unresolvable.
+pub fn net_datadir(base: Option<&Path>, network: Network) -> PathBuf {
+    let mut path = base.map(Path::to_path_buf).unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".floresta")
+    });
+    if let Some(subdir) = data_subdir(network) {
+        path.push(subdir);
+    }
+    path
+}
+
+/// Resolve the cookie path against an already network-specific `datadir`.
+/// Absolute overrides win, relative ones are joined. Shared with floresta-cli,
+/// as Core shares its own.
+pub fn resolve_cookie_path(datadir: &Path, cookie_file: Option<&Path>) -> PathBuf {
+    match cookie_file {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(relative) => datadir.join(relative),
+        None => datadir.join(COOKIE_FILE_NAME),
+    }
+}
+
+/// Read a florestad RPC cookie file at `path` and split it into `(user, pass)`
+/// on the first `:`. Returns `io::Error` on read failure or malformed content.
+pub fn read_cookie_file(path: &Path) -> io::Result<(String, String)> {
+    let contents = std::fs::read_to_string(path)?;
+    contents
+        .split_once(':')
+        .map(|(u, p)| (u.to_string(), p.to_string()))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cookie file at {} is malformed", path.display()),
+            )
+        })
+}
+
 // Those tests doesn't work on windows
 // TODO (Davidson): work on windows?
+
+#[cfg(test)]
+mod path_tests {
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    use bitcoin::Network;
+
+    use super::net_datadir;
+    use super::resolve_cookie_path;
+
+    /// Mainnet sits at the datadir root; other networks nest one level.
+    #[test]
+    fn net_datadir_nests_only_non_mainnet() {
+        let base = Path::new("/data");
+
+        assert_eq!(
+            net_datadir(Some(base), Network::Bitcoin),
+            PathBuf::from("/data")
+        );
+        assert_eq!(
+            net_datadir(Some(base), Network::Signet),
+            PathBuf::from("/data/signet")
+        );
+        assert_eq!(
+            net_datadir(Some(base), Network::Regtest),
+            PathBuf::from("/data/regtest")
+        );
+    }
+
+    /// With no override we use the cookie file inside the datadir.
+    #[test]
+    fn resolve_cookie_path_defaults_into_the_datadir() {
+        assert_eq!(
+            resolve_cookie_path(Path::new("/data/signet"), None),
+            PathBuf::from("/data/signet/.cookie")
+        );
+    }
+
+    /// A relative override is prefixed by the datadir, as florestad does.
+    #[test]
+    fn resolve_cookie_path_joins_relative_overrides() {
+        assert_eq!(
+            resolve_cookie_path(Path::new("/data/signet"), Some(Path::new("alt.cookie"))),
+            PathBuf::from("/data/signet/alt.cookie")
+        );
+    }
+
+    /// An absolute override wins over the datadir entirely.
+    #[test]
+    fn resolve_cookie_path_keeps_absolute_overrides() {
+        assert_eq!(
+            resolve_cookie_path(Path::new("/data"), Some(Path::new("/elsewhere/x.cookie"))),
+            PathBuf::from("/elsewhere/x.cookie")
+        );
+    }
+}
 
 #[cfg(all(
     test,
@@ -53,6 +172,7 @@ mod tests {
     use rcgen::generate_simple_self_signed;
 
     use crate::jsonrpc_client::Client;
+    use crate::jsonrpc_client::JsonRPCConfig;
     use crate::rpc_interfaces::BlockchainRpc;
     use crate::rpc_interfaces::ControlRpc;
     use crate::rpc_interfaces::NetworkRpc;
@@ -123,7 +243,16 @@ mod tests {
             .spawn()
             .unwrap_or_else(|e| panic!("Couldn't launch florestad at {florestad_path}: {e}"));
 
-        let client = Client::new(format!("http://127.0.0.1:{port}"));
+        // florestad writes the cookie file before binding the RPC port, so poll
+        // for it to appear and use it to authenticate the test client.
+        let cookie_path = format!("{dirname}/regtest/.cookie");
+        let (user, pass) = read_cookie(&cookie_path, &mut fld);
+
+        let client = Client::new_with_config(JsonRPCConfig {
+            url: format!("http://127.0.0.1:{port}"),
+            user: Some(user),
+            pass: Some(pass),
+        });
 
         let mut retries = 10;
         loop {
@@ -143,6 +272,23 @@ mod tests {
         }
 
         (Florestad { proc: fld }, client)
+    }
+
+    /// Poll for the RPC cookie file and split it into (user, pass) on the first
+    /// `:`. Kills `fld` and panics if the cookie does not appear within 30s.
+    fn read_cookie(path: &str, fld: &mut Child) -> (String, String) {
+        let mut retries = 30;
+        loop {
+            if let Ok(creds) = super::read_cookie_file(Path::new(path)) {
+                return creds;
+            }
+            if retries == 0 {
+                fld.kill().unwrap();
+                panic!("Cookie file {path} did not appear within 30 seconds");
+            }
+            retries -= 1;
+            sleep(Duration::from_secs(1));
+        }
     }
 
     fn get_available_port() -> u16 {
@@ -351,5 +497,19 @@ mod tests {
         let rpc_info = client.get_rpc_info().unwrap();
         // Just check it returns something without error
         let _ = rpc_info;
+    }
+}
+
+#[cfg(test)]
+mod data_subdir_tests {
+    use super::*;
+
+    #[test]
+    fn maps_each_network_to_its_datadir_subdir() {
+        assert_eq!(data_subdir(Network::Bitcoin), None);
+        assert_eq!(data_subdir(Network::Signet), Some("signet"));
+        assert_eq!(data_subdir(Network::Testnet), Some("testnet3"));
+        assert_eq!(data_subdir(Network::Testnet4), Some("testnet4"));
+        assert_eq!(data_subdir(Network::Regtest), Some("regtest"));
     }
 }

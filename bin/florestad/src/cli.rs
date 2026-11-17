@@ -116,6 +116,31 @@ pub struct Cli {
     /// The address where our json-rpc server should listen to, in the format `<address>[:<port>]`
     pub rpc_address: Option<String>,
 
+    #[arg(long, value_name = "USER")]
+    /// Username for `-rpcuser`/`-rpcpassword` auth.
+    pub rpc_user: Option<String>,
+
+    #[arg(long, value_name = "PASS")]
+    /// Password for `-rpcuser`/`-rpcpassword` auth; setting it disables cookie auth.
+    pub rpc_password: Option<String>,
+
+    #[arg(long, value_name = "LINE", action = clap::ArgAction::Append)]
+    /// Pre-hashed credential entry in `<user>:<salt_hex>$<hash_hex>` format.
+    /// Generate with Bitcoin Core's `share/rpcauth/rpcauth.py`. Repeat for
+    /// multiple users.
+    pub rpc_auth: Vec<String>,
+
+    #[arg(long, value_name = "PATH")]
+    /// Override the path where florestad writes the RPC cookie file.
+    /// Absolute paths are used as-is; relative paths are joined against the
+    /// net-specific data directory.
+    pub rpc_cookie_file: Option<PathBuf>,
+
+    #[arg(long)]
+    /// Disable cookie auth entirely. Configured `-rpcuser`/`-rpcpassword` or
+    /// `-rpcauth` entries still work; no cookie file is written.
+    pub no_rpc_cookie_file: bool,
+
     #[arg(long, value_name = "HEIGHT")]
     /// Download block filters starting at this height. Negative numbers are relative to the current tip.
     pub filters_start_height: Option<i32>,

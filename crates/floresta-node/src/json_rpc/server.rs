@@ -13,7 +13,6 @@ use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::Method;
 use axum::http::Response as HttpResponse;
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -39,11 +38,12 @@ use floresta_wire::node_handle::NodeHandle;
 use serde_json::Value;
 use serde_json::json;
 use tokio::sync::RwLock;
-use tower_http::cors::CorsLayer;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 
+use super::auth::Auth;
+use super::auth::auth_middleware;
 use super::res::jsonrpc_interface::JsonRpcError;
 use crate::json_rpc::request::RpcRequest;
 use crate::json_rpc::request::arg_parser::get_at;
@@ -377,6 +377,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         user_agent: String,
         proxy: Option<SocketAddr>,
         default_connection_is_v2: bool,
+        credentials: Arc<Auth>,
     ) {
         let address = address.unwrap_or_else(|| {
             format!("127.0.0.1:{}", network.default_rpc_port())
@@ -402,11 +403,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
         let router = Router::new()
             .route("/", post(json_rpc_request).get(cannot_get))
-            .layer(
-                CorsLayer::new()
-                    .allow_private_network(true)
-                    .allow_methods([Method::POST, Method::HEAD]),
-            )
+            .layer(axum::middleware::from_fn_with_state(
+                credentials,
+                auth_middleware,
+            ))
             .with_state(Arc::new(Self {
                 chain,
                 wallet,
@@ -422,9 +422,12 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 default_connection_is_v2,
             }));
 
-        axum::serve(listener, router)
-            .await
-            .expect("failed to start rpc server");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("failed to start rpc server");
     }
 }
 

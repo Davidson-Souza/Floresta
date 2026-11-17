@@ -39,8 +39,14 @@ This setup will run Floresta in a Docker container and expose the RPC and Electr
 To use the RPC via CLI, you can use a command like this:
 
 ```bash
-docker exec -it Floresta floresta-cli getblockchaininfo
+docker exec -it Floresta floresta-cli --data-dir /data/.floresta getblockchaininfo
 ```
+
+`--data-dir` has to match `florestad`'s, so the CLI finds the RPC cookie it
+writes there. If you passed `-n <network>` to the daemon, pass the same
+`--network <network>` to the CLI: every network other than mainnet keeps its
+cookie in a subdirectory and listens on its own port. See
+[RPC authentication](rpc/auth.md).
 
 ## Monitoring
 

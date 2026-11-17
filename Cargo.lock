@@ -1103,6 +1103,7 @@ dependencies = [
  "bitcoin",
  "floresta-chain",
  "floresta-mempool",
+ "floresta-node",
  "floresta-wire",
  "libfuzzer-sys",
  "tempfile",
@@ -1138,6 +1139,7 @@ name = "floresta-node"
 version = "0.9.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bitcoin",
  "dns-lookup",
  "floresta-chain",
@@ -1153,6 +1155,7 @@ dependencies = [
  "libc",
  "miniscript",
  "pretty_assertions",
+ "rand 0.10.2",
  "rcgen",
  "rustreexo",
  "serde",
@@ -1161,7 +1164,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml 1.1.2+spec-1.1.0",
- "tower-http",
  "tracing",
  "zmq",
 ]
@@ -1182,6 +1184,7 @@ dependencies = [
  "bitcoin",
  "clap",
  "corepc-types",
+ "dirs",
  "floresta-proc-macro",
  "jsonrpc",
  "rand 0.10.2",
@@ -3209,21 +3212,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "tower-http"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
-dependencies = [
- "bitflags 2.11.1",
- "bytes",
- "http",
- "percent-encoding",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
 ]
 
 [[package]]

@@ -20,7 +20,12 @@ tokio = { workspace = true }
 # Local dependencies
 floresta-chain = { workspace = true, features = ["flat-chainstore"] }
 floresta-mempool = { workspace = true }
+floresta-node = { workspace = true, optional = true }
 floresta-wire = { workspace = true, features = ["fuzzing"] }
+
+[features]
+default = ["json-rpc"]
+json-rpc = ["dep:floresta-node", "floresta-node/json-rpc"]
 
 [[bin]]
 name = "local_address_str"
@@ -123,6 +128,13 @@ bench = false
 [[bin]]
 name = "p2p_v2_peer"
 path = "fuzz_targets/p2p_v2_peer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "basic_auth_parse_header"
+path = "fuzz_targets/basic_auth_parse_header.rs"
 test = false
 doc = false
 bench = false

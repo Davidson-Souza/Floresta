@@ -2,3 +2,13 @@
 xpubs = []
 descriptors = []
 addresses = []
+
+# JSON-RPC authentication. See doc/rpc/auth.md for details.
+# [rpc]
+# user = "alice"
+# password = "hunter2"
+# auth = [
+#     "bob:<salt_hex>$<hash_hex>",
+#     "carol:<salt_hex>$<hash_hex>",
+# ]
+# cookie_file = "/home/alice/.floresta/custom.cookie"

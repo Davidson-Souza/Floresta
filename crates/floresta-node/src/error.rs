@@ -113,6 +113,23 @@ pub enum FlorestadError {
 
     /// Load a flat chain store error.
     CouldNotLoadFlatChainStore(BlockchainError),
+
+    /// A malformed `-rpcauth` entry was provided at startup. Carries no
+    /// payload: `alice:hunter2` is an easy mix-up for `user:pass`, and the
+    /// message reaches stderr, journald and docker logs.
+    InvalidRpcAuth,
+
+    /// Both `--rpc-cookie-file` and `--no-rpc-cookie-file` were set on the CLI.
+    ConflictingCookieFlags(PathBuf),
+
+    /// No authentication method was configured at startup.
+    NoAuthConfigured(String),
+
+    /// A configured RPC credential is not ASCII. Names the offending field.
+    NonAsciiCredential(&'static str),
+
+    /// A configured RPC username contains `:`, the header's own separator.
+    ColonInRpcUser(String),
 }
 
 impl Display for FlorestadError {
@@ -212,6 +229,33 @@ impl Display for FlorestadError {
             }
             Self::CouldNotLoadFlatChainStore(err) => {
                 write!(f, "Failure while loading flat chainstore: {err:?}")
+            }
+            Self::InvalidRpcAuth => {
+                // Matches Bitcoin Core's wording (httprpc.cpp:300).
+                write!(f, "Invalid -rpcauth argument.")
+            }
+            Self::ConflictingCookieFlags(path) => {
+                write!(
+                    f,
+                    "--rpc-cookie-file={} conflicts with --no-rpc-cookie-file; pick one",
+                    path.display(),
+                )
+            }
+            Self::NoAuthConfigured(detail) => {
+                write!(f, "no authentication method configured: {detail}")
+            }
+            Self::NonAsciiCredential(field) => {
+                write!(
+                    f,
+                    "{field} must be ASCII; non-ASCII credentials can never authenticate"
+                )
+            }
+            Self::ColonInRpcUser(user) => {
+                write!(
+                    f,
+                    "--rpc-user '{user}' must not contain ':'; it separates user from password \
+                     in the Authorization header, so this can never authenticate"
+                )
             }
         }
     }

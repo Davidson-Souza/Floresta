@@ -129,7 +129,7 @@ class Node:
         During initialization, the `static_values` attribute is set to False,
         allowing the node's arguments to be modified after creation.
         """
-        config_rpc = cls.create_config_rpc_default(variant=variant)
+        config_rpc = cls.create_config_rpc_default()
         config_p2p = cls.create_config_p2p_default(log_path=log_path)
         config_electrum = cls.create_config_electrum_default(tls=tls)
 
@@ -208,24 +208,17 @@ class Node:
         self.daemon.set_extra_args(value)
 
     @staticmethod
-    def create_config_rpc_default(variant: NodeType) -> ConfigRPC:
+    def create_config_rpc_default() -> ConfigRPC:
         """
         Create a default RPC configuration for a node.
 
-        Generates a random port and sets default credentials based on the node variant.
+        Generates a random port and sets default credentials.
         """
-        if variant == NodeType.FLORESTAD:
-            user = None
-            password = None
-        else:
-            user = "test"
-            password = "test"
-
         return ConfigRPC(
             host="127.0.0.1",
             port=Utility.get_random_port(),
-            user=user,
-            password=password,
+            user="test",
+            password="test",
         )
 
     @staticmethod
@@ -267,7 +260,7 @@ class Node:
         This function sets new configurations for the node by using the default
         configuration creation methods
         """
-        new_rpc_config = self.create_config_rpc_default(self.variant)
+        new_rpc_config = self.create_config_rpc_default()
         new_p2p_config = self.create_config_p2p_default(self._log_path)
         new_electrum_config = self.create_config_electrum_default(self._tls)
 
