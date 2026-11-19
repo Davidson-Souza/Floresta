@@ -1042,14 +1042,11 @@ where
             }
 
             // During chain selection we don't ask for blocks, unless it's an explicit
-            // user request made through the node handle. If it isn't, we punish this
-            // peer for sending an unrequested block.
+            // user request made through the node handle.
             PeerMessages::Block(block) => {
-                let block = self.check_is_user_block_and_reply(block)?;
-
-                if let Some(block) = block {
-                    self.punish_unrequested_block(peer, block.block_hash())?;
-                }
+                // `handle_received_block` punishes truly unrequested blocks and replies to
+                // user requests; any accepted leftover is dropped without storing it.
+                if let Some(_leftover) = self.handle_received_block(block, peer)? {}
             }
 
             _ => {}
@@ -1065,8 +1062,20 @@ mod tests {
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
     use rustreexo::node_hash::BitcoinNodeHash;
+    use tokio::sync::oneshot;
 
     use super::*;
+    use crate::node::InflightRequests;
+    use crate::node::PeerStatus;
+    use crate::node_handle::NodeResponse;
+    use crate::node_handle::UserRequest;
+    use crate::p2p_wire::tests::utils::BlockDefect;
+    use crate::p2p_wire::tests::utils::PEER_TEST;
+    use crate::p2p_wire::tests::utils::mutate_block;
+    use crate::p2p_wire::tests::utils::setup_unit_node;
+    use crate::p2p_wire::tests::utils::signet_blocks;
+    use crate::p2p_wire::tests::utils::signet_headers;
+    use crate::p2p_wire::tests::utils::synthetic_block;
 
     type TestNode = UtreexoNode<Arc<ChainState<FlatChainStore>>, ChainSelector>;
 
@@ -1168,5 +1177,170 @@ mod tests {
                 ],
             },
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_block_mutated_with_user_request_bans_and_retries() {
+        let mut node = setup_unit_node();
+        let block = synthetic_block(BlockDefect::MerkleRoot);
+        let block_hash = block.block_hash();
+
+        let (tx, _rx) = oneshot::channel();
+        node.inflight_user_requests.insert(
+            UserRequest::Block(block_hash),
+            (PEER_TEST, Instant::now(), tx),
+        );
+
+        node.handle_peer_notification(PeerMessages::Block(block), PEER_TEST, Instant::now())
+            .await
+            .unwrap();
+
+        // The peer is banned and the block is retried elsewhere
+        assert_eq!(
+            node.peers.get(&PEER_TEST).unwrap().state,
+            PeerStatus::Banned
+        );
+        assert!(
+            node.inflight
+                .contains_key(&InflightRequests::Blocks(block_hash))
+        );
+
+        // The user request stays open
+        assert!(
+            node.inflight_user_requests
+                .contains_key(&UserRequest::Block(block_hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_block_mutated_then_valid_user_request_clears_inflight() {
+        let mut node = setup_unit_node();
+        let block_hash = signet_headers()[1].block_hash();
+        let blocks = signet_blocks();
+        assert!(blocks.contains_key(&block_hash));
+        let Some(valid) = blocks.get(&block_hash).cloned() else {
+            return;
+        };
+        let mut mutated = valid.clone();
+        mutate_block(&mut mutated);
+        assert_eq!(mutated.block_hash(), block_hash);
+
+        let (tx, rx) = oneshot::channel();
+        node.inflight_user_requests.insert(
+            UserRequest::Block(block_hash),
+            (PEER_TEST, Instant::now(), tx),
+        );
+
+        let result = node
+            .handle_peer_notification(PeerMessages::Block(mutated), PEER_TEST, Instant::now())
+            .await;
+        assert!(result.is_ok());
+
+        let retry_peer = node
+            .inflight
+            .get(&InflightRequests::Blocks(block_hash))
+            .map(|req| req.0);
+        assert!(matches!(retry_peer, Some(peer) if peer != PEER_TEST));
+        let Some(retry_peer) = retry_peer else {
+            return;
+        };
+        assert!(
+            node.inflight_user_requests
+                .contains_key(&UserRequest::Block(block_hash))
+        );
+
+        let result = node
+            .handle_peer_notification(PeerMessages::Block(valid), retry_peer, Instant::now())
+            .await;
+        assert!(result.is_ok());
+
+        let response = rx.await;
+        assert!(
+            matches!(response, Ok(NodeResponse::Block(Some(block))) if block.block_hash() == block_hash)
+        );
+
+        assert!(
+            !node
+                .inflight_user_requests
+                .contains_key(&UserRequest::Block(block_hash))
+        );
+        // A leftover entry would be retried after delivery and punish the peer that answers.
+        assert!(
+            !node
+                .inflight
+                .contains_key(&InflightRequests::Blocks(block_hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_block_mutated_unrequested_is_ignored() {
+        let mut node = setup_unit_node();
+        let block = synthetic_block(BlockDefect::MerkleRoot);
+        let block_hash = block.block_hash();
+
+        node.handle_peer_notification(PeerMessages::Block(block), PEER_TEST, Instant::now())
+            .await
+            .unwrap();
+
+        let peer = node.peers.get(&PEER_TEST).unwrap();
+        assert_eq!(peer.state, PeerStatus::Ready);
+        assert_eq!(peer.banscore, 5);
+
+        // No retry should happen
+        assert!(
+            !node
+                .inflight
+                .contains_key(&InflightRequests::Blocks(block_hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_block_valid_with_user_request_replies_to_user() {
+        let mut node = setup_unit_node();
+        let block = synthetic_block(BlockDefect::None);
+        let block_hash = block.block_hash();
+
+        let (tx, rx) = oneshot::channel();
+        node.inflight_user_requests.insert(
+            UserRequest::Block(block_hash),
+            (PEER_TEST, Instant::now(), tx),
+        );
+
+        node.handle_peer_notification(PeerMessages::Block(block), PEER_TEST, Instant::now())
+            .await
+            .unwrap();
+
+        // The user gets the block
+        let response = rx.await.unwrap();
+        match response {
+            NodeResponse::Block(Some(b)) => assert_eq!(b.block_hash(), block_hash),
+            _ => panic!("expected NodeResponse::Block(Some(_))"),
+        }
+
+        // The user request is consumed and the peer isn't punished
+        assert!(
+            !node
+                .inflight_user_requests
+                .contains_key(&UserRequest::Block(block_hash))
+        );
+
+        let peer = node.peers.get(&PEER_TEST).unwrap();
+        assert_eq!(peer.state, PeerStatus::Ready);
+        assert_eq!(peer.banscore, 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_block_valid_unrequested_increases_banscore() {
+        let mut node = setup_unit_node();
+        let block = synthetic_block(BlockDefect::None);
+
+        node.handle_peer_notification(PeerMessages::Block(block), PEER_TEST, Instant::now())
+            .await
+            .unwrap();
+
+        let peer = node.peers.get(&PEER_TEST).unwrap();
+        // The peer is punished with a banscore, but not banned
+        assert_eq!(peer.banscore, 5);
+        assert_eq!(peer.state, PeerStatus::Ready);
     }
 }
