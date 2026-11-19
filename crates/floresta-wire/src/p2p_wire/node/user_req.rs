@@ -5,7 +5,6 @@ use std::time::Instant;
 use bitcoin::Block;
 use bitcoin::p2p::ServiceFlags;
 use floresta_chain::ChainBackend;
-use floresta_common::try_and_log;
 use tokio::sync::oneshot;
 use tracing::debug;
 use tracing::info;
@@ -45,7 +44,15 @@ where
         }
 
         let peers = peers.into_iter().flatten().collect();
-        try_and_log!(responder.send(NodeResponse::GetPeerInfo(peers)));
+        // TODO(#1449): replace with `try_and_debug!` once floresta-common is bumped
+        if let Err(error) = responder.send(NodeResponse::GetPeerInfo(peers)) {
+            debug!(
+                "{}: {} - GetPeerInfo responder dropped before reply: {:?}",
+                line!(),
+                file!(),
+                error
+            );
+        }
     }
 
     /// Actually perform the user request
@@ -73,8 +80,15 @@ where
 
             UserRequest::Ping => {
                 self.broadcast_to_peers(NodeRequest::Ping);
-                try_and_log!(responder.send(NodeResponse::Ping(true)));
-
+                // TODO(#1449): replace with `try_and_debug!` once floresta-common is bumped
+                if let Err(error) = responder.send(NodeResponse::Ping(true)) {
+                    debug!(
+                        "{}: {} - Ping responder dropped before reply: {:?}",
+                        line!(),
+                        file!(),
+                        error
+                    );
+                }
                 return;
             }
 
@@ -95,7 +109,15 @@ where
 
             UserRequest::GetConnectionCount => {
                 let count = self.connected_peers();
-                try_and_log!(responder.send(NodeResponse::GetConnectionCount(count)));
+                // TODO(#1449): replace with `try_and_debug!` once floresta-common is bumped
+                if let Err(error) = responder.send(NodeResponse::GetConnectionCount(count)) {
+                    debug!(
+                        "{}: {} - GetConnectionCount responder dropped before reply: {:?}",
+                        line!(),
+                        file!(),
+                        error
+                    );
+                }
                 return;
             }
 
@@ -166,7 +188,15 @@ where
 
             UserRequest::GetAddrManInfo => {
                 let info = self.address_man.get_connection_stats();
-                try_and_log!(responder.send(NodeResponse::GetAddrManInfo(info)));
+                // TODO(#1449): replace with `try_and_debug!` once floresta-common is bumped
+                if let Err(error) = responder.send(NodeResponse::GetAddrManInfo(info)) {
+                    debug!(
+                        "{}: {} - GetAddrManInfo responder dropped before reply: {:?}",
+                        line!(),
+                        file!(),
+                        error
+                    );
+                }
                 return;
             }
 

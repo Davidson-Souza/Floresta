@@ -182,6 +182,22 @@ macro_rules! try_and_warn {
     };
 }
 
+#[macro_export]
+/// Run a task and log any errors that might occur at debug level.
+///
+/// `try_and_log!` variant for failures that are expected and benign, with an
+/// extra context message so the call site can say what was being attempted.
+///
+/// The error is logged with `tracing::debug!`, which is resolved in the calling crate, so that
+/// crate must depend on `tracing`.
+macro_rules! try_and_debug {
+    ($what:expr, $ctx:expr) => {
+        if let Err(error) = $what {
+            tracing::debug!("{}: {} - {}: {:?}", line!(), file!(), $ctx, error);
+        }
+    };
+}
+
 #[cfg(test)]
 mod test {
     use super::validate_hash_compile_time as validate_hash;
