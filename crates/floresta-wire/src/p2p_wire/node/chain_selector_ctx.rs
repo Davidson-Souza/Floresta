@@ -480,7 +480,7 @@ where
                     }
 
                     // Check if the block was maliciously mutated by our peer
-                    self.enforce_block_structure_check(&recv_block, peer)?;
+                    self.enforce_block_structure_check(&recv_block, peer, true)?;
 
                     block = Some(recv_block);
                     // ask for the proof. Sending two empty bitmaps means we want the full

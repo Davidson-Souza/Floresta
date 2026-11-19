@@ -25,8 +25,10 @@ use super::NodeRequest;
 use super::UtreexoNode;
 use crate::block_proof::Bitmap;
 use crate::block_proof::UtreexoProof;
+use crate::node::WitnessMode;
 use crate::node_context::NodeContext;
 use crate::node_context::PeerId;
+use crate::node_handle::NodeResponse;
 use crate::node_handle::UserRequest;
 use crate::p2p_wire::error::WireError;
 
@@ -81,6 +83,18 @@ impl InflightBlock {
     fn add_utreexo_data(&mut self, leaf_data: Vec<CompactLeafData>, proof: Proof, peer: PeerId) {
         self.aux_data = Some((leaf_data, proof, peer));
     }
+}
+
+/// Outcome of [`UtreexoNode::enforce_block_structure_check_and_retry_user_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockStructureCheckOutcome {
+    /// Caller should continue to user-reply/storage handling. This does not by itself
+    /// mean the block is valid: authentic consensus-invalid blocks also continue under
+    /// existing semantics.
+    Continue,
+    /// The block was bad and the user request was retried with another peer; the
+    /// caller must stop processing this block.
+    UserRequestRetried,
 }
 
 impl<T, Chain> UtreexoNode<Chain, T>
@@ -145,17 +159,105 @@ where
     /// If validation fails, [`Self::handle_block_error`] is called to handle the
     /// error and apply the appropriate network consensus.
     ///
+    /// `invalidate_chain`: when `true` and the block is consensus-invalid, it is invalidated in
+    /// our chain with [`UpdatableChainstate::invalidate_block`]. When `false`, the chain is left
+    /// untouched.
+    ///
     /// [`Block::check_block_structure`]: floresta_chain::extensions::BlockExt::check_block_structure
+    /// [`UpdatableChainstate::invalidate_block`]: floresta_chain::pruned_utreexo::UpdatableChainstate::invalidate_block
     pub(crate) fn enforce_block_structure_check(
         &mut self,
         block: &Block,
         peer: PeerId,
+        invalidate_chain: bool,
     ) -> Result<(), WireError> {
         let Err(e) = block.check_block_structure() else {
             return Ok(());
         };
 
-        self.handle_block_error(e.into(), Arc::new(block.clone()), peer, None)
+        self.handle_block_error(
+            e.into(),
+            Arc::new(block.clone()),
+            peer,
+            None,
+            invalidate_chain,
+        )
+    }
+
+    /// Enforces the block structure consensus with [`Self::enforce_block_structure_check`],
+    /// banning the peer if the block is bad.
+    ///
+    /// Returns [`BlockStructureCheckOutcome::UserRequestRetried`] if the block was bad and
+    /// shouldn't be processed any further because it was a user request retried with
+    /// another peer, keeping the request open. Otherwise returns
+    /// [`BlockStructureCheckOutcome::Continue`], meaning the caller should continue to
+    /// user-reply/storage handling; when the block was bad and no retry happened, a
+    /// `WireError` is returned instead.
+    ///
+    /// When no other peer is available to retry with, the user request is failed with
+    /// a `None` block instead of being left open forever, since user requests have no
+    /// timeout.
+    pub(crate) fn enforce_block_structure_check_and_retry_user_request(
+        &mut self,
+        block: &Block,
+        peer: PeerId,
+    ) -> Result<BlockStructureCheckOutcome, WireError> {
+        let block_hash = block.block_hash();
+        let is_user_request = self
+            .inflight_user_requests
+            .contains_key(&UserRequest::Block(block_hash));
+
+        // User-requested fetches must not mutate our chain state
+        let Err(e) = self.enforce_block_structure_check(block, peer, !is_user_request) else {
+            return Ok(BlockStructureCheckOutcome::Continue);
+        };
+
+        if is_user_request {
+            // Retry the block elsewhere; the user request stays open
+            // and the inflight entry re-arms the timeout machinery.
+            // The offending peer is excluded from the retry: manual peers
+            // are exempt from bans, so it stays eligible and could be
+            // picked again, sending another mutated block and retriggering
+            // this retry indefinitely.
+            match self.send_to_fast_peer_excluding(
+                NodeRequest::GetBlock(vec![block_hash], WitnessMode::Full),
+                ServiceFlags::NETWORK,
+                peer,
+            ) {
+                Ok(new_peer) => {
+                    let now = Instant::now();
+                    self.inflight
+                        .insert(InflightRequests::Blocks(block_hash), (new_peer, now));
+
+                    // Disconnection handling drops user requests by their registered peer, and the
+                    // banned offender disconnects right after the ban, so the request must track
+                    // the replacement peer or it would be lost before the replacement replies.
+                    if let Some(request) = self
+                        .inflight_user_requests
+                        .get_mut(&UserRequest::Block(block_hash))
+                    {
+                        request.0 = new_peer;
+                        request.1 = now;
+                    }
+                    return Ok(BlockStructureCheckOutcome::UserRequestRetried);
+                }
+                Err(err) => warn!("couldn't retry block {block_hash} with another peer: {err}"),
+            }
+
+            // We couldn't retry the request with the other peers, so we respond
+            // to the user with `None`.
+            if let Some(request) = self
+                .inflight_user_requests
+                .remove(&UserRequest::Block(block_hash))
+            {
+                request
+                    .2
+                    .send(NodeResponse::Block(None))
+                    .map_err(|_| WireError::ResponseSendError)?;
+            }
+        }
+
+        Err(e)
     }
 
     /// Handles a block received from a peer at the notification level.
@@ -164,9 +266,6 @@ where
     /// outstanding [`UserRequest::Block`]. Blocks that were neither requested nor
     /// user-requested are punished via [`Self::punish_unrequested_block`] and dropped
     /// before validation, so the structure check cannot touch the chain.
-    ///
-    /// Otherwise replies to an outstanding user request if there is one. Returns `None`
-    /// when the block completed a user request, or `Some` when the caller should store it.
     pub(crate) fn handle_received_block(
         &mut self,
         block: Block,
@@ -188,6 +287,13 @@ where
             return Ok(None);
         }
 
+        // Enforce the block structure consensus (which may ban the peer) and check
+        // whether there is an outstanding user request before proceeding.
+        match self.enforce_block_structure_check_and_retry_user_request(&block, peer)? {
+            BlockStructureCheckOutcome::UserRequestRetried => return Ok(None),
+            BlockStructureCheckOutcome::Continue => {}
+        }
+
         // Reply and return early if it's a user-requested block. Else continue handling it.
         self.check_is_user_block_and_reply(block)
     }
@@ -195,15 +301,14 @@ where
     /// Stores an accepted block and requests its Utreexo proof when needed.
     ///
     /// The block must have been accepted by [`Self::handle_received_block`]: requested
-    /// gating and user replies all happen there. Blocks with only a coinbase need no
-    /// proof and are immediately ready.
+    /// gating, structure validation, user-request retry and user replies all happen
+    /// there. Blocks with only a coinbase need no proof and are immediately ready.
     pub(crate) fn request_block_proof(
         &mut self,
         block: Block,
         peer: PeerId,
     ) -> Result<(), WireError> {
         let block_hash = block.block_hash();
-
         let txdata_len = block.txdata.len();
         debug!("Received block {block_hash} from peer {peer}, with {txdata_len} txs");
 
@@ -409,7 +514,9 @@ where
             Err(err)?
         };
 
-        self.handle_block_error(chain_err, block, block_peer, Some(utreexo_peer))
+        // Blocks reaching `process_block` are chain blocks: user-requested blocks are consumed
+        // earlier, in `handle_received_block`.
+        self.handle_block_error(chain_err, block, block_peer, Some(utreexo_peer), true)
     }
 
     /// Handles chain errors caused by peer-supplied block or Utreexo data.
@@ -418,12 +525,19 @@ where
     /// and consensus-invalid blocks are only invalidated.
     ///
     /// `utreexo_peer` is `None` when no Utreexo peer was involved yet (see #1280).
+    ///
+    /// `invalidate_chain`: when `true` and the block is consensus-invalid, it is invalidated in
+    /// our chain with [`UpdatableChainstate::invalidate_block`]. When `false`, the chain is left
+    /// untouched.
+    ///
+    /// [`UpdatableChainstate::invalidate_block`]: floresta_chain::pruned_utreexo::UpdatableChainstate::invalidate_block
     fn handle_block_error(
         &mut self,
         chain_err: BlockchainError,
         block: Arc<Block>,
         block_peer: PeerId,
         utreexo_peer: Option<PeerId>,
+        invalidate_chain: bool,
     ) -> Result<(), WireError> {
         // Return early if the error is not from block validation (e.g., a database error)
         let Some(e) = Self::block_validation_err(chain_err) else {
@@ -433,10 +547,16 @@ where
         let block_hash = block.block_hash();
 
         let blamed_peer = match utreexo_peer {
-            Some(utreexo_peer) => {
-                self.blame_peer_for_block_error(&e, block, block_peer, utreexo_peer)
+            Some(utreexo_peer) => self.blame_peer_for_block_error(
+                &e,
+                block,
+                block_peer,
+                utreexo_peer,
+                invalidate_chain,
+            ),
+            None => {
+                self.blame_block_peer_for_block_error(&e, block_peer, block_hash, invalidate_chain)
             }
-            None => self.blame_block_peer_for_block_error(&e, block_peer, block_hash),
         };
 
         let Some(blamed_peer) = blamed_peer else {
@@ -476,6 +596,7 @@ where
         block: Arc<Block>,
         block_peer: PeerId,
         utreexo_peer: PeerId,
+        invalidate_chain: bool,
     ) -> Option<PeerId> {
         let hash = block.block_hash();
 
@@ -502,7 +623,7 @@ where
             }
 
             // Every other error kind is either the block peer's fault or ours.
-            _ => self.blame_block_peer_for_block_error(e, block_peer, hash),
+            _ => self.blame_block_peer_for_block_error(e, block_peer, hash, invalidate_chain),
         }
     }
 
@@ -516,12 +637,19 @@ where
     /// Utreexo errors are attributed by the caller ([`Self::blame_peer_for_block_error`]).
     /// This match is exhaustive, so a new error variant must be classified here.
     ///
+    /// `invalidate_chain`: when `true` and the block is consensus-invalid, it is invalidated in
+    /// our chain with [`UpdatableChainstate::invalidate_block`]. When `false`, the chain is left
+    /// untouched.
+    ///
     /// Returns the peer id to blame, if any.
+    ///
+    /// [`UpdatableChainstate::invalidate_block`]: floresta_chain::pruned_utreexo::UpdatableChainstate::invalidate_block
     fn blame_block_peer_for_block_error(
         &mut self,
         e: &BlockValidationErrors,
         block_peer: PeerId,
         hash: BlockHash,
+        invalidate_chain: bool,
     ) -> Option<PeerId> {
         match e {
             // The block is invalid, so we have to invalidate it in our chain.
@@ -549,7 +677,9 @@ where
             | BlockValidationErrors::CoinbaseNotMatured
             | BlockValidationErrors::UtxoNotFound(_)
             | BlockValidationErrors::BadRelativeLockTime => {
-                try_and_log!(self.chain.invalidate_block(hash));
+                if invalidate_chain {
+                    try_and_log!(self.chain.invalidate_block(hash));
+                }
 
                 warn!("Block {hash} is invalid");
                 None
@@ -824,7 +954,7 @@ mod tests {
             let mut setup = setup_test_with_validation_index(0);
             let blamed = setup
                 .node
-                .blame_block_peer_for_block_error(&error, BLOCK_PEER, hash);
+                .blame_block_peer_for_block_error(&error, BLOCK_PEER, hash, true);
 
             // Consensus-invalid blocks are invalidated, but no peer is banned for them
             assert_eq!(blamed, None, "blame consensus for {error:?}");
@@ -837,6 +967,23 @@ mod tests {
     }
 
     #[test]
+    fn test_blame_block_peer_for_block_error_skips_invalidation_when_disabled() {
+        let hash = dummy_block().block_hash();
+        let mut setup = setup_test_with_validation_index(0);
+
+        let blamed = setup.node.blame_block_peer_for_block_error(
+            &BlockValidationErrors::BlockTooBig,
+            BLOCK_PEER,
+            hash,
+            false,
+        );
+
+        // Still no peer is blamed, and the chain is not invalidated when `invalidate_chain` is off
+        assert_eq!(blamed, None);
+        assert!(setup.chain.invalidated_blocks().is_empty());
+    }
+
+    #[test]
     fn test_blame_block_peer_for_block_error_mutated_block_errors_blame_block_peer() {
         let hash = dummy_block().block_hash();
 
@@ -844,7 +991,7 @@ mod tests {
             let mut setup = setup_test_with_validation_index(0);
             let blamed = setup
                 .node
-                .blame_block_peer_for_block_error(&error, BLOCK_PEER, hash);
+                .blame_block_peer_for_block_error(&error, BLOCK_PEER, hash, true);
 
             assert_eq!(blamed, Some(BLOCK_PEER), "blame consensus for {error:?}");
 
@@ -866,7 +1013,7 @@ mod tests {
 
             let blamed = setup
                 .node
-                .blame_block_peer_for_block_error(&error, BLOCK_PEER, hash);
+                .blame_block_peer_for_block_error(&error, BLOCK_PEER, hash, true);
 
             // This is our own mistake, don't punish any peer
             assert_eq!(blamed, None, "blame consensus for {error:?}");
@@ -888,7 +1035,7 @@ mod tests {
             let mut setup = setup_test_with_validation_index(0);
             let blamed = setup
                 .node
-                .blame_block_peer_for_block_error(&error, BLOCK_PEER, hash);
+                .blame_block_peer_for_block_error(&error, BLOCK_PEER, hash, true);
 
             // Utreexo errors are the utreexo peer's fault, not the block peer's
             assert_eq!(blamed, None, "blame consensus for {error:?}");
@@ -929,6 +1076,7 @@ mod tests {
                 block.clone(),
                 BLOCK_PEER,
                 UTREEXO_PEER,
+                true,
             );
 
             let (expected_blamed, expected_invalidation, expected_kept) =
@@ -964,6 +1112,7 @@ mod tests {
             block,
             BLOCK_PEER,
             UTREEXO_PEER,
+            true,
         );
 
         // Block errors are delegated to the block peer's blame consensus
@@ -984,6 +1133,7 @@ mod tests {
             block,
             BLOCK_PEER,
             UTREEXO_PEER,
+            true,
         );
 
         assert_eq!(blamed, Some(UTREEXO_PEER));
@@ -1007,6 +1157,7 @@ mod tests {
             block,
             BLOCK_PEER,
             UTREEXO_PEER,
+            true,
         );
 
         assert_eq!(blamed, Some(UTREEXO_PEER));
@@ -1038,6 +1189,7 @@ mod tests {
             block,
             BLOCK_PEER,
             UTREEXO_PEER,
+            true,
         );
 
         assert_eq!(blamed, None);
@@ -1060,7 +1212,7 @@ mod tests {
 
         let result = setup
             .node
-            .handle_block_error(chain_err, block, BLOCK_PEER, None);
+            .handle_block_error(chain_err, block, BLOCK_PEER, None, true);
 
         // The tx error is unwrapped into the block error, which only invalidates the block.
         assert!(result.is_ok());
@@ -1076,7 +1228,7 @@ mod tests {
         let chain_err = BlockchainError::BlockValidation(BlockValidationErrors::BadMerkleRoot);
         let result = setup
             .node
-            .handle_block_error(chain_err, block, BLOCK_PEER, None);
+            .handle_block_error(chain_err, block, BLOCK_PEER, None, true);
 
         assert!(matches!(result, Err(WireError::PeerMisbehaving)));
         assert_peer_state(&setup.node, BLOCK_PEER, PeerStatus::Banned);
@@ -1094,6 +1246,7 @@ mod tests {
             block,
             BLOCK_PEER,
             Some(UTREEXO_PEER),
+            true,
         );
 
         assert!(matches!(result, Err(WireError::PeerMisbehaving)));
@@ -1115,7 +1268,7 @@ mod tests {
         let result =
             setup
                 .node
-                .handle_block_error(chain_err, block, BLOCK_PEER, Some(UTREEXO_PEER));
+                .handle_block_error(chain_err, block, BLOCK_PEER, Some(UTREEXO_PEER), true);
 
         // Accumulator errors are mapped to an invalid utreexo proof
         assert!(matches!(result, Err(WireError::PeerMisbehaving)));
@@ -1146,6 +1299,7 @@ mod tests {
             block,
             BLOCK_PEER,
             Some(UTREEXO_PEER),
+            true,
         );
 
         // Leaf reconstruction errors are mapped to an invalid utreexo proof
@@ -1166,6 +1320,7 @@ mod tests {
             block,
             BLOCK_PEER,
             Some(UTREEXO_PEER),
+            true,
         );
 
         assert!(result.is_ok());
@@ -1189,6 +1344,7 @@ mod tests {
                 block.clone(),
                 BLOCK_PEER,
                 utreexo_peer,
+                true,
             );
 
             assert!(result.is_ok(), "case utreexo_peer={utreexo_peer:?}");

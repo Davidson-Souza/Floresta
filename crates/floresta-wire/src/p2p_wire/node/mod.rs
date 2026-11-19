@@ -27,6 +27,8 @@ use bitcoin::Network;
 use bitcoin::Txid;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::AddrV2Message;
+#[cfg(test)]
+pub(crate) use blocks::BlockStructureCheckOutcome;
 pub(crate) use blocks::InflightBlock;
 use floresta_chain::BlockchainError;
 use floresta_chain::ChainBackend;
