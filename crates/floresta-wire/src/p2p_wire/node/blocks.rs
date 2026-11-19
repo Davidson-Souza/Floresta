@@ -138,19 +138,34 @@ where
         Ok(())
     }
 
+    /// Handles a block received from a peer at the notification level.
+    ///
+    /// Removes the matching [`InflightRequests::Blocks`] entry and replies to an
+    /// outstanding user request if there is one. Returns `None` when the block
+    /// completed a user request, or `Some` when the caller should store it.
+    pub(crate) fn handle_received_block(
+        &mut self,
+        block: Block,
+        _peer: PeerId,
+    ) -> Result<Option<Block>, WireError> {
+        let block_hash = block.block_hash();
+        self.inflight.remove(&InflightRequests::Blocks(block_hash));
+
+        // Reply and return early if it's a user-requested block. Else continue handling it.
+        self.check_is_user_block_and_reply(block)
+    }
+
+    /// Stores an accepted block and requests its Utreexo proof when needed.
+    ///
+    /// The block must have been accepted by [`Self::handle_received_block`]: requested
+    /// gating and user replies all happen there. Blocks with only a coinbase need no
+    /// proof and are immediately ready.
     pub(crate) fn request_block_proof(
         &mut self,
         block: Block,
         peer: PeerId,
     ) -> Result<(), WireError> {
         let block_hash = block.block_hash();
-        self.inflight.remove(&InflightRequests::Blocks(block_hash));
-
-        // Reply and return early if it's a user-requested block. Else continue handling it.
-        let Some(block) = self.check_is_user_block_and_reply(block)? else {
-            return Ok(());
-        };
-
         let txdata_len = block.txdata.len();
         debug!("Received block {block_hash} from peer {peer}, with {txdata_len} txs");
 

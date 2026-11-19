@@ -18,6 +18,7 @@ mod tests {
     use crate::node::sync_ctx::SyncNode;
     use crate::node_handle::NodeResponse;
     use crate::node_handle::UserRequest;
+    use crate::p2p_wire::error::WireError;
     use crate::p2p_wire::tests::utils::PeerData;
     use crate::p2p_wire::tests::utils::SetupNodeArgs;
     use crate::p2p_wire::tests::utils::setup_node;
@@ -69,12 +70,25 @@ mod tests {
         (node, block, response)
     }
 
+    /// Runs the received-block orchestration under test: notification-level handling
+    /// followed by storage/proof processing for accepted blocks.
+    fn receive_block(
+        node: &mut UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+        block: Block,
+        peer: u32,
+    ) -> Result<(), WireError> {
+        if let Some(block) = node.handle_received_block(block, peer)? {
+            node.request_block_proof(block, peer)?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_block_proof_coinbase_only_block_stores_and_skips_proof_request() {
         let (mut node, block, _) = setup_test(false);
         let block_hash = block.block_hash();
 
-        node.request_block_proof(block, PEER_TEST).unwrap();
+        receive_block(&mut node, block, PEER_TEST).unwrap();
 
         // The block should be stored
         assert!(node.blocks.contains_key(&block_hash));
@@ -100,7 +114,7 @@ mod tests {
         let (mut node, block, response) = setup_test(true);
         let block_hash = block.block_hash();
 
-        node.request_block_proof(block, PEER_TEST).unwrap();
+        receive_block(&mut node, block, PEER_TEST).unwrap();
 
         // The user should have received the block
         let response = response.unwrap().await.unwrap();
