@@ -170,14 +170,13 @@ pub(crate) enum InflightRequests {
     GetAddresses,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, PartialEq, Clone, Copy)]
 /// The kind of connection we see this peer as.
 ///
 /// Core's counterpart: <https://github.com/bitcoin/bitcoin/blob/bf9ef4f0433551e850a11c2da8baae0ec6439a99/src/node/connection_types.h#L18>.
 pub enum ConnectionKind {
     /// A regular outbound peer, used to relay transactions, addresses, and blocks.
-    OutboundFullRelay(#[serde(skip)] ServiceFlags),
+    OutboundFullRelay(ServiceFlags),
 
     /// A connection that was manually requested by our user. This type of peer won't be banned on
     /// misbehaving, and won't respect the [`ServiceFlags`] requirements when creating a
@@ -197,7 +196,7 @@ pub enum ConnectionKind {
     AddrFetch,
 
     /// A peer that is only used to relay blocks, not transactions or addresses.
-    BlockRelayOnly(#[serde(skip)] ServiceFlags),
+    BlockRelayOnly(ServiceFlags),
 
     /// A temporary extra peer created if our tip hasn't moved for too long.
     ///
@@ -205,12 +204,12 @@ pub enum ConnectionKind {
     /// last processed block, we use this to make sure we are not in a partitioned
     /// subnet, unable to learn about new blocks. If this peer returns useful
     /// headers, we keep it as a [`ConnectionKind::BlockRelayOnly`] peer.
-    #[serde(rename = "block-relay-only")]
     Extra,
 }
 
 impl ConnectionKind {
-    /// The name of this connection kind, as reported by `getpeerinfo`.
+    /// The name of this connection kind, as reported by `getpeerinfo` and used by its
+    /// [`Serialize`] implementation.
     ///
     /// These match Bitcoin Core's connection type names. [`ConnectionKind::Extra`] is
     /// reported as `block-relay-only`, since that's how it behaves to the outside.
@@ -261,6 +260,13 @@ impl ConnectionKind {
     /// Whether this connection kind is block-relay-only.
     pub(crate) const fn is_block_relay_only(&self) -> bool {
         matches!(self, Self::BlockRelayOnly(_))
+    }
+}
+
+/// Serializes the public connection kind name returned by [`ConnectionKind::as_str`].
+impl Serialize for ConnectionKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -514,28 +520,27 @@ mod tests {
     use super::ConnectionKind;
 
     #[test]
-    fn extra_connection_kind_serializes_as_block_relay_only() {
-        // Extra is an internal stale-tip connection kind. It is exposed through
-        // RPC as block-relay-only, matching its externally visible behavior.
-        let serialized =
-            serde_json::to_string(&ConnectionKind::Extra).expect("kind should serialize");
+    fn connection_kind_names_and_serialization_match_core() {
+        let cases = [
+            (
+                ConnectionKind::OutboundFullRelay(ServiceFlags::NETWORK),
+                "outbound-full-relay",
+            ),
+            (ConnectionKind::Manual, "manual"),
+            (ConnectionKind::Feeler, "feeler"),
+            (ConnectionKind::AddrFetch, "addr-fetch"),
+            (
+                ConnectionKind::BlockRelayOnly(ServiceFlags::NETWORK),
+                "block-relay-only",
+            ),
+            (ConnectionKind::Extra, "block-relay-only"),
+        ];
 
-        assert_eq!(serialized, "\"block-relay-only\"");
-    }
+        for (kind, name) in cases {
+            assert_eq!(kind.as_str(), name, "{kind:?}");
 
-    #[test]
-    fn connection_kind_names_match_core() {
-        assert_eq!(
-            ConnectionKind::OutboundFullRelay(ServiceFlags::NETWORK).as_str(),
-            "outbound-full-relay"
-        );
-        assert_eq!(ConnectionKind::Manual.as_str(), "manual");
-        assert_eq!(ConnectionKind::Feeler.as_str(), "feeler");
-        assert_eq!(ConnectionKind::AddrFetch.as_str(), "addr-fetch");
-        assert_eq!(
-            ConnectionKind::BlockRelayOnly(ServiceFlags::NETWORK).as_str(),
-            "block-relay-only"
-        );
-        assert_eq!(ConnectionKind::Extra.as_str(), "block-relay-only");
+            let serialized = serde_json::to_value(kind).expect("kind should serialize");
+            assert_eq!(serialized, name, "{kind:?}");
+        }
     }
 }
