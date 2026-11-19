@@ -27,6 +27,7 @@ use crate::block_proof::Bitmap;
 use crate::block_proof::UtreexoProof;
 use crate::node_context::NodeContext;
 use crate::node_context::PeerId;
+use crate::node_handle::UserRequest;
 use crate::p2p_wire::error::WireError;
 
 /// The leaf data, utreexo proof and the peer that sent them.
@@ -140,16 +141,33 @@ where
 
     /// Handles a block received from a peer at the notification level.
     ///
-    /// Removes the matching [`InflightRequests::Blocks`] entry and replies to an
-    /// outstanding user request if there is one. Returns `None` when the block
-    /// completed a user request, or `Some` when the caller should store it.
+    /// Removes the matching [`InflightRequests::Blocks`] entry and checks for an
+    /// outstanding [`UserRequest::Block`]. Blocks that were neither requested nor
+    /// user-requested are punished via [`Self::punish_unrequested_block`] and dropped
+    /// before validation, so the structure check cannot touch the chain.
+    ///
+    /// Otherwise replies to an outstanding user request if there is one. Returns `None`
+    /// when the block completed a user request, or `Some` when the caller should store it.
     pub(crate) fn handle_received_block(
         &mut self,
         block: Block,
-        _peer: PeerId,
+        peer: PeerId,
     ) -> Result<Option<Block>, WireError> {
         let block_hash = block.block_hash();
-        self.inflight.remove(&InflightRequests::Blocks(block_hash));
+        let was_requested = self
+            .inflight
+            .remove(&InflightRequests::Blocks(block_hash))
+            .is_some();
+        let is_user_request = self
+            .inflight_user_requests
+            .contains_key(&UserRequest::Block(block_hash));
+
+        // A block we never asked for must not reach block validation: discard it before
+        // the structure check can touch the chain (e.g. `invalidate_block`).
+        if !was_requested && !is_user_request {
+            self.punish_unrequested_block(peer, block_hash)?;
+            return Ok(None);
+        }
 
         // Reply and return early if it's a user-requested block. Else continue handling it.
         self.check_is_user_block_and_reply(block)
@@ -166,6 +184,7 @@ where
         peer: PeerId,
     ) -> Result<(), WireError> {
         let block_hash = block.block_hash();
+
         let txdata_len = block.txdata.len();
         debug!("Received block {block_hash} from peer {peer}, with {txdata_len} txs");
 

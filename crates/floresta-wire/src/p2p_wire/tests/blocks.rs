@@ -14,16 +14,19 @@ mod tests {
     use tokio::sync::oneshot::Receiver;
 
     use crate::node::InflightRequests;
+    use crate::node::PeerStatus;
     use crate::node::UtreexoNode;
     use crate::node::sync_ctx::SyncNode;
     use crate::node_handle::NodeResponse;
     use crate::node_handle::UserRequest;
     use crate::p2p_wire::error::WireError;
+    use crate::p2p_wire::tests::utils::BlockDefect;
     use crate::p2p_wire::tests::utils::PeerData;
     use crate::p2p_wire::tests::utils::SetupNodeArgs;
     use crate::p2p_wire::tests::utils::setup_node;
     use crate::p2p_wire::tests::utils::signet_blocks;
     use crate::p2p_wire::tests::utils::signet_headers;
+    use crate::p2p_wire::tests::utils::synthetic_block;
 
     const PEER_TEST: u32 = 0;
 
@@ -107,6 +110,27 @@ mod tests {
                 .inflight
                 .contains_key(&InflightRequests::UtreexoProof(block_hash))
         );
+    }
+
+    #[tokio::test]
+    async fn test_block_proof_unrequested_block_is_ignored() {
+        let (mut node, _, _) = setup_test(false);
+        let block = synthetic_block(BlockDefect::TooManySigops);
+        let block_hash = block.block_hash();
+
+        receive_block(&mut node, block, PEER_TEST).unwrap();
+
+        // The block is discarded before structure validation, so it is not stored,
+        // no proof is requested and the peer is only penalized with a banscore.
+        assert!(!node.blocks.contains_key(&block_hash));
+        assert!(
+            !node
+                .inflight
+                .contains_key(&InflightRequests::UtreexoProof(block_hash))
+        );
+        let peer = node.peers.get(&PEER_TEST).unwrap();
+        assert_eq!(peer.state, PeerStatus::Ready);
+        assert_eq!(peer.banscore, 5);
     }
 
     #[tokio::test]

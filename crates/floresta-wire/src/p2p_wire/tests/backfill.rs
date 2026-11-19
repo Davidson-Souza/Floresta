@@ -97,8 +97,8 @@ mod tests {
     /// `expected_err` is what [`BlockExt::check_block_structure`] must return for the block:
     /// `None` if the block is structurally valid.
     ///
-    /// The block isn't the next block of the backfill interval, so it's never processed: asserts
-    /// the backfill still completes with the honest state.
+    /// Unsolicited blocks are discarded before structure validation, so the backfill must
+    /// complete with the honest state instead of reaching `invalidate_block`.
     async fn check_unsolicited_block(
         defect: BlockDefect,
         expected_err: Option<BlockExtError>,
