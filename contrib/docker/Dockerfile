@@ -46,4 +46,9 @@ EXPOSE 50001
 EXPOSE 8332
 EXPOSE 3333
 
+LABEL org.opencontainers.image.description="A lightweight and embeddable Bitcoin client, built for sovereignty!"
+LABEL org.opencontainers.image.documentation="https://raw.githubusercontent.com/getfloresta/Floresta/refs/heads/master/README.md"
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+LABEL org.opencontainers.image.source="https://github.com/getfloresta/Floresta"
+
 CMD [ "florestad" ]
