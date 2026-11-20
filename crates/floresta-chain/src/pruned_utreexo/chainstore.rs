@@ -7,7 +7,13 @@
 //! It also defines two important types for our storage format:
 //! - [DiskBlockHeader]: A block header linked to its validation-state metadata
 //! - [BestChain]: Tracks the current best chain, last valid block, and fork tips
+//!
+//! # Error types
+//!
+//! This module centralises the error types used by chainstore implementations:
+//! - [ChainstoreError]: The public-facing error enum for [ChainStore] operations
 
+use core::error;
 use core::fmt;
 use core::fmt::Display;
 use core::fmt::Formatter;
@@ -21,6 +27,90 @@ use bitcoin::consensus::encode;
 use crate::BlockchainError;
 use crate::DatabaseError;
 use crate::prelude::*;
+
+/// The maximum theoretical size in bytes of the Utreexo accumulator
+///
+/// In the worst case that all leaves are filled:
+/// * The accumulator can have up to 64 roots
+/// * Each root is 32 bytes
+/// * The number of leaves is expressed as a [`u64`]
+///
+/// 64 (MAX_ROOTS) * 32 bytes (ROOT_SIZE) + 8 bytes (LEAF_COUNT) = 2056 bytes
+pub const MAX_ACCUMULATOR_SIZE: usize = 2056;
+
+#[derive(Debug)]
+/// Errors that can happen whilst interacting with a [`ChainStore`] implementation
+///
+/// Variants that carry domain meaning ([`HeaderNotFound`], [`OversizedAccumulator`],
+/// [`CorruptedDatabase`], [`InvalidValidationIndex`], [`FullIndex`]) allow callers to react
+/// programmatically. Unrecoverable implementation-level failures are wrapped inside
+/// [`Other`] as a plain diagnostic string.
+///
+/// [`HeaderNotFound`]: ChainstoreError::HeaderNotFound
+/// [`OversizedAccumulator`]: ChainstoreError::OversizedAccumulator
+/// [`CorruptedDatabase`]: ChainstoreError::CorruptedDatabase
+/// [`InvalidValidationIndex`]: ChainstoreError::InvalidValidationIndex
+/// [`FullIndex`]: ChainstoreError::FullIndex
+/// [`Other`]: ChainstoreError::Other
+pub enum ChainstoreError {
+    /// The requested block header was not found in the store
+    HeaderNotFound,
+
+    /// The accumulator data exceeds the maximum allowed size of
+    /// [`MAX_ACCUMULATOR_SIZE`] bytes
+    OversizedAccumulator,
+
+    /// The database is corrupted
+    CorruptedDatabase,
+
+    /// The validation index references a block without a known height
+    ///
+    /// Usually indicates the block is orphaned or on an invalid chain;
+    /// Can be remedied by a full reindex
+    InvalidValidationIndex,
+
+    /// The store has reached its capacity; no new headers or index entries can be saved
+    ///
+    /// Surfaced to users as a [`ChainStoreWarning`]
+    FullIndex,
+
+    /// An unrecoverable error with a plain diagnostic message
+    ///
+    /// Covers implementation details such as I/O failures, lock poisoning,
+    /// schema mismatches, and other non-actionable
+    /// conditions. Consumers should treat this as fatal and surface the
+    /// message for diagnostic purposes only.
+    Other(String),
+}
+
+impl Display for ChainstoreError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeaderNotFound => {
+                write!(f, "the requested block header was not found")
+            }
+            Self::OversizedAccumulator => write!(
+                f,
+                "accumulator exceeds the maximum size of {} bytes",
+                MAX_ACCUMULATOR_SIZE
+            ),
+            Self::CorruptedDatabase => write!(f, "the database is corrupted"),
+            Self::InvalidValidationIndex => {
+                write!(
+                    f,
+                    "validation index has no known height; can be remedied by a full reindex"
+                )
+            }
+            Self::FullIndex => write!(f, "the chainstore is full; no new entries can be saved"),
+            Self::Other(msg) => write!(f, "other error: {msg}"),
+        }
+    }
+}
+
+impl error::Error for ChainstoreError {}
+
+/// Allows [`ChainstoreError`] to be used as the associated `Error` type of [`ChainStore`]
+impl DatabaseError for ChainstoreError {}
 
 /// A trait defining methods for interacting with our chain database. These methods will be used by
 /// the [ChainState](super::chain_state::ChainState) to save and retrieve data about the blockchain,
