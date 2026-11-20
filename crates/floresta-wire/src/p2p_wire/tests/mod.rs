@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod backfill;
 mod blocks;
 mod chain_selector;
 mod peer_latency;

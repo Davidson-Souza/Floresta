@@ -736,7 +736,9 @@ where
                     }
 
                     PeerMessages::Block(block) => {
-                        self.request_block_proof(block, peer)?;
+                        if let Some(block) = self.handle_received_block(block, peer)? {
+                            self.request_block_proof(block, peer)?;
+                        }
                     }
 
                     PeerMessages::Headers(headers) => {

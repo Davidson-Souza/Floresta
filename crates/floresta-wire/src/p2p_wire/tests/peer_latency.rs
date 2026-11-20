@@ -332,7 +332,9 @@ mod tests {
         let Some(PeerMessages::Block(block)) = message else {
             panic!("the requested block should reach the block handler");
         };
-        node.request_block_proof(block, 1).unwrap();
+        if let Some(block) = node.handle_received_block(block, 1).unwrap() {
+            node.request_block_proof(block, 1).unwrap();
+        }
         assert!(!node.inflight.contains_key(&request));
         assert!(node.inflight.contains_key(&fresh_request));
         assert!(node.blocks.contains_key(&hash));

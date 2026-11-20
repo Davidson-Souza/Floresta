@@ -564,8 +564,7 @@ where
                         }
 
                         let Some(_) = self.inflight.remove(&InflightRequests::Blocks(hash)) else {
-                            warn!("Received block {hash}, but we didn't ask for it");
-                            self.increase_banscore(peer, 5)?;
+                            self.punish_unrequested_block(peer, hash)?;
 
                             return Ok(());
                         };
