@@ -42,6 +42,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::debug;
 use tracing::error;
+use tracing::trace;
 use tracing::warn;
 
 use self::peer_utils::make_pong;
@@ -411,7 +412,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
 
     pub async fn handle_node_request(&mut self, request: NodeRequest) -> Result<()> {
         assert_eq!(self.state, State::Connected);
-        debug!("Handling node request: {request:?}");
+        trace!("Handling node request: {request:?}");
         match request {
             NodeRequest::GetBlock(block_hashes, witness) => {
                 let inv = block_hashes
@@ -517,7 +518,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
         self.last_message = time;
         self.messages += 1;
 
-        debug!("Received {} from peer {}", message.command(), self.id);
+        trace!("Received {} from peer {}", message.command(), self.id);
         match self.state {
             State::Connected => match message {
                 NetworkMessage::Inv(inv) => {
@@ -731,7 +732,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
 
 impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
     pub async fn write(&mut self, msg: NetworkMessage) -> Result<()> {
-        debug!("Writing {} to peer {}", msg.command(), self.id);
+        trace!("Writing {} to peer {}", msg.command(), self.id);
         self.writer.write_message(msg).await?;
         Ok(())
     }

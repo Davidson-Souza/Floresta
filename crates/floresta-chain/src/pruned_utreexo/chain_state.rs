@@ -50,6 +50,7 @@ use rustreexo::stump::Stump;
 use spin::RwLock;
 use tracing::debug;
 use tracing::info;
+use tracing::trace;
 use tracing::warn;
 
 use super::BlockchainInterface;
@@ -1560,7 +1561,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         // Update our current tip
         if header.prev_blockhash == best_block.1 {
             let height = best_block.0 + 1;
-            debug!("Header builds on top of our best chain");
+            trace!("Header builds on top of our best chain");
 
             write_lock!(self).best_block.new_block(block_hash, height);
             let disk_header = DiskBlockHeader::HeadersOnly(header, height);
