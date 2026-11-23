@@ -118,53 +118,55 @@ impl ChainParams {
         let genesis = genesis_block(Params::new(network));
         match network {
             Network::Bitcoin => AssumeUtreexoValue {
-                height: 939969,
+                height: 976679,
                 block_hash: bhash!(
-                    "000000000000000000009d36aae180d04aeac872adb14e22f65c8b6647a8bf79"
+                    "000000000000000000000d9c98eed0d249631c1326408b194321690611bf52b9"
                 ),
                 roots: acchashes![
-                    "08daaf0c6bc41531885cfcfdeb89c34bd4d06ab4b105cf0e81bd74ab082693f5",
-                    "8d4166d0303d41f7023cd35b95b24455b99b2f4a2728083bba3d172727900bed",
-                    "08d95bc9b7bc0bc07c9f626322c0092bd16c198fcb96d290fe1a191e9719b4c9",
-                    "e663da82fd6523124b4ae5b52d1790460cfdd16ae7733fb5ef7d9d0e8911f516",
-                    "87a9dd5e49e99b29c394622207a27f0c2ba51a8325eedccc8f604b07b3dafe23",
-                    "174bed42eb80a6e5adec1e97f7fc8e736e96d99d0f4d6cdcfed0343281934aa3",
-                    "16a4b567f72e39d928b8fc84afc50e035bba5639c5bdaa01b53ddb806190f96a",
-                    "d1a2df40385aa7c5ac3b9fc9f1ebd4fa9c2d007842fa70e3f60a434762ae8855",
-                    "cf985706bc58a2fb89edc2f28b7c4bf04af440c0534da01b27a2a7eea5f98391",
-                    "6d3c3406b7b99e476a754f3d04a1bec2442b2699c8b7d317ee0aca877b59a74f",
-                    "f166e22db463c0c1ec2c374d6ddff56699ae27d52443622154a4f6f29b2d6bac",
-                    "11270cc9d63da0cf47b2a75e8948576fecc9f6405981f7306c2b58b0fcb37ef6",
-                    "fc9bcdcf61bf2ee5480326d24a460ef520f4b02d1cec8a309784795ddcc4bcd9",
-                    "c97717ab33820c8efe9d464ff48a1d593e06e4c99135686ae96cc7328a290a79",
-                    "5b3c899b033b43989ed57db0854e2deb084de27fcf8596e9c60738ccd08d16c1",
-                    "745b78a30e984590b7ceb3a433adb363862cf84b747cb55e500eb25164b5f71f",
-                    "d338cb3e81a902b4e0301f69ac9443f7a9bb423446bbac41306c7e839bae4866",
-                    "d3078b9c3bb20af622559fc2837d339210cd4e1e13ebdb66d19ca70e83e91a00",
+                    "7d9bdee21d75a5c2b4eb9e3a9300b37d14b1c89b0e1c5af9fd41417fc4ce4abc",
+                    "de2d96c559d1bb933f0d194cfb36180f2e20204766b40e8d9509e673f3f41f8a",
+                    "f425aaddf40db26b4884892f2b1371d37733aa9c68bdec21190f58a73e1f3d98",
+                    "e2793a974c9b39aa2c27a014d67dfcc16dd72e3e083e20d9d04d7cf9f7d266ec",
+                    "acbc10a5a8506d0ff217b664661d19cd177e1352de6f7f0b4376bee7849e0f12",
+                    "8cb1a6153fa5c359b837e84401600923b46cce1b03da792764566498d6e56239",
+                    "b480e08f8333e39c715183339a215bcec3eb6f6d3106eeb6d031370f699eb058",
+                    "f14d29c159669f93e62eba0d1a317a0bd13e0192f0cc915254b537535c0598b6",
+                    "4ef58ba52ce2db8be116bbc6148a181af018642f954c61c555ac8ccae888dd6a",
+                    "7cf06c7367e9b25edc7981b8afc07d14fc4449995ee441f3f0ea13228907dcbe",
+                    "a01c424e89fef3f455cf4caec71dc0959d66f9687c2a6316f6b8a1fab97fa67a",
+                    "a964e30a5b3504661a1bd1047ba6242a6e4dea8a5a1f931b641934f0f15d4cd7",
+                    "438ad4152fcab5de786e75cca4928654239ccfad550a9557b56a6ca61f4c1a78",
+                    "c65700fab927ff98fcd21c9541e46a23d1ffee4b8e7b5f987fa6c7191dda833b",
+                    "fd6db3280d75bb5a796e730b9d1aaa5ba0595a6167ce75f9320149873b6e8c8a",
                 ]
                 .to_vec(),
-                leaves: 3066490760,
+                leaves: 3243591085,
             },
             Network::Signet => AssumeUtreexoValue {
-                height: 296870,
+                height: 331881,
                 block_hash: bhash!(
-                    "000000068d38e9cfa53268a08b32dab55118a58e5212729b016ee3c9c66387a6"
+                    "00000013de70c4cc657575e55ff9a6acc932729128b9434d31679178f71a1ca1"
                 ),
                 roots: acchashes![
-                    "2f50b3b1ed71ab671b8f9e90dcd1a73aba00ee9e8441f34c388efe224956257c",
-                    "cfbc9f1139665175ffdf6f949ec8e82956172e128ca4c1fca228ef5b6816c196",
-                    "31bcb14a70b18a8c22a4144e270dcdae8795cda26e938ed9c676dbba4443b8ad",
-                    "cb90b5ad4df6ff872f315575a8dda593f6d1382349f6f2e41e315f7ceb8a084f",
-                    "ca0db15d9e59ae69691e82b3e9b2fb65b7b932275cd86795337a066fb1f371a7",
-                    "d802536c657b0b52e34929ebf26033f0354d1ac65f2186f34e967fafa5b0c3fd",
-                    "fe157607ceec8e0f46d401f0f1a0d3421bfe40abaef708d9694246e512be27da",
-                    "87a75c823e13bb8d0111c238a0a9b5d8d89ba79395f7970418d9981ad5b0ffc3",
-                    "4670816e7c71a989e2d4da8dd491a045681536276e386913dca98c7f6fbe5156",
-                    "ed1e927d905d01616e066492d1f4a014151b74801299a596918d103c438e2551",
-                    "5c8e0755507f65c79972aaadf49a86f3c5f02a75d855a6a3380707830cc20ae2"
+                    "819fe2ab44dd87a33dcc262d29890c6fad0111fa4a13507fc28fa63907f10cec",
+                    "3a08e8403f9f8740d076724dec22123ce6ea1dd5b5387d0889e3229a3cecd8a9",
+                    "2a990a42dc75ff5e0b1d5ce7b0aa52f3db5c58cc0f3c3fdfc7da4935edcb93c4",
+                    "78f67308229225f60ce781e24b2898d2fffc350774259eac6df999f3d7caf334",
+                    "f5cc57665fb9e9f017336c6795ecfa20ebcca8e372b2270a45b0b719e5d1b828",
+                    "3aa05ca40b5851de3711693f4c26d2ad0ea0e47fa7f0bd060a197fe69fa9eef7",
+                    "b4762ae42f3d017ba3fa403338275db4852868a67befa13454839d6052c4aaf2",
+                    "3eacdf34fce736ee009959138be9478288b6696a702dbf39ebc532ccdd46cad1",
+                    "aa07cb033f653d5d446c0a15599f67193ca82f436258a1ba0f1968e46cf5e7de",
+                    "4a4523c54f472ed4c696bc7abbc1918304d0559586dfbaa9f1dd3c06674c5833",
+                    "6ca17573455d699f95449b48cd559bf2d1ae7937c77ac672335c023dc77b7338",
+                    "e885d24c919131bc3ce641c74c493e2fd70fea5fe250f40d7b7e3e16137827f5",
+                    "f88eabe952734dd3655cce64d8af89bf85ddefe12a174aa525febcecb6f06605",
+                    "0fcc9ffe10130000dc09791272f0eafb45a3e7c0e69dab0392fbee8b8f217a34",
+                    "948a885d7ca57fd9cb9832a96bff33c30ccdb2613ceef5bc9c18aaa7e864da5d",
+                    "40ca03221215b734ae246941502b1696ba159271bcc7decf9b58906229c9843d",
                 ]
                 .to_vec(),
-                leaves: 126113034,
+                leaves: 163448509,
             },
             Network::Testnet => AssumeUtreexoValue {
                 block_hash: genesis.block_hash(),
@@ -209,10 +211,10 @@ impl ChainParams {
             AssumeValidArg::UserInput(hash) => Some(hash),
             AssumeValidArg::Hardcoded => match network {
                 Network::Bitcoin => Some(bhash!(
-                    "000000000000000000019d4afaefa42fc5b4211a7edcce7681a1478df661ead6" // 971_420
+                    "000000000000000000000d9c98eed0d249631c1326408b194321690611bf52b9" // 976_679
                 )),
                 Network::Signet => Some(bhash!(
-                    "00000008f507c8db68879442b1eea8c312fd66b445d4dd9b1b12c4bc8188ef64" // 326_326
+                    "00000013de70c4cc657575e55ff9a6acc932729128b9434d31679178f71a1ca1" // 331_881
                 )),
                 Network::Testnet => Some(bhash!(
                     "000000005cf458fb1f79c8fee78822eead52aee40530a6bbe018cd61f22d6bb1" // 4_887_983
