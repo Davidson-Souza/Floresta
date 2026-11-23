@@ -199,12 +199,9 @@ impl ChainParams {
     /// # Variants
     /// - [`AssumeValidArg::Disabled`] — no checkpoint; all scripts are validated.
     /// - [`AssumeValidArg::UserInput`] — use the provided hash.
-    /// - [`AssumeValidArg::Hardcoded`] — use a release-time checkpoint per [`Network`]:
-    ///   - **Bitcoin**: block [971,420](https://mempool.space/block/971420)
-    ///   - **Signet**: block [326,326](https://mempool.space/signet/block/326326)
-    ///   - **Testnet**: block [4,887,983](https://mempool.space/testnet/block/4887983)
-    ///   - **Testnet4**: block [126,514](https://mempool.space/testnet4/block/126514)
-    ///   - **Regtest**: genesis block
+    /// - [`AssumeValidArg::Hardcoded`] — use the release-time checkpoint hardcoded for
+    ///   each [`Network`] in the body of this function, where every hash carries its
+    ///   height as a comment. For Regtest this is the genesis block.
     pub fn get_assume_valid(network: Network, arg: AssumeValidArg) -> Option<BlockHash> {
         match arg {
             AssumeValidArg::Disabled => None,
