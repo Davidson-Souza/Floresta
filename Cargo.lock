@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "floresta"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "floresta-chain",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-chain"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "bitcoin_hashes 1.1.0",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-compact-filters"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "floresta-chain",
@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-electrum"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "floresta-chain",
@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-fuzz"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arbitrary",
  "bitcoin",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-mempool"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ahash",
  "bitcoin",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-metrics"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "prometheus-client",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-node"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-rpc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "clap",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-watch-only"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "floresta-chain",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "floresta-wire"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bip324",
  "bitcoin",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "florestad"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bitcoin",
  "clap",

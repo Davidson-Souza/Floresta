@@ -1,6 +1,6 @@
 [package]
 name = "floresta-electrum"
-version = "0.5.0"
+version = "0.6.0"
 rust-version.workspace = true
 edition.workspace = true
 authors = ["Floresta Developers <contact@getfloresta.org>"]

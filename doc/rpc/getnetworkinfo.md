@@ -29,7 +29,7 @@ Returns a JSON object with the following fields:
 
 - `version` - (numeric) The server version, encoded as Bitcoin Core's `MMmmpp` numeric scheme (e.g., `1.2.5` is encoded as `10205`).
 
-- `subversion` - (string) The User Agent string the node advertises to peers (e.g., `/Floresta:0.9.0/`).
+- `subversion` - (string) The User Agent string the node advertises to peers (e.g., `/Floresta:0.10.0/`).
 
 - `protocolversion` - (numeric) The P2P protocol version the node speaks.
 
