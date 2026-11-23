@@ -3,4 +3,5 @@ ignore = [
     "RUSTSEC-2026-0009", # blame: time@0.3.45 (unpatchable, time > v0.3.45 needs 1.88.0)
     "RUSTSEC-2025-0057", # blame: fxhash@0.2.1 (unmaintained, pulled in by kv@0.24.0)
     "RUSTSEC-2024-0384", # blame: instant@0.1.13 (unmaintained, pulled in by kv@0.24.0)
+    "RUSTSEC-2026-0542", # humantime is unmaintained (used by upstream console-subscriber)
 ]
