@@ -391,6 +391,10 @@ impl BlockchainInterface for PartialChainState {
         self.inner().chain_params().params
     }
 
+    fn get_chain_params(&self) -> ChainParams {
+        self.inner().chain_params()
+    }
+
     fn acc(&self) -> Stump {
         self.inner().current_acc.clone()
     }

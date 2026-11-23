@@ -253,6 +253,9 @@ pub mod jsonrpc_interface {
 
         /// The provided net address is invalid
         InvalidNetAddress(InvalidAddressError),
+
+        /// Invalid coinbase transaction
+        InvalidCoinbaseTransaction(String),
     }
 
     impl_error_from!(JsonRpcError, MempoolError, MempoolAccept);
@@ -292,6 +295,7 @@ pub mod jsonrpc_interface {
                 | Self::InvalidNetAddress(_)
                 | Self::EmptyTxids
                 | Self::DuplicatedTxid(_)
+                | Self::InvalidCoinbaseTransaction(_)
                 | Self::Wallet(_) => StatusCode::BAD_REQUEST,
 
                 // 404 Not Found - resource/method doesn't exist
@@ -431,6 +435,11 @@ pub mod jsonrpc_interface {
                     code: INTERNAL_ERROR,
                     message: "Numeric conversion overflow".into(),
                     data: Some(Value::String(msg.clone())),
+                },
+                Self::InvalidCoinbaseTransaction(err) => RpcError {
+                    code: INTERNAL_ERROR,
+                    message: "Invalid coinbase".into(),
+                    data: Some(Value::String(err.clone())),
                 },
 
                 // Server errors (implementation-defined: -32099..=-32000)

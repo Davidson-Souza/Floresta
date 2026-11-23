@@ -22,6 +22,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod extensions;
+pub use extensions::DnsSeed;
 
 pub mod pruned_utreexo;
 

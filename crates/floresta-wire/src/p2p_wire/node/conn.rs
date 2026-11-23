@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 use bitcoin::Network;
 use bitcoin::p2p::ServiceFlags;
 use floresta_chain::ChainBackend;
+use floresta_chain::extensions::ChainParamsExt;
 use floresta_common::Ema;
 use floresta_common::service_flags;
 use floresta_common::try_and_log;
@@ -367,6 +368,7 @@ where
     pub(crate) fn get_peers_from_dns(&self) -> Result<(), WireError> {
         let node_sender = self.node_tx.clone();
         let network = self.network;
+        let params = self.chain.get_chain_params();
 
         let proxy_addr = self.socks5.as_ref().map(|proxy| {
             let addr = proxy.address;
@@ -376,7 +378,7 @@ where
 
         tokio::task::spawn_blocking(move || {
             let default_port = BitcoinSocketAddr::default_p2p_port(network);
-            let dns_seeds = floresta_chain::get_chain_dns_seeds(network);
+            let dns_seeds = params.get_chain_dns_seeds();
 
             let mut addresses = Vec::new();
             for seed in &dns_seeds {

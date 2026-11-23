@@ -16,6 +16,7 @@ use std::sync::Mutex;
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
+use bitcoin::Network;
 use bitcoin::OutPoint;
 use bitcoin::Transaction;
 use bitcoin::Txid;
@@ -26,6 +27,7 @@ use bitcoin::hashes::sha256;
 use bitcoin::params::Params;
 use floresta_chain::BlockConsumer;
 use floresta_chain::BlockchainError;
+use floresta_chain::ChainParams;
 use floresta_chain::UtxoData;
 use floresta_chain::pruned_utreexo::BlockchainInterface;
 use floresta_chain::pruned_utreexo::IBDState;
@@ -166,6 +168,10 @@ impl BlockchainInterface for MockChain {
 
     fn get_params(&self) -> Params {
         unimplemented!("not needed by the unit tests")
+    }
+
+    fn get_chain_params(&self) -> ChainParams {
+        ChainParams::from(Network::Regtest)
     }
 
     fn acc(&self) -> Stump {

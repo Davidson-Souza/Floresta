@@ -32,6 +32,8 @@ Returns a JSON object describing the activation state of every known consensus d
 
 - `hash` - (string) Hash of the block at which deployment state was queried.
 - `height` - (numeric) Height of that block.
+- `script_flags` : (json array) script verify flags for the block
+  - `"str"` - (string) a script verify flag
 - `deployments` - (object) Map of deployment name to deployment state. Each entry contains:
   - `type` - (string) `"buried"` for deployments locked-in at fixed heights, `"bip9"` for versionbits deployments.
   - `height` - (numeric) The activation height of the deployment.

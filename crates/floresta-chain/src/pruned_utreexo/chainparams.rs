@@ -5,12 +5,8 @@
 //!
 //! It includes:
 //! - Network-specific parameters like block reward halving intervals and maturity periods
-//! - DNS seeds for peer discovery
 //! - Assumable validation states for Utreexo
 //! - Block verification flag exceptions
-//!
-//! The main struct [`ChainParams`] encapsulates all chain-specific parameters while
-//! [`DnsSeed`] handles peer discovery through DNS.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -20,13 +16,11 @@ use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
-use bitcoin::p2p::ServiceFlags;
 use bitcoin::params::Params;
 #[cfg(feature = "bitcoinkernel")]
 use bitcoinkernel::ScriptVerificationFlags;
 use floresta_common::acchashes;
 use floresta_common::bhash;
-use floresta_common::service_flags;
 use rustreexo::node_hash::BitcoinNodeHash;
 
 use crate::AssumeValidArg;
@@ -97,30 +91,6 @@ pub struct ChainParams {
 
     /// Whether we should enforce BIP-094 "Testnet 4" rules
     pub enforce_bip94: bool,
-}
-
-/// A dns seed is a authoritative DNS server that returns the IP addresses of nodes that are
-/// likely to be accepting incoming connections. This is our preferred way of finding new peers
-/// on the first startup, as peers returned by seeds are likely to be online and accepting
-/// connections. We may use this as a fallback if we don't have any peers to connect in
-/// subsequent startups.
-///
-/// Some seeds allow filtering by service flags, so we may use this to find peers that are
-/// likely to be running Utreexo, for example.
-pub struct DnsSeed {
-    /// The domain name of the seed
-    pub seed: &'static str,
-
-    /// Useful filters we can use to find relevant peers
-    pub filters: ServiceFlags,
-}
-
-/// This functionality is used to create a new DNS seed with possible filters.
-impl DnsSeed {
-    /// Create a new DNS seed
-    pub fn new(seed: &'static str, filters: ServiceFlags) -> Self {
-        Self { seed, filters }
-    }
 }
 
 /// If enabled, the node will assume that the provided Utreexo state is valid, and will
@@ -397,112 +367,5 @@ impl From<Network> for ChainParams {
                 enforce_bip94: false,
             },
         }
-    }
-}
-
-/// Get a list of [`DnsSeed`]s for a given [`Network`].
-///
-/// Some DNS seeds allow requesting addresses using a [`ServiceFlags`] filter.
-/// Here we define `x9`, `x49`, and `x1009` (the relevant services for this node
-/// to operate), and use them to request addresses from the DNS seeds that support it.
-pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
-    let mut seeds = Vec::new();
-
-    let none = ServiceFlags::NONE;
-    let x9 = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-    let x49 = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
-    let x1009 = ServiceFlags::NETWORK | ServiceFlags::WITNESS | service_flags::UTREEXO.into();
-    let x1000 = service_flags::UTREEXO.into();
-
-    #[rustfmt::skip]
-    match network {
-        Network::Bitcoin => {
-            seeds.push(DnsSeed::new("seed.calvinkim.info", x1009));
-            seeds.push(DnsSeed::new("seed.bitcoin.luisschwab.com", x1009));
-            seeds.push(DnsSeed::new("seed.bitcoin.sipa.be", x9));
-            seeds.push(DnsSeed::new("dnsseed.bluematt.me", x49));
-            seeds.push(DnsSeed::new("seed.bitcoinstats.com", x49));
-            seeds.push(DnsSeed::new("seed.btc.petertodd.org", x49));
-            seeds.push(DnsSeed::new("seed.bitcoin.sprovoost.nl", x49));
-            seeds.push(DnsSeed::new("dnsseed.emzy.de", x49));
-            seeds.push(DnsSeed::new("seed.bitcoin.wiz.biz", x49));
-            seeds.push(DnsSeed::new("bitcoin.seed.dlsouza.lol", x1000));
-        }
-        Network::Signet => {
-            seeds.push(DnsSeed::new("signet.seed.dlsouza.lol", x1000));
-            seeds.push(DnsSeed::new("seed.signet.bitcoin.sprovoost.nl", x49));
-            seeds.push(DnsSeed::new("signet.seed.utreexo.net", x1009));
-        }
-        Network::Testnet => {
-            seeds.push(DnsSeed::new("testnet-seed.bitcoin.jonasschnelli.ch", x49));
-            seeds.push(DnsSeed::new("testnet.seed.dlsouza.lol", x1000));
-            seeds.push(DnsSeed::new("seed.tbtc.petertodd.org", x49));
-            seeds.push(DnsSeed::new("seed.testnet.bitcoin.sprovoost.nl", x49));
-            seeds.push(DnsSeed::new("testnet-seed.bluematt.me", none));
-        }
-        Network::Testnet4 => {
-            seeds.push(DnsSeed::new("seed.testnet4.bitcoin.sprovoost.nl", none));
-            seeds.push(DnsSeed::new("seed.testnet4.wiz.biz", none));
-        }
-        Network::Regtest => {}
-    };
-
-    seeds
-}
-
-/// Returns the buried deployment list for a network, as `(name, activation_height)` pairs.
-///
-/// Heights are sourced from Bitcoin Core's `chainparams.cpp` at v30.2
-/// (commit `4d7d5f6b79d4c11c47e7a828d81296918fd11d4d`):
-/// <https://github.com/bitcoin/bitcoin/blob/4d7d5f6b79d4c11c47e7a828d81296918fd11d4d/src/kernel/chainparams.cpp>
-//
-// TODO: also emit BIP9 deployments (`taproot`, `testdummy`); requires the versionbits state machine.
-pub fn buried_deployments_for(network: Network) -> &'static [(&'static str, u32)] {
-    const BITCOIN_BURIED: &[(&str, u32)] = &[
-        ("bip34", 227_931),
-        ("bip66", 363_725),
-        ("bip65", 388_381),
-        ("csv", 419_328),
-        ("segwit", 481_824),
-    ];
-
-    const TESTNET_BURIED: &[(&str, u32)] = &[
-        ("bip34", 21_111),
-        ("bip66", 330_776),
-        ("bip65", 581_885),
-        ("csv", 770_112),
-        ("segwit", 834_624),
-    ];
-
-    const TESTNET4_BURIED: &[(&str, u32)] = &[
-        ("bip34", 1),
-        ("bip66", 1),
-        ("bip65", 1),
-        ("csv", 1),
-        ("segwit", 1),
-    ];
-
-    const SIGNET_BURIED: &[(&str, u32)] = &[
-        ("bip34", 1),
-        ("bip66", 1),
-        ("bip65", 1),
-        ("csv", 1),
-        ("segwit", 1),
-    ];
-
-    const REGTEST_BURIED: &[(&str, u32)] = &[
-        ("bip34", 1),
-        ("bip66", 1),
-        ("bip65", 1),
-        ("csv", 1),
-        ("segwit", 0),
-    ];
-
-    match network {
-        Network::Bitcoin => BITCOIN_BURIED,
-        Network::Testnet => TESTNET_BURIED,
-        Network::Testnet4 => TESTNET4_BURIED,
-        Network::Signet => SIGNET_BURIED,
-        Network::Regtest => REGTEST_BURIED,
     }
 }

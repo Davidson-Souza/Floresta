@@ -1334,7 +1334,8 @@ mod test {
     use bitcoin::Network;
     use bitcoin::p2p::ServiceFlags;
     use bitcoin::p2p::address::AddrV2;
-    use floresta_chain::get_chain_dns_seeds;
+    use floresta_chain::ChainParams;
+    use floresta_chain::extensions::ChainParamsExt;
     use floresta_common::assert_ok;
     use floresta_common::service_flags;
     use rand::RngExt;
@@ -1527,8 +1528,9 @@ mod test {
         assert!(!AddressMan::get_net_seeds(Network::Regtest).is_empty());
         assert!(!AddressMan::get_net_seeds(Network::Testnet).is_empty());
 
+        let chain_params = ChainParams::from(Network::Signet);
         assert_ok!(AddressMan::get_seeds_from_dns(
-            &get_chain_dns_seeds(Network::Signet)[0],
+            &chain_params.get_chain_dns_seeds()[0],
             8333,
             None, // No proxy
         ));
