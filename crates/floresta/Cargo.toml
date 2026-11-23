@@ -1,6 +1,6 @@
 [package]
 name = "floresta"
-version = "0.5.0"
+version = "0.6.0"
 description = "A modular and extensible framework for building Utreexo-based Bitcoin nodes"
 authors = ["Floresta Developers <contact@getfloresta.org>"]
 documentation = "https://docs.getfloresta.sh/floresta"

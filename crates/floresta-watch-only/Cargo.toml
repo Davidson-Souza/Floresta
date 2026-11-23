@@ -1,6 +1,6 @@
 [package]
 name = "floresta-watch-only"
-version = "0.5.0"
+version = "0.6.0"
 rust-version.workspace = true
 edition.workspace = true
 description = "A simple, lightweight and Electrum-First, watch-only wallet"

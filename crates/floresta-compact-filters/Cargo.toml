@@ -1,6 +1,6 @@
 [package]
 name = "floresta-compact-filters"
-version = "0.5.0"
+version = "0.6.0"
 authors = ["Floresta Developers <contact@getfloresta.org>"]
 rust-version.workspace = true
 edition.workspace = true

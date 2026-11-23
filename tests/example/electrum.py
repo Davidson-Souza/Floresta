@@ -14,7 +14,7 @@ It shows:
 
 import pytest
 
-EXPECTED_VERSION = ["Floresta 0.5.0", "1.4"]
+EXPECTED_VERSION = ["Floresta 0.6.0", "1.4"]
 
 
 @pytest.mark.example
