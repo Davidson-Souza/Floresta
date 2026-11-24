@@ -22,6 +22,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
+use jiff::ZonedDateTime;
 use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
@@ -31,7 +32,6 @@ use tracing_subscriber::fmt::FormatEvent;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::layer;
-use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
@@ -40,16 +40,16 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// The file which logging events are written to.
 pub(crate) const LOG_FILE: &str = "debug.log";
 
-/// The string used to format the timestamp, via [`ChronoLocal`].
+/// The string used to format the timestamp, via [`LocalTimer`].
 ///
 /// Format: `YYYY-MM-DD HH:mm:ss`
-pub(crate) const CHRONO_FORMATTER: &str = "%Y-%m-%d %H:%M:%S";
+pub(crate) const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// The string used to format the timestamp when
-/// the log level [`Level::DEBUG`] or higher, via [`ChronoLocal`].
+/// the log level [`Level::DEBUG`] or higher, via [`LocalTimer`].
 ///
 /// Format: `YYYY-MM-DD HH:mm:ss.sss`
-pub(crate) const CHRONO_FORMATTER_DEBUG: &str = "%Y-%m-%d %H:%M:%S%.3f";
+pub(crate) const TIMESTAMP_FORMAT_DEBUG: &str = "%Y-%m-%d %H:%M:%S%.3f";
 
 /// Colored `ERROR` in bright red.
 pub(crate) const COLORED_ERROR: &str = "\x1b[0;31mERROR\x1b[0m";
@@ -65,6 +65,23 @@ pub(crate) const COLORED_DEBUG: &str = "\x1b[0;34mDEBUG\x1b[0m";
 
 /// Colored `TRACE` in dim magenta.
 pub(crate) const COLORED_TRACE: &str = "\x1b[0;35mTRACE\x1b[0m";
+
+/// A [`FormatTime`] implementation that renders the local time with `jiff`.
+struct LocalTimer {
+    format: &'static str,
+}
+
+impl LocalTimer {
+    fn new(format: &'static str) -> Self {
+        Self { format }
+    }
+}
+
+impl FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
+        write!(w, "{}", ZonedDateTime::now().strftime(self.format))
+    }
+}
 
 /// A custom [`FormatEvent`] implementation for [`tracing-subscriber`]'s `fmt` layer.
 ///
@@ -100,13 +117,13 @@ pub(crate) const COLORED_TRACE: &str = "\x1b[0;35mTRACE\x1b[0m";
 ///
 /// [`tracing-subscriber`]: https://crates.io/crates/tracing-subscriber
 pub struct ShortTargetFormatter {
-    timer: ChronoLocal,
+    timer: LocalTimer,
 }
 
 impl Default for ShortTargetFormatter {
     fn default() -> Self {
         Self {
-            timer: ChronoLocal::new(CHRONO_FORMATTER.to_string()),
+            timer: LocalTimer::new(TIMESTAMP_FORMAT),
         }
     }
 }
@@ -117,12 +134,12 @@ impl ShortTargetFormatter {
     /// If `debug` is `true`, it will also log milliseconds.
     pub fn new(debug: bool) -> Self {
         let fmt = if debug {
-            CHRONO_FORMATTER_DEBUG
+            TIMESTAMP_FORMAT_DEBUG
         } else {
-            CHRONO_FORMATTER
+            TIMESTAMP_FORMAT
         };
         Self {
-            timer: ChronoLocal::new(fmt.to_string()),
+            timer: LocalTimer::new(fmt),
         }
     }
 

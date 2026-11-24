@@ -25,10 +25,11 @@ bitcoin = { workspace = true }
 clap = { workspace = true, features = ["help"] }
 console-subscriber = { workspace = true, optional = true }
 dirs = { version = "=6.0.0", default-features = false }
+jiff = { version = "=1.0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-concatenated", "tzdb-zoneinfo"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { version = "=0.2.5", default-features = false }
-tracing-subscriber = { version = "=0.3.23", features = ["chrono", "ansi", "env-filter"] }
+tracing-subscriber = { version = "=0.3.23", features = ["ansi", "env-filter"] }
 
 # Local dependencies
 floresta-node = { workspace = true }
